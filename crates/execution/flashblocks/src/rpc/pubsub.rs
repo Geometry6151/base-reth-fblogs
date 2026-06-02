@@ -250,10 +250,17 @@ where
             unreachable!("Standard subscription types should be delegated to inner");
         };
 
-        let sink = pending.accept().await?;
-
         match base_kind {
+            BaseSubscriptionKind::NewFlashblockLogsBatch => {
+                return Err(ErrorObjectOwned::owned(
+                    INVALID_PARAMS_CODE,
+                    "newFlashblockLogsBatch subscription is not yet implemented",
+                    None::<()>,
+                )
+                .into());
+            }
             BaseSubscriptionKind::NewFlashblocks => {
+                let sink = pending.accept().await?;
                 let stream = Self::new_flashblocks_stream(Arc::clone(&self.flashblocks_state));
 
                 tokio::spawn(async move {
@@ -261,6 +268,7 @@ where
                 });
             }
             BaseSubscriptionKind::PendingLogs => {
+                let sink = pending.accept().await?;
                 // Extract filter from params, default to empty filter (match all)
                 let filter = match params {
                     Some(Params::Logs(filter)) => *filter,
@@ -275,6 +283,7 @@ where
             }
             BaseSubscriptionKind::NewFlashblockTransactions => match params {
                 Some(Params::Logs(filter)) => {
+                    let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_filtered_stream(
                         Arc::clone(&self.flashblocks_state),
                         *filter,
@@ -284,6 +293,7 @@ where
                     });
                 }
                 Some(Params::Bool(true)) => {
+                    let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_full_stream(Arc::clone(
                         &self.flashblocks_state,
                     ));
@@ -292,6 +302,7 @@ where
                     });
                 }
                 _ => {
+                    let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_hash_stream(Arc::clone(
                         &self.flashblocks_state,
                     ));
@@ -300,14 +311,6 @@ where
                     });
                 }
             },
-            BaseSubscriptionKind::NewFlashblockLogsBatch => {
-                return Err(ErrorObjectOwned::owned(
-                    INVALID_PARAMS_CODE,
-                    "newFlashblockLogsBatch subscription is not yet implemented",
-                    None::<()>,
-                )
-                .into());
-            }
         }
 
         Ok(())
