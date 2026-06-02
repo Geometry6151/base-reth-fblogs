@@ -16,6 +16,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     server::SubscriptionMessage,
 };
+use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use reth_rpc::eth::EthPubSub as RethEthPubSub;
 use reth_rpc_eth_api::{
     EthApiTypes, RpcBlock, RpcNodeCore, RpcTransaction,
@@ -299,6 +300,14 @@ where
                     });
                 }
             },
+            BaseSubscriptionKind::NewFlashblockLogsBatch => {
+                return Err(ErrorObjectOwned::owned(
+                    INVALID_PARAMS_CODE,
+                    "newFlashblockLogsBatch subscription is not yet implemented",
+                    None::<()>,
+                )
+                .into());
+            }
         }
 
         Ok(())

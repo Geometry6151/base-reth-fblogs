@@ -57,5 +57,6 @@ pub use config::FlashblocksConfig;
 mod rpc;
 pub use rpc::{
     BaseSubscriptionKind, BlockNumberOrTagExt, EthApiExt, EthApiOverrideServer, EthPubSub,
-    EthPubSubApiServer, ExtendedSubscriptionKind, TransactionWithLogs,
+    EthPubSubApiServer, ExtendedSubscriptionKind, FlashblockLog, FlashblockLogsBatch,
+    FlashblockTxMeta, TransactionWithLogs,
 };
