@@ -1073,6 +1073,30 @@ async fn test_eth_subscribe_new_heads() -> eyre::Result<()> {
     Ok(())
 }
 
+fn assert_hex_string(value: &serde_json::Value, field_name: &str) {
+    let string = value
+        .as_str()
+        .unwrap_or_else(|| panic!("expected {field_name} hex string, got: {value:?}"));
+    assert!(string.starts_with("0x"), "expected {field_name} to start with 0x, got: {string}");
+}
+
+fn assert_flashblock_logs_batch_log(log: &serde_json::Value) {
+    assert_hex_string(&log["txHash"], "txHash");
+    assert_hex_string(&log["txIndex"], "txIndex");
+    assert_hex_string(&log["logIndexInTx"], "logIndexInTx");
+    assert_hex_string(&log["logIndexInBlock"], "logIndexInBlock");
+    assert!(log["address"].is_string(), "expected address string, got: {log:?}");
+    assert!(log["topics"].is_array(), "expected topics array, got: {log:?}");
+    assert_hex_string(&log["data"], "data");
+    assert!(log["removed"].is_boolean(), "expected removed bool, got: {log:?}");
+}
+
+fn assert_flashblock_logs_batch_transaction(tx: &serde_json::Value) {
+    assert_hex_string(&tx["hash"], "hash");
+    assert_hex_string(&tx["index"], "index");
+    assert_hex_string(&tx["status"], "status");
+}
+
 #[tokio::test]
 async fn test_eth_subscribe_new_flashblock_transactions_hashes() -> eyre::Result<()> {
     let setup = TestSetup::new().await?;
@@ -1215,6 +1239,210 @@ async fn test_eth_subscribe_new_flashblock_transactions_full() -> eyre::Result<(
         received_count += 1;
     }
     assert_eq!(received_count, 9);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_flashblock_logs_batch_unfiltered() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFlashblockLogsBatch"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+    let subscription_id = sub["result"].as_str().expect("subscription id expected");
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["method"], "eth_subscription");
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let batch = &notif["params"]["result"];
+    assert_eq!(batch["blockNumber"], "0x1");
+    assert_eq!(batch["flashblockIndex"], "0x0");
+    assert!(batch["logs"].is_array(), "expected logs array, got: {batch:?}");
+    assert!(batch["transactions"].is_array(), "expected transactions array, got: {batch:?}");
+    assert_hex_string(&batch["batchHash"], "batchHash");
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let batch = &notif["params"]["result"];
+    assert_eq!(batch["blockNumber"], "0x1");
+    assert_eq!(batch["flashblockIndex"], "0x1");
+
+    let logs = batch["logs"].as_array().expect("logs array expected");
+    assert!(logs.len() >= 2, "expected at least 2 logs, got: {logs:?}");
+    for log in logs {
+        assert_flashblock_logs_batch_log(log);
+    }
+
+    let transactions = batch["transactions"].as_array().expect("transactions array expected");
+    assert!(
+        !transactions.is_empty(),
+        "expected at least 1 transaction metadata entry, got: {transactions:?}"
+    );
+    for tx in transactions {
+        assert_flashblock_logs_batch_transaction(tx);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_flashblock_logs_batch_filter() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": [
+                    "newFlashblockLogsBatch",
+                    { "address": setup.txn_details.log_emitter_a_address }
+                ]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+    let subscription_id = sub["result"].as_str().expect("subscription id expected");
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let batch = &notif["params"]["result"];
+    let logs = batch["logs"].as_array().expect("logs array expected");
+    assert!(!logs.is_empty(), "expected filtered logs notification to contain logs");
+
+    let filter_address = setup.txn_details.log_emitter_a_address.to_string().to_lowercase();
+    for log in logs {
+        assert_flashblock_logs_batch_log(log);
+        let address = log["address"].as_str().expect("log address string expected");
+        assert_eq!(address.to_lowercase(), filter_address);
+    }
+
+    let transactions = batch["transactions"].as_array().expect("transactions array expected");
+    assert!(
+        transactions.len() >= logs.len(),
+        "expected tx metadata to be retained with filtered logs: txs={transactions:?} logs={logs:?}"
+    );
+    for tx in transactions {
+        assert_flashblock_logs_batch_transaction(tx);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_flashblock_logs_batch_invalid_params() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFlashblockLogsBatch", true]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let error: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(error["jsonrpc"], "2.0");
+    assert_eq!(error["id"], 1);
+    assert!(error.get("error").is_some(), "expected error response, got: {error:?}");
+    let message = error["error"]["message"].as_str().expect("error message expected");
+    assert!(message.contains("newFlashblockLogsBatch"), "unexpected error message: {message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_flashblock_logs_batch_null_params() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFlashblockLogsBatch", null]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+    let subscription_id = sub["result"].as_str().expect("subscription id expected");
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["method"], "eth_subscription");
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let batch = &notif["params"]["result"];
+    assert_eq!(batch["blockNumber"], "0x1");
+    assert_eq!(batch["flashblockIndex"], "0x0");
+    assert!(batch["logs"].is_array(), "expected logs array, got: {batch:?}");
+    assert!(batch["transactions"].is_array(), "expected transactions array, got: {batch:?}");
 
     Ok(())
 }
