@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Instant};
 use alloy_consensus::{Header, Sealed, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{
-    Address, B256, BlockNumber, TxHash, U256,
+    Address, B256, BlockNumber, TxHash, U256, keccak256,
     map::foldhash::{HashMap, HashMapExt},
 };
 use alloy_provider::network::TransactionResponse;
@@ -26,7 +26,8 @@ use revm::{
 };
 
 use crate::{
-    BuildError, PendingBlocksAPI, StateProcessorError, TransactionWithLogs, metrics::Metrics,
+    BuildError, FlashblockLog, FlashblockLogsBatch, FlashblockTxMeta, PendingBlocksAPI,
+    StateProcessorError, TransactionWithLogs, metrics::Metrics,
 };
 
 /// Builder for [`PendingBlocks`].
@@ -523,6 +524,27 @@ impl PendingBlocks {
             .sum()
     }
 
+    /// Returns the transaction range covered by the latest flashblock.
+    fn latest_flashblock_tx_range(&self) -> std::ops::Range<usize> {
+        let start = self.previous_flashblocks_tx_count();
+        let latest_len = self
+            .flashblocks
+            .last()
+            .map(|flashblock| flashblock.diff.transactions.len())
+            .unwrap_or_default();
+        let end = start.saturating_add(latest_len).min(self.transactions.len());
+        start..end
+    }
+
+    fn count_receipt_logs_before(&self, tx_count: usize) -> u64 {
+        self.transactions
+            .iter()
+            .take(tx_count)
+            .filter_map(|tx| self.transaction_receipts.get(&tx.tx_hash()))
+            .map(|receipt| receipt.inner.logs().len() as u64)
+            .sum()
+    }
+
     /// Returns logs matching the filter from only the latest flashblock (delta).
     ///
     /// Unlike `get_pending_logs`, this returns only logs from transactions
@@ -543,6 +565,61 @@ impl PendingBlocks {
         }
 
         logs
+    }
+
+    /// Returns a batch payload for logs and transaction metadata from only the latest flashblock.
+    pub fn get_latest_flashblock_logs_batch(&self, filter: Option<&Filter>) -> FlashblockLogsBatch {
+        let tx_range = self.latest_flashblock_tx_range();
+        let mut transactions = Vec::new();
+        let mut logs = Vec::new();
+        let mut next_block_log_index = self.count_receipt_logs_before(tx_range.start);
+
+        for (relative_tx_index, tx) in self.transactions[tx_range.clone()].iter().enumerate() {
+            let tx_index = (tx_range.start + relative_tx_index) as u64;
+            let tx_hash = tx.tx_hash();
+            let Some(receipt) = self.transaction_receipts.get(&tx_hash) else {
+                continue;
+            };
+
+            transactions.push(FlashblockTxMeta {
+                hash: tx_hash,
+                index: tx_index,
+                status: Some(if receipt.inner.inner.status() { 1 } else { 0 }),
+            });
+
+            for (log_index_in_tx, log) in receipt.inner.logs().iter().enumerate() {
+                let log_index_in_block = log.log_index.unwrap_or(next_block_log_index);
+                next_block_log_index = next_block_log_index.saturating_add(1);
+
+                if filter.is_some_and(|filter| !filter.matches(&log.inner)) {
+                    continue;
+                }
+
+                logs.push(FlashblockLog {
+                    tx_hash,
+                    tx_index,
+                    log_index_in_tx: log_index_in_tx as u64,
+                    log_index_in_block,
+                    address: log.inner.address,
+                    topics: log.inner.data.topics().to_vec(),
+                    data: log.inner.data.data.clone(),
+                    removed: log.removed,
+                });
+            }
+        }
+
+        let mut batch = FlashblockLogsBatch {
+            block_number: self.latest_block_number(),
+            flashblock_index: self.latest_flashblock_index(),
+            payload_id: self.payload_id(),
+            parent_hash: self.parent_hash(),
+            batch_hash: B256::ZERO,
+            block_timestamp: Some(self.latest_header.timestamp),
+            logs,
+            transactions,
+        };
+        batch.batch_hash = compute_flashblock_logs_batch_hash(&batch);
+        batch
     }
 
     /// Returns transactions with their associated logs from only the latest flashblock (delta).
@@ -601,6 +678,41 @@ impl PendingBlocks {
         let prev_count = self.previous_flashblocks_tx_count();
         self.transactions.iter().skip(prev_count).map(|tx| tx.tx_hash()).collect()
     }
+}
+
+fn compute_flashblock_logs_batch_hash(batch: &FlashblockLogsBatch) -> B256 {
+    let mut bytes = Vec::new();
+    push_u64(&mut bytes, batch.block_number);
+    push_u64(&mut bytes, batch.flashblock_index);
+    bytes.extend_from_slice(batch.payload_id.to_string().as_bytes());
+    bytes.extend_from_slice(batch.parent_hash.as_slice());
+
+    for tx in &batch.transactions {
+        bytes.extend_from_slice(tx.hash.as_slice());
+        push_u64(&mut bytes, tx.index);
+        push_u64(&mut bytes, tx.status.unwrap_or(u64::MAX));
+    }
+
+    for log in &batch.logs {
+        bytes.extend_from_slice(log.tx_hash.as_slice());
+        push_u64(&mut bytes, log.tx_index);
+        push_u64(&mut bytes, log.log_index_in_tx);
+        push_u64(&mut bytes, log.log_index_in_block);
+        bytes.extend_from_slice(log.address.as_slice());
+        push_u64(&mut bytes, log.topics.len() as u64);
+        for topic in &log.topics {
+            bytes.extend_from_slice(topic.as_slice());
+        }
+        push_u64(&mut bytes, log.data.len() as u64);
+        bytes.extend_from_slice(log.data.as_ref());
+        bytes.push(u8::from(log.removed));
+    }
+
+    keccak256(bytes)
+}
+
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
 }
 
 impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
@@ -1026,6 +1138,226 @@ mod tests {
         }
 
         builder.build().expect("build should succeed")
+    }
+
+    fn test_flashblock_with_index_and_tx_count(index: u64, tx_count: usize) -> Flashblock {
+        let mut flashblock = test_flashblock();
+        flashblock.index = index;
+        flashblock.payload_id = PayloadId::new([index as u8; 8]);
+        flashblock.diff.transactions = vec![Bytes::new(); tx_count];
+        flashblock
+    }
+
+    fn test_header() -> Sealed<Header> {
+        Sealed::new_unchecked(
+            Header {
+                parent_hash: B256::with_last_byte(0x42),
+                number: 1,
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            },
+            B256::ZERO,
+        )
+    }
+
+    fn test_log(tx_hash: B256, log_address: Address, log_index: Option<u64>, removed: bool) -> Log {
+        Log {
+            inner: PrimitiveLog {
+                address: log_address,
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            },
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(0),
+            log_index,
+            removed,
+        }
+    }
+
+    fn test_receipt_with_logs(tx_hash: B256, logs: Vec<Log>) -> BaseTransactionReceipt {
+        BaseTransactionReceipt {
+            inner: alloy_rpc_types_eth::TransactionReceipt {
+                inner: ReceiptWithBloom {
+                    receipt: BaseReceipt::Legacy(Receipt {
+                        status: alloy_consensus::Eip658Value::Eip658(true),
+                        cumulative_gas_used: 21_000,
+                        logs,
+                    }),
+                    logs_bloom: Bloom::default(),
+                },
+                transaction_hash: tx_hash,
+                transaction_index: Some(0),
+                block_hash: Some(B256::ZERO),
+                block_number: Some(1),
+                gas_used: 21_000,
+                effective_gas_price: 1_000_000_000,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+            },
+            l1_block_info: Default::default(),
+        }
+    }
+
+    fn build_pending_blocks_for_latest_flashblock_batch_tests(
+        flashblocks: Vec<Flashblock>,
+        entries: Vec<(B256, BaseTransactionReceipt)>,
+    ) -> PendingBlocks {
+        let mut builder = PendingBlocksBuilder::new();
+        builder.with_flashblocks(flashblocks);
+        builder.with_header(test_header());
+
+        for (index, (hash, receipt)) in entries.into_iter().enumerate() {
+            let mut tx = test_transaction_with_hash(hash);
+            tx.inner.transaction_index = Some(index as u64);
+            builder.with_transaction(tx);
+            builder.with_receipt(hash, receipt);
+        }
+
+        builder.build().expect("build should succeed")
+    }
+
+    #[test]
+    fn latest_flashblock_logs_batch_emits_empty_flashblock() {
+        let prev_hash = B256::with_last_byte(0xAA);
+        let prev_addr = Address::with_last_byte(0x0A);
+
+        let pending = build_pending_blocks_for_latest_flashblock_batch_tests(
+            vec![
+                test_flashblock_with_index_and_tx_count(0, 1),
+                test_flashblock_with_index_and_tx_count(1, 0),
+            ],
+            vec![(prev_hash, test_receipt_with_log(prev_hash, prev_addr))],
+        );
+
+        let batch = pending.get_latest_flashblock_logs_batch(None);
+
+        assert_eq!(batch.flashblock_index, 1);
+        assert!(batch.logs.is_empty());
+        assert!(batch.transactions.is_empty());
+        assert_eq!(batch.batch_hash, compute_flashblock_logs_batch_hash(&batch));
+    }
+
+    #[test]
+    fn latest_flashblock_logs_batch_includes_tx_meta_for_all_latest_txs() {
+        let prev_hash = B256::with_last_byte(0xAA);
+        let latest_hash_a = B256::with_last_byte(0xBB);
+        let latest_hash_b = B256::with_last_byte(0xCC);
+
+        let pending = build_pending_blocks_for_latest_flashblock_batch_tests(
+            vec![
+                test_flashblock_with_index_and_tx_count(0, 1),
+                test_flashblock_with_index_and_tx_count(1, 2),
+            ],
+            vec![
+                (prev_hash, test_receipt_with_log(prev_hash, Address::with_last_byte(0x01))),
+                (
+                    latest_hash_a,
+                    test_receipt_with_log(latest_hash_a, Address::with_last_byte(0x02)),
+                ),
+                (latest_hash_b, test_receipt(latest_hash_b, None)),
+            ],
+        );
+
+        let batch = pending.get_latest_flashblock_logs_batch(None);
+
+        assert_eq!(batch.transactions.len(), 2);
+        assert_eq!(batch.transactions[0].hash, latest_hash_a);
+        assert_eq!(batch.transactions[0].index, 1);
+        assert_eq!(batch.transactions[0].status, Some(1));
+        assert_eq!(batch.transactions[1].hash, latest_hash_b);
+        assert_eq!(batch.transactions[1].index, 2);
+        assert_eq!(batch.transactions[1].status, Some(1));
+    }
+
+    #[test]
+    fn latest_flashblock_logs_batch_filters_logs_but_keeps_tx_meta() {
+        let prev_hash = B256::with_last_byte(0xAA);
+        let latest_hash_a = B256::with_last_byte(0xBB);
+        let latest_hash_b = B256::with_last_byte(0xCC);
+        let keep_addr = Address::with_last_byte(0x0B);
+        let drop_addr = Address::with_last_byte(0x0C);
+
+        let pending = build_pending_blocks_for_latest_flashblock_batch_tests(
+            vec![
+                test_flashblock_with_index_and_tx_count(0, 1),
+                test_flashblock_with_index_and_tx_count(1, 2),
+            ],
+            vec![
+                (prev_hash, test_receipt_with_log(prev_hash, Address::with_last_byte(0x01))),
+                (latest_hash_a, test_receipt_with_log(latest_hash_a, keep_addr)),
+                (latest_hash_b, test_receipt_with_log(latest_hash_b, drop_addr)),
+            ],
+        );
+
+        let filter = Filter::new().address(keep_addr);
+        let batch = pending.get_latest_flashblock_logs_batch(Some(&filter));
+
+        assert_eq!(batch.logs.len(), 1);
+        assert_eq!(batch.logs[0].tx_hash, latest_hash_a);
+        assert_eq!(batch.logs[0].address, keep_addr);
+        assert_eq!(
+            batch.transactions.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![latest_hash_a, latest_hash_b]
+        );
+    }
+
+    #[test]
+    fn latest_flashblock_logs_batch_sets_tx_local_and_block_global_log_indices() {
+        let prev_hash = B256::with_last_byte(0xAA);
+        let latest_hash_a = B256::with_last_byte(0xBB);
+        let latest_hash_b = B256::with_last_byte(0xCC);
+
+        let pending = build_pending_blocks_for_latest_flashblock_batch_tests(
+            vec![
+                test_flashblock_with_index_and_tx_count(0, 1),
+                test_flashblock_with_index_and_tx_count(1, 2),
+            ],
+            vec![
+                (
+                    prev_hash,
+                    test_receipt_with_logs(
+                        prev_hash,
+                        vec![test_log(prev_hash, Address::with_last_byte(0x01), None, false)],
+                    ),
+                ),
+                (
+                    latest_hash_a,
+                    test_receipt_with_logs(
+                        latest_hash_a,
+                        vec![
+                            test_log(latest_hash_a, Address::with_last_byte(0x02), None, false),
+                            test_log(latest_hash_a, Address::with_last_byte(0x03), None, true),
+                        ],
+                    ),
+                ),
+                (
+                    latest_hash_b,
+                    test_receipt_with_logs(
+                        latest_hash_b,
+                        vec![test_log(latest_hash_b, Address::with_last_byte(0x04), None, false)],
+                    ),
+                ),
+            ],
+        );
+
+        let batch = pending.get_latest_flashblock_logs_batch(None);
+
+        assert_eq!(batch.logs.len(), 3);
+        assert_eq!(batch.logs[0].tx_hash, latest_hash_a);
+        assert_eq!(batch.logs[0].log_index_in_tx, 0);
+        assert_eq!(batch.logs[0].log_index_in_block, 1);
+        assert_eq!(batch.logs[1].tx_hash, latest_hash_a);
+        assert_eq!(batch.logs[1].log_index_in_tx, 1);
+        assert_eq!(batch.logs[1].log_index_in_block, 2);
+        assert!(batch.logs[1].removed);
+        assert_eq!(batch.logs[2].tx_hash, latest_hash_b);
+        assert_eq!(batch.logs[2].log_index_in_tx, 0);
+        assert_eq!(batch.logs[2].log_index_in_block, 3);
     }
 
     #[test]
