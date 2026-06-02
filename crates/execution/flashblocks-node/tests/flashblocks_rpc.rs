@@ -1444,6 +1444,63 @@ async fn test_eth_subscribe_new_flashblock_logs_batch_null_params() -> eyre::Res
     assert!(batch["logs"].is_array(), "expected logs array, got: {batch:?}");
     assert!(batch["transactions"].is_array(), "expected transactions array, got: {batch:?}");
 
+    setup.send_flashblock(setup.create_second_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let batch = &notif["params"]["result"];
+    assert_eq!(batch["blockNumber"], "0x1");
+    assert_eq!(batch["flashblockIndex"], "0x1");
+
+    let logs = batch["logs"].as_array().expect("logs array expected");
+    assert!(logs.len() >= 2, "expected at least 2 logs, got: {logs:?}");
+
+    let expected_trigger_hash = setup.txn_details.log_trigger_hash.to_string().to_lowercase();
+    let expected_log_emitter_a = setup.txn_details.log_emitter_a_address.to_string().to_lowercase();
+    let expected_log_emitter_b = setup.txn_details.log_emitter_b_address.to_string().to_lowercase();
+    let mut seen_log_emitter_a = false;
+    let mut seen_log_emitter_b = false;
+
+    for log in logs {
+        assert_flashblock_logs_batch_log(log);
+
+        let address = log["address"].as_str().expect("log address string expected").to_lowercase();
+        let tx_hash = log["txHash"].as_str().expect("log txHash string expected").to_lowercase();
+        assert_eq!(tx_hash, expected_trigger_hash);
+
+        if address == expected_log_emitter_a {
+            seen_log_emitter_a = true;
+        }
+        if address == expected_log_emitter_b {
+            seen_log_emitter_b = true;
+        }
+    }
+
+    assert!(seen_log_emitter_a, "expected unfiltered logs to include LogEmitterA");
+    assert!(seen_log_emitter_b, "expected unfiltered logs to include LogEmitterB");
+
+    let transactions = batch["transactions"].as_array().expect("transactions array expected");
+    assert!(
+        !transactions.is_empty(),
+        "expected at least 1 transaction metadata entry, got: {transactions:?}"
+    );
+
+    let mut saw_trigger_tx = false;
+    for tx in transactions {
+        assert_flashblock_logs_batch_transaction(tx);
+
+        if tx["hash"]
+            .as_str()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(expected_trigger_hash.as_str()))
+        {
+            saw_trigger_tx = true;
+        }
+    }
+
+    assert!(saw_trigger_tx, "expected tx metadata for log trigger tx, got: {transactions:?}");
+
     Ok(())
 }
 
