@@ -228,6 +228,7 @@ fn logs_batch_filter_from_params(
 ) -> Result<Option<Filter>, ErrorObjectOwned> {
     match params {
         None => Ok(None),
+        Some(Params::None) => Ok(None),
         Some(Params::Logs(filter)) => Ok(Some(*filter)),
         Some(_) => Err(ErrorObjectOwned::owned(
             INVALID_PARAMS_CODE,
@@ -267,7 +268,13 @@ where
 
         match base_kind {
             BaseSubscriptionKind::NewFlashblockLogsBatch => {
-                let filter = logs_batch_filter_from_params(params)?;
+                let filter = match logs_batch_filter_from_params(params) {
+                    Ok(filter) => filter,
+                    Err(err) => {
+                        pending.reject(err).await;
+                        return Ok(());
+                    }
+                };
                 let sink = pending.accept().await?;
                 let flashblocks_state = Arc::clone(&self.flashblocks_state);
 
@@ -438,6 +445,11 @@ mod tests {
     #[test]
     fn logs_batch_filter_accepts_missing_params() {
         assert!(logs_batch_filter_from_params(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn logs_batch_filter_accepts_null_params() {
+        assert!(logs_batch_filter_from_params(Some(Params::None)).unwrap().is_none());
     }
 
     #[test]
