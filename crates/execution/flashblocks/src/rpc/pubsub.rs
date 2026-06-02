@@ -23,6 +23,7 @@ use reth_rpc_eth_api::{
     pubsub::EthPubSubApiServer as RethEthPubSubApiServer,
 };
 use serde::Serialize;
+use tokio::sync::broadcast::error::RecvError;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::error;
 
@@ -222,6 +223,20 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     }
 }
 
+fn logs_batch_filter_from_params(
+    params: Option<Params>,
+) -> Result<Option<Filter>, ErrorObjectOwned> {
+    match params {
+        None => Ok(None),
+        Some(Params::Logs(filter)) => Ok(Some(*filter)),
+        Some(_) => Err(ErrorObjectOwned::owned(
+            INVALID_PARAMS_CODE,
+            "invalid params for newFlashblockLogsBatch: expected omitted/null params or a logs filter object",
+            None::<()>,
+        )),
+    }
+}
+
 #[async_trait]
 impl<Eth, FB> EthPubSubApiServer for EthPubSub<Eth, FB>
 where
@@ -252,12 +267,13 @@ where
 
         match base_kind {
             BaseSubscriptionKind::NewFlashblockLogsBatch => {
-                return Err(ErrorObjectOwned::owned(
-                    INVALID_PARAMS_CODE,
-                    "newFlashblockLogsBatch subscription is not yet implemented",
-                    None::<()>,
-                )
-                .into());
+                let filter = logs_batch_filter_from_params(params)?;
+                let sink = pending.accept().await?;
+                let flashblocks_state = Arc::clone(&self.flashblocks_state);
+
+                tokio::spawn(async move {
+                    pipe_flashblock_logs_batch_subscription(sink, flashblocks_state, filter).await;
+                });
             }
             BaseSubscriptionKind::NewFlashblocks => {
                 let sink = pending.accept().await?;
@@ -317,6 +333,57 @@ where
     }
 }
 
+async fn pipe_flashblock_logs_batch_subscription<FB>(
+    sink: SubscriptionSink,
+    flashblocks_state: Arc<FB>,
+    filter: Option<Filter>,
+) where
+    FB: FlashblocksAPI + Send + Sync + 'static,
+{
+    let mut receiver = flashblocks_state.subscribe_to_flashblocks();
+
+    loop {
+        tokio::select! {
+            _ = sink.closed() => return,
+            result = receiver.recv() => {
+                let pending_blocks = match result {
+                    Ok(pending_blocks) => pending_blocks,
+                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(skipped)) => {
+                        error!(
+                            target: "flashblocks_rpc::pubsub",
+                            skipped,
+                            "closing newFlashblockLogsBatch subscription after broadcast lag"
+                        );
+                        return;
+                    }
+                };
+
+                let batch = pending_blocks.get_latest_flashblock_logs_batch(filter.as_ref());
+                let msg = match SubscriptionMessage::new(
+                    sink.method_name(),
+                    sink.subscription_id(),
+                    &batch,
+                ) {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        error!(
+                            target: "flashblocks_rpc::pubsub",
+                            %err,
+                            "failed to serialize newFlashblockLogsBatch subscription message"
+                        );
+                        return;
+                    }
+                };
+
+                if sink.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Pipes all stream items to the subscription sink.
 ///
 /// This function runs until the stream ends, the client disconnects, or a serialization error occurs.
@@ -359,5 +426,32 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::Address;
+
+    use super::*;
+
+    #[test]
+    fn logs_batch_filter_accepts_missing_params() {
+        assert!(logs_batch_filter_from_params(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn logs_batch_filter_accepts_logs_filter() {
+        let filter = Filter::new().address(Address::with_last_byte(1));
+        let parsed = logs_batch_filter_from_params(Some(Params::Logs(Box::new(filter.clone()))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, filter);
+    }
+
+    #[test]
+    fn logs_batch_filter_rejects_bool_params() {
+        let err = logs_batch_filter_from_params(Some(Params::Bool(true))).unwrap_err();
+        assert!(err.to_string().contains("newFlashblockLogsBatch"));
     }
 }
