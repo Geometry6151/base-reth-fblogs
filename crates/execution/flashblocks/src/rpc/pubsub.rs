@@ -34,8 +34,8 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug)]
-enum PubSubSerializeMetric {
-    Fast,
+enum PubSubMetric {
+    FastLogs,
     LogsBatch,
 }
 
@@ -96,7 +96,7 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
                     return None;
                 }
             };
-            Some(base_metrics::time!(Metrics::fast_delta_build_duration(), {
+            Some(base_metrics::time!(Metrics::new_flashblocks_build_duration(), {
                 pending_blocks.get_latest_block(true)
             }))
         })
@@ -400,7 +400,7 @@ async fn pipe_flashblock_logs_batch_subscription<FB>(
                 if !send_subscription_item(
                     &sink,
                     &batch,
-                    Some(PubSubSerializeMetric::LogsBatch),
+                    Some(PubSubMetric::LogsBatch),
                 )
                 .await
                 {
@@ -435,10 +435,10 @@ async fn pipe_fast_flashblock_logs_subscription(
 
                 if let Some(filter) = filter.as_ref() {
                     let filtered_delta = update.delta.filtered(filter);
-                    if !send_subscription_item(&sink, &filtered_delta, Some(PubSubSerializeMetric::Fast)).await {
+                    if !send_subscription_item(&sink, &filtered_delta, Some(PubSubMetric::FastLogs)).await {
                         return;
                     }
-                } else if !send_subscription_item(&sink, update.delta.as_ref(), Some(PubSubSerializeMetric::Fast)).await {
+                } else if !send_subscription_item(&sink, update.delta.as_ref(), Some(PubSubMetric::FastLogs)).await {
                     return;
                 }
             }
@@ -459,7 +459,7 @@ where
                     return;
                 };
 
-                if !send_subscription_item(&sink, &item, Some(PubSubSerializeMetric::Fast)).await {
+                if !send_subscription_item(&sink, &item, None).await {
                     return;
                 }
             }
@@ -470,13 +470,13 @@ where
 async fn send_subscription_item<T>(
     sink: &SubscriptionSink,
     item: &T,
-    metric: Option<PubSubSerializeMetric>,
+    metric: Option<PubSubMetric>,
 ) -> bool
 where
     T: Serialize,
 {
     let msg = match metric {
-        Some(PubSubSerializeMetric::Fast) => {
+        Some(PubSubMetric::FastLogs) => {
             match base_metrics::time!(Metrics::fast_pubsub_serialize_duration(), {
                 SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), item)
             }) {
@@ -491,7 +491,7 @@ where
                 }
             }
         }
-        Some(PubSubSerializeMetric::LogsBatch) => {
+        Some(PubSubMetric::LogsBatch) => {
             match base_metrics::time!(Metrics::logs_batch_pubsub_serialize_duration(), {
                 SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), item)
             }) {
@@ -519,7 +519,19 @@ where
         },
     };
 
-    sink.send(msg).await.is_ok()
+    let send_result = match metric {
+        Some(PubSubMetric::FastLogs) => {
+            base_metrics::time!(Metrics::fast_pubsub_send_duration(), { sink.send(msg).await })
+        }
+        Some(PubSubMetric::LogsBatch) => {
+            base_metrics::time!(Metrics::logs_batch_pubsub_send_duration(), {
+                sink.send(msg).await
+            })
+        }
+        None => sink.send(msg).await,
+    };
+
+    send_result.is_ok()
 }
 
 /// Pipes all stream items to the subscription sink.

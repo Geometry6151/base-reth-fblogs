@@ -16,14 +16,32 @@ base_metrics::define_metrics! {
     state_queue_delay_duration: histogram,
     #[describe("Time taken to build pending state from flashblocks")]
     pending_state_build_duration: histogram,
-    #[describe("Time taken to build the newFlashblocks payload from pending state")]
+    #[describe("Time taken to build the newFastFlashblockLogs delta from pending state")]
     fast_delta_build_duration: histogram,
+    #[describe("Time taken to build the newFlashblocks block payload from pending state")]
+    new_flashblocks_build_duration: histogram,
     #[describe("Time taken to build the newFlashblockLogsBatch payload")]
     logs_batch_build_duration: histogram,
     #[describe("Time taken to serialize newFlashblockLogsBatch subscription payloads")]
     logs_batch_pubsub_serialize_duration: histogram,
-    #[describe("Time taken to serialize newFlashblocks subscription payloads")]
+    #[describe("Time taken to serialize newFastFlashblockLogs subscription payloads")]
     fast_pubsub_serialize_duration: histogram,
+    #[describe("Time taken to send newFastFlashblockLogs subscription payloads")]
+    fast_pubsub_send_duration: histogram,
+    #[describe("Time taken to send newFlashblockLogsBatch subscription payloads")]
+    logs_batch_pubsub_send_duration: histogram,
+    #[describe("Time taken to insert a pending snapshot into the snapshot cache")]
+    snapshot_cache_insert_duration: histogram,
+    #[describe("Time taken to look up a pending snapshot in the snapshot cache")]
+    snapshot_cache_get_duration: histogram,
+    #[describe("Time taken to clear the snapshot cache")]
+    snapshot_cache_clear_duration: histogram,
+    #[describe("Count of snapshot cache hits")]
+    snapshot_cache_hits: counter,
+    #[describe("Count of snapshot cache misses, including key-not-found and expired reads")]
+    snapshot_cache_misses: counter,
+    #[describe("Count of snapshot cache evictions from capacity pressure or explicit pruning")]
+    snapshot_cache_evictions: counter,
     #[describe("Time taken to estimate gas against a state-pinned flashblock snapshot with best-effort block env")]
     pinned_estimate_gas_duration: histogram,
     #[describe("Time taken to execute a call against a pinned flashblock snapshot")]

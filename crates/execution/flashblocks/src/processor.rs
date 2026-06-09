@@ -412,12 +412,12 @@ where
             (_, Some(next)) => next,
         };
 
+        let delta = base_metrics::time!(Metrics::fast_delta_build_duration(), {
+            pending_blocks.get_latest_fast_flashblock_logs_delta(self.next_snapshot_nonce(), None)
+        });
         let update = Arc::new(FlashblockUpdate {
             pending_blocks: Arc::clone(pending_blocks),
-            delta: Arc::new(
-                pending_blocks
-                    .get_latest_fast_flashblock_logs_delta(self.next_snapshot_nonce(), None),
-            ),
+            delta: Arc::new(delta),
         });
         self.snapshot_cache
             .lock()
