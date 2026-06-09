@@ -21,11 +21,20 @@ pub use error::{
     BuildError, ExecutionError, ProtocolError, ProviderError, Result, StateProcessorError,
 };
 
+mod fast_logs;
+pub use fast_logs::{
+    FastFlashblockLog, FastFlashblockLogsDelta, FastFlashblockLogsDeltaError, FastFlashblockTxMeta,
+    FlashblockSnapshotId, FlashblockUpdate,
+};
+
 mod metrics;
 pub use metrics::Metrics;
 
 mod pending_blocks;
 pub use pending_blocks::{PendingBlocks, PendingBlocksBuilder};
+
+mod snapshot_cache;
+pub use snapshot_cache::SnapshotCache;
 
 mod processor;
 pub use processor::{StateProcessor, StateUpdate};

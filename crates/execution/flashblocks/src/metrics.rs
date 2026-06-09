@@ -6,8 +6,28 @@ base_metrics::define_metrics! {
     upstream_errors: counter,
     #[describe("Count of messages received from the upstream source")]
     upstream_messages: counter,
-    #[describe("Time taken to process a message")]
+    #[describe("Time taken to decode upstream flashblock messages")]
+    upstream_decode_duration: histogram,
+    #[describe("Time taken to successfully apply a flashblock to pending state")]
     block_processing_duration: histogram,
+    #[describe("Time taken to attempt applying a flashblock, including success, cache, and error paths")]
+    flashblock_apply_duration: histogram,
+    #[describe("Time spent waiting in the flashblock state queue before processing starts")]
+    state_queue_delay_duration: histogram,
+    #[describe("Time taken to build pending state from flashblocks")]
+    pending_state_build_duration: histogram,
+    #[describe("Time taken to build the newFlashblocks payload from pending state")]
+    fast_delta_build_duration: histogram,
+    #[describe("Time taken to build the newFlashblockLogsBatch payload")]
+    logs_batch_build_duration: histogram,
+    #[describe("Time taken to serialize newFlashblockLogsBatch subscription payloads")]
+    logs_batch_pubsub_serialize_duration: histogram,
+    #[describe("Time taken to serialize newFlashblocks subscription payloads")]
+    fast_pubsub_serialize_duration: histogram,
+    #[describe("Time taken to estimate gas against a state-pinned flashblock snapshot with best-effort block env")]
+    pinned_estimate_gas_duration: histogram,
+    #[describe("Time taken to execute a call against a pinned flashblock snapshot")]
+    pinned_call_duration: histogram,
     #[describe("Time spent on parallel sender recovery")]
     sender_recovery_duration: histogram,
     #[describe("Number of Flashblocks that arrive in an unexpected order")]

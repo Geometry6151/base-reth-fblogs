@@ -1,6 +1,13 @@
 //! Flashblocks state processor.
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use alloy_consensus::{
     Header,
@@ -25,8 +32,9 @@ use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
 use crate::{
-    BlockAssembler, ExecutionError, FlashblockCache, PendingBlocks, PendingBlocksBuilder,
-    PendingStateBuilder, ProviderError, Result, StateProcessorError,
+    BlockAssembler, ExecutionError, FlashblockCache, FlashblockUpdate, PendingBlocks,
+    PendingBlocksBuilder, PendingStateBuilder, ProviderError, Result, SnapshotCache,
+    StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -40,7 +48,12 @@ pub enum StateUpdate {
     /// New canonical block to reconcile against pending state.
     Canonical(RecoveredBlock<BaseBlock>),
     /// Incoming flashblock payload to extend pending state.
-    Flashblock(Flashblock),
+    Flashblock {
+        /// The flashblock to apply to pending state.
+        flashblock: Flashblock,
+        /// The local time when this update was enqueued.
+        enqueued_at: Instant,
+    },
 }
 
 /// Processes flashblocks and canonical blocks to keep pending state updated.
@@ -50,8 +63,11 @@ pub struct StateProcessor<Client> {
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
     max_depth: u64,
     client: Client,
+    fast_sender: Sender<Arc<FlashblockUpdate>>,
     sender: Sender<Arc<PendingBlocks>>,
     cache: Arc<Mutex<FlashblockCache>>,
+    snapshot_cache: Arc<StdMutex<SnapshotCache>>,
+    next_snapshot_nonce: Arc<AtomicU64>,
 }
 
 impl<Client> StateProcessor<Client>
@@ -68,24 +84,43 @@ where
         pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
         max_depth: u64,
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+        fast_sender: Sender<Arc<FlashblockUpdate>>,
         sender: Sender<Arc<PendingBlocks>>,
+        snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     ) -> Self {
         let cache = client
             .best_block_number()
             .map_or_else(|_| FlashblockCache::new(0), FlashblockCache::new);
 
-        Self { pending_blocks, client, max_depth, rx, sender, cache: Arc::new(Mutex::new(cache)) }
+        Self {
+            pending_blocks,
+            client,
+            max_depth,
+            rx,
+            fast_sender,
+            sender,
+            cache: Arc::new(Mutex::new(cache)),
+            snapshot_cache,
+            next_snapshot_nonce: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Processes updates from the queue until the channel closes.
     pub async fn start(&self) {
         while let Some(update) = self.rx.lock().await.recv().await {
+            if let StateUpdate::Flashblock { enqueued_at, .. } = &update {
+                Metrics::state_queue_delay_duration().record(enqueued_at.elapsed());
+            }
+
             let prev_pending_blocks = self.pending_blocks.load_full();
             match update {
                 StateUpdate::Canonical(block) => {
                     debug!(message = "processing canonical block", block_number = block.number);
                     match self.process_canonical_block(prev_pending_blocks, &block) {
                         Ok(new_pending_blocks) => {
+                            if new_pending_blocks.is_none() {
+                                self.clear_snapshot_cache();
+                            }
                             self.pending_blocks.swap(new_pending_blocks);
 
                             let mut cache = self.cache.lock().await;
@@ -110,7 +145,7 @@ where
                         }
                     }
                 }
-                StateUpdate::Flashblock(flashblock) => {
+                StateUpdate::Flashblock { flashblock, .. } => {
                     debug!(
                         message = "processing flashblock",
                         block_number = flashblock.metadata.block_number,
@@ -127,14 +162,25 @@ where
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblock: Flashblock,
     ) {
-        let start_time = Instant::now();
-        match self.process_flashblock(prev_pending_blocks, &flashblock) {
+        let _flashblock_apply_timer = base_metrics::timed!(Metrics::flashblock_apply_duration());
+        let block_processing_start = Instant::now();
+        match self.process_flashblock(prev_pending_blocks.clone(), &flashblock) {
             Ok(new_pending_blocks) => {
+                let fast_update = self.prepare_fast_flashblock_update(
+                    prev_pending_blocks.as_ref(),
+                    new_pending_blocks.as_ref(),
+                );
+                if new_pending_blocks.is_none() {
+                    self.clear_snapshot_cache();
+                }
+                self.pending_blocks.swap(new_pending_blocks.clone());
+                if let Some(update) = fast_update {
+                    _ = self.fast_sender.send(update);
+                }
                 if let Some(ref pb) = new_pending_blocks {
                     _ = self.sender.send(Arc::clone(pb));
                 }
-                self.pending_blocks.swap(new_pending_blocks);
-                Metrics::block_processing_duration().record(start_time.elapsed());
+                Metrics::block_processing_duration().record(block_processing_start.elapsed());
             }
             Err(e) => {
                 match e {
@@ -232,6 +278,7 @@ where
                     block_txn_hashes = ?block_txn_hashes,
                 );
                 Metrics::pending_clear_reorg().increment(1);
+                self.clear_snapshot_cache();
 
                 // If there is a reorg, we re-process all future flashblocks without reusing the existing pending state
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
@@ -243,6 +290,7 @@ where
                     pending_blocks_depth = depth,
                     max_depth = max_depth,
                 );
+                self.clear_snapshot_cache();
 
                 flashblocks.retain(|flashblock| flashblock.metadata.block_number > block.number);
                 self.build_pending_state(None, &flashblocks)
@@ -341,12 +389,52 @@ where
         }
     }
 
+    fn clear_snapshot_cache(&self) {
+        self.snapshot_cache.lock().expect("snapshot cache mutex poisoned").clear();
+    }
+
+    fn next_snapshot_nonce(&self) -> u64 {
+        self.next_snapshot_nonce.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    fn prepare_fast_flashblock_update(
+        &self,
+        prev_pending_blocks: Option<&Arc<PendingBlocks>>,
+        new_pending_blocks: Option<&Arc<PendingBlocks>>,
+    ) -> Option<Arc<FlashblockUpdate>> {
+        if self.fast_sender.receiver_count() == 0 {
+            return None;
+        }
+
+        let pending_blocks = match (prev_pending_blocks, new_pending_blocks) {
+            (_, None) => return None,
+            (Some(prev), Some(next)) if Arc::ptr_eq(prev, next) => return None,
+            (_, Some(next)) => next,
+        };
+
+        let update = Arc::new(FlashblockUpdate {
+            pending_blocks: Arc::clone(pending_blocks),
+            delta: Arc::new(
+                pending_blocks
+                    .get_latest_fast_flashblock_logs_delta(self.next_snapshot_nonce(), None),
+            ),
+        });
+        self.snapshot_cache
+            .lock()
+            .expect("snapshot cache mutex poisoned")
+            .insert(update.delta.snapshot_id, Arc::clone(&update.pending_blocks));
+        Some(update)
+    }
+
     #[instrument(level = "debug", skip_all, fields(num_flashblocks = flashblocks.len()))]
     fn build_pending_state(
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblocks: &[Flashblock],
     ) -> Result<Option<Arc<PendingBlocks>>> {
+        let _pending_state_build_timer =
+            base_metrics::timed!(Metrics::pending_state_build_duration());
+
         // BTreeMap guarantees ascending order of keys while iterating
         let mut flashblocks_per_block = BTreeMap::<BlockNumber, Vec<Flashblock>>::new();
         for flashblock in flashblocks {

@@ -4,19 +4,25 @@ use std::str::FromStr;
 
 use DoubleCounter::DoubleCounterInstance;
 use alloy_consensus::{Transaction, constants::EMPTY_WITHDRAWALS};
-use alloy_eips::{BlockNumberOrTag, eip7685::EMPTY_REQUESTS_HASH};
+use alloy_eips::{BlockNumberOrTag, Decodable2718, Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
 use alloy_network::{ReceiptResponse, TransactionResponse};
-use alloy_primitives::{Address, B256, Bytes, TxHash, U256, address, b256, bytes};
+use alloy_primitives::{Address, B256, Bytes, TxHash, U256, address, b256, bytes, keccak256};
 use alloy_provider::Provider;
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types::simulate::{SimBlock, SimulatePayload};
+use alloy_rpc_types::{
+    BlockOverrides,
+    simulate::{SimBlock, SimulatePayload},
+    state::{AccountOverride, StateOverride},
+};
 use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::{TransactionInput, error::EthRpcErrorCode};
+use base_common_consensus::TxDeposit;
 use base_common_flashblocks::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
 };
 use base_common_network::Base;
 use base_common_rpc_types::BaseTransactionRequest;
+use base_flashblocks::{FlashblockSnapshotId, FlashblocksAPI};
 use base_flashblocks_node::test_harness::FlashblocksHarness;
 use base_node_runner::test_utils::L1_BLOCK_INFO_DEPOSIT_TX;
 use base_test_utils::{Account, DoubleCounter};
@@ -141,9 +147,77 @@ fn wrap_in_init_code(runtime_hex: &str) -> Bytes {
     Bytes::from(init_code)
 }
 
+fn block_env_reader_runtime(opcode: u8) -> Bytes {
+    Bytes::from(vec![opcode, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3])
+}
+
+fn block_number_revert_if_eq_runtime(expected_block_number: u8) -> Bytes {
+    Bytes::from(vec![
+        0x43, // NUMBER
+        0x60,
+        expected_block_number, // PUSH1 expected_block_number
+        0x14,                  // EQ
+        0x60,
+        0x08, // PUSH1 revert_dest
+        0x57, // JUMPI
+        0x00, // STOP
+        0x5b, // JUMPDEST
+        0x60,
+        0x00, // PUSH1 0
+        0x60,
+        0x00, // PUSH1 0
+        0xfd, // REVERT
+    ])
+}
+
+fn count1_snapshot_guard_runtime(counter_address: Address) -> Bytes {
+    let selector = keccak256("count1()");
+    let mut runtime = vec![0x63];
+    runtime.extend_from_slice(&selector[..4]);
+    runtime.extend_from_slice(&[
+        0x60, 0x00, 0x52, // mstore(0x00, selector)
+        0x60, 0x20, // out size
+        0x60, 0x00, // out offset
+        0x60, 0x04, // in size
+        0x60, 0x1c, // in offset
+        0x73, // PUSH20 counter_address
+    ]);
+    runtime.extend_from_slice(counter_address.as_slice());
+    runtime.extend_from_slice(&[
+        0x61, 0xff, 0xff, // gas
+        0xfa, // STATICCALL
+        0x15, 0x60, 0x44, 0x57, // revert if call failed
+        0x3d, 0x60, 0x20, 0x14, 0x15, 0x60, 0x44, 0x57, // revert if returndatasize != 32
+        0x60, 0x00, 0x51, 0x60, 0x02, 0x14, 0x15, 0x60, 0x44, 0x57, // revert if count1() != 2
+        0x60, 0x00, 0x60, 0x00, 0xf3, // return success with empty data
+        0x5b, 0x60, 0x00, 0x60, 0x00, 0xfd, // revert
+    ]);
+    Bytes::from(runtime)
+}
+
+fn code_override(address: Address, code: Bytes) -> StateOverride {
+    [(address, AccountOverride::default().with_code(code))].into_iter().collect()
+}
+
+fn u256_return_data(value: u64) -> Bytes {
+    Bytes::copy_from_slice(&U256::from(value).to_be_bytes::<32>())
+}
+
+fn unique_l1_block_info_deposit_tx(block_number: u64) -> Bytes {
+    let mut deposit = TxDeposit::decode_2718(&mut L1_BLOCK_INFO_DEPOSIT_TX.as_ref())
+        .expect("L1_BLOCK_INFO_DEPOSIT_TX must decode as a deposit transaction");
+    let mut source_hash = [0u8; 32];
+    source_hash[24..].copy_from_slice(&block_number.to_be_bytes());
+    deposit.source_hash = B256::from(source_hash);
+    let mut buf = Vec::with_capacity(deposit.encode_2718_len());
+    deposit.encode_2718(&mut buf);
+    buf.into()
+}
+
 struct TestSetup {
     harness: FlashblocksHarness,
     txn_details: TransactionDetails,
+    canonical_parent_hash: B256,
 }
 
 struct TransactionDetails {
@@ -176,6 +250,7 @@ impl TestSetup {
         let harness = FlashblocksHarness::new().await?;
 
         let provider = harness.provider();
+        let canonical_parent_hash = harness.latest_block().hash();
         let deployer = Account::Deployer;
         let alice = Account::Alice;
         let bob = Account::Bob;
@@ -262,7 +337,7 @@ impl TestSetup {
             balance_transfer_tx,
         };
 
-        Ok(Self { harness, txn_details })
+        Ok(Self { harness, txn_details, canonical_parent_hash })
     }
 
     fn create_first_payload(&self) -> Flashblock {
@@ -271,7 +346,7 @@ impl TestSetup {
             index: 0,
             base: Some(ExecutionPayloadBaseV1 {
                 parent_beacon_block_root: TEST_PARENT_BEACON_BLOCK_ROOT,
-                parent_hash: B256::default(),
+                parent_hash: self.canonical_parent_hash,
                 fee_recipient: Address::ZERO,
                 prev_randao: B256::default(),
                 block_number: 1,
@@ -319,6 +394,31 @@ impl TestSetup {
                 withdrawals_root: EMPTY_WITHDRAWALS,
             },
             metadata: Metadata { block_number: 1 },
+        }
+    }
+
+    fn create_third_payload(&self, parent_hash: B256) -> Flashblock {
+        Flashblock {
+            payload_id: PayloadId::new([1; 8]),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 {
+                parent_beacon_block_root: TEST_PARENT_BEACON_BLOCK_ROOT,
+                parent_hash,
+                fee_recipient: Address::ZERO,
+                prev_randao: B256::default(),
+                block_number: 2,
+                gas_limit: 30_000_000,
+                timestamp: 1,
+                extra_data: Bytes::new(),
+                base_fee_per_gas: U256::ZERO,
+            }),
+            diff: ExecutionPayloadFlashblockDeltaV1 {
+                blob_gas_used: Some(0),
+                transactions: vec![unique_l1_block_info_deposit_tx(2)],
+                withdrawals_root: EMPTY_WITHDRAWALS,
+                ..Default::default()
+            },
+            metadata: Metadata { block_number: 2 },
         }
     }
 
@@ -604,6 +704,429 @@ async fn test_eth_estimate_gas() -> Result<()> {
     assert!(res.is_err());
     assert!(
         res.unwrap_err().as_error_resp().unwrap().message.contains("insufficient funds for gas")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_base_estimate_gas_at_flashblock() -> Result<()> {
+    let setup = TestSetup::new().await?;
+    let canonical_parent_number = setup
+        .harness
+        .provider()
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await?
+        .expect("latest block expected")
+        .number();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+
+    let first_payload = setup.create_first_payload();
+    let snapshot_block_number =
+        first_payload.base.as_ref().expect("flashblock base payload expected").block_number;
+    assert_ne!(snapshot_block_number, canonical_parent_number);
+
+    setup.send_flashblock(first_payload).await?;
+    let _first_notification = ws_stream.next().await.unwrap()?;
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    let snapshot_id = notif["params"]["result"]["snapshotId"].clone();
+    assert_fast_flashblock_snapshot_id(&snapshot_id);
+
+    let url = setup.harness.rpc_url();
+    let client = RpcClient::new_http(url.parse()?);
+    let estimate_guard_address = address!("0x1000000000000000000000000000000000000001");
+    let estimate_overrides = code_override(
+        estimate_guard_address,
+        count1_snapshot_guard_runtime(setup.txn_details.counter_address),
+    );
+    let estimate_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(estimate_guard_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let estimate: U256 = client
+        .request(
+            "eth_baseEstimateGasAtFlashblock",
+            (snapshot_id.clone(), estimate_request(), Some(estimate_overrides.clone())),
+        )
+        .await?;
+
+    assert!(estimate > U256::ZERO, "expected snapshot-pinned estimate to succeed");
+
+    client
+        .request::<_, U256>(
+            "eth_estimateGas",
+            (estimate_request(), Some(BlockNumberOrTag::Latest), Some(estimate_overrides.clone())),
+        )
+        .await
+        .expect_err("latest estimate should fail without snapshot state pinning");
+
+    let block_env_guard_address = address!("0x1000000000000000000000000000000000000003");
+    let block_env_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(block_env_guard_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let snapshot_block_number_result: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id.clone(),
+                block_env_request(),
+                Some(code_override(block_env_guard_address, block_env_reader_runtime(0x43))),
+                None::<Box<BlockOverrides>>,
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        snapshot_block_number_result,
+        u256_return_data(snapshot_block_number),
+        "base call should execute against the synthetic flashblock header env"
+    );
+
+    let parent_block_number_guard = code_override(
+        block_env_guard_address,
+        block_number_revert_if_eq_runtime(
+            canonical_parent_number
+                .try_into()
+                .expect("test harness parent block number must fit in PUSH1"),
+        ),
+    );
+
+    let call_result: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id.clone(),
+                block_env_request(),
+                Some(parent_block_number_guard.clone()),
+                None::<Box<BlockOverrides>>,
+            ),
+        )
+        .await?;
+
+    assert!(
+        call_result.is_empty(),
+        "base call should not hit the canonical-parent block-number guard"
+    );
+
+    let error = client
+        .request::<_, U256>(
+            "eth_baseEstimateGasAtFlashblock",
+            (snapshot_id.clone(), block_env_request(), Some(parent_block_number_guard)),
+        )
+        .await
+        .expect_err("snapshot estimate should still use the canonical parent block env");
+
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert!(
+        error.message.contains("revert"),
+        "unexpected parent-env estimate error message: {}",
+        error.message
+    );
+
+    let mut unknown_snapshot_id = snapshot_id;
+    unknown_snapshot_id["nonce"] = json!("0xffff");
+    let error = client
+        .request::<_, U256>(
+            "eth_baseEstimateGasAtFlashblock",
+            (unknown_snapshot_id, estimate_request(), Some(estimate_overrides)),
+        )
+        .await
+        .expect_err("unknown snapshot should fail");
+
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_eq!(error.code, -32602);
+    assert!(
+        error.message.contains("unknown flashblock snapshot"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_base_call_at_flashblock() -> Result<()> {
+    let setup = TestSetup::new().await?;
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+    let _first_notification = ws_stream.next().await.unwrap()?;
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    let snapshot_id = notif["params"]["result"]["snapshotId"].clone();
+    assert_fast_flashblock_snapshot_id(&snapshot_id);
+
+    let url = setup.harness.rpc_url();
+    let client = RpcClient::new_http(url.parse()?);
+    let result: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id.clone(),
+                setup.count1(),
+                None::<serde_json::Value>,
+                None::<serde_json::Value>,
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        result,
+        bytes!("0x0000000000000000000000000000000000000000000000000000000000000002")
+    );
+
+    let block_env_reader_address = address!("0x1000000000000000000000000000000000000002");
+    let block_env_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(block_env_reader_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let snapshot_block_number: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id.clone(),
+                block_env_request(),
+                Some(code_override(block_env_reader_address, block_env_reader_runtime(0x43))),
+                None::<Box<BlockOverrides>>,
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        snapshot_block_number,
+        u256_return_data(1),
+        "snapshot header block number should be visible by default"
+    );
+
+    let overridden_block_number: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id.clone(),
+                block_env_request(),
+                Some(code_override(block_env_reader_address, block_env_reader_runtime(0x43))),
+                Some(Box::new(BlockOverrides {
+                    number: Some(U256::from(42)),
+                    ..Default::default()
+                })),
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        overridden_block_number,
+        u256_return_data(42),
+        "user block overrides should take precedence over snapshot defaults"
+    );
+
+    let mut unknown_snapshot_id = snapshot_id;
+    unknown_snapshot_id["nonce"] = json!("0xffff");
+    let error = client
+        .request::<_, Bytes>(
+            "eth_baseCallAtFlashblock",
+            (
+                unknown_snapshot_id,
+                setup.count1(),
+                None::<serde_json::Value>,
+                None::<serde_json::Value>,
+            ),
+        )
+        .await
+        .expect_err("unknown snapshot should fail");
+
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_eq!(error.code, -32602);
+    assert!(
+        error.message.contains("unknown flashblock snapshot"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pinned_flashblock_rpc_accepts_multi_block_pending_snapshot() -> Result<()> {
+    let setup = TestSetup::new().await?;
+    let provider = setup.harness.provider();
+    let canonical_parent_number = provider
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await?
+        .expect("latest block expected")
+        .number();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+    let _first_notification = ws_stream.next().await.unwrap()?;
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+    let _second_notification = ws_stream.next().await.unwrap()?;
+
+    let first_pending_block = provider
+        .get_block_by_number(BlockNumberOrTag::Pending)
+        .await?
+        .expect("pending block expected");
+    let first_pending_hash = first_pending_block.hash();
+    assert_ne!(first_pending_hash, setup.canonical_parent_hash);
+
+    setup.send_flashblock(setup.create_third_payload(first_pending_hash)).await?;
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    let snapshot_id = notif["params"]["result"]["snapshotId"].clone();
+    assert_fast_flashblock_snapshot_id(&snapshot_id);
+    assert_eq!(snapshot_id["blockNumber"], "0x2");
+    assert_eq!(snapshot_id["flashblockIndex"], "0x0");
+    assert_eq!(snapshot_id["parentHash"], json!(first_pending_hash));
+    assert_ne!(snapshot_id["parentHash"], json!(setup.canonical_parent_hash));
+
+    let url = setup.harness.rpc_url();
+    let client = RpcClient::new_http(url.parse()?);
+    let estimate_guard_address = address!("0x1000000000000000000000000000000000000004");
+    let estimate_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(estimate_guard_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let estimate: U256 = client
+        .request(
+            "eth_baseEstimateGasAtFlashblock",
+            (
+                snapshot_id.clone(),
+                estimate_request(),
+                Some(code_override(
+                    estimate_guard_address,
+                    count1_snapshot_guard_runtime(setup.txn_details.counter_address),
+                )),
+            ),
+        )
+        .await?;
+
+    assert!(estimate > U256::ZERO, "expected multi-block snapshot estimate to succeed");
+
+    let block_env_guard_address = address!("0x1000000000000000000000000000000000000005");
+    let block_env_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(block_env_guard_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let snapshot_block_number: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id.clone(),
+                block_env_request(),
+                Some(code_override(block_env_guard_address, block_env_reader_runtime(0x43))),
+                None::<Box<BlockOverrides>>,
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        snapshot_block_number,
+        u256_return_data(2),
+        "base call should see the latest pending block header for a multi-block snapshot"
+    );
+
+    let estimate_error = client
+        .request::<_, U256>(
+            "eth_baseEstimateGasAtFlashblock",
+            (
+                snapshot_id,
+                block_env_request(),
+                Some(code_override(
+                    block_env_guard_address,
+                    block_number_revert_if_eq_runtime(
+                        canonical_parent_number
+                            .try_into()
+                            .expect("test harness parent block number must fit in PUSH1"),
+                    ),
+                )),
+            ),
+        )
+        .await
+        .expect_err("snapshot estimate should still use the canonical parent block env");
+
+    let estimate_error = estimate_error.as_error_resp().expect("json-rpc error response expected");
+    assert!(
+        estimate_error.message.contains("revert"),
+        "unexpected parent-env estimate error message: {}",
+        estimate_error.message
     );
 
     Ok(())
@@ -1097,6 +1620,31 @@ fn assert_flashblock_logs_batch_transaction(tx: &serde_json::Value) {
     assert_hex_string(&tx["status"], "status");
 }
 
+fn assert_fast_flashblock_snapshot_id(snapshot_id: &serde_json::Value) {
+    assert_hex_string(&snapshot_id["nonce"], "snapshotId.nonce");
+    assert_hex_string(&snapshot_id["blockNumber"], "snapshotId.blockNumber");
+    assert_hex_string(&snapshot_id["flashblockIndex"], "snapshotId.flashblockIndex");
+    assert_hex_string(&snapshot_id["payloadId"], "snapshotId.payloadId");
+    assert_hex_string(&snapshot_id["parentHash"], "snapshotId.parentHash");
+}
+
+fn assert_fast_flashblock_log(log: &serde_json::Value) {
+    assert_hex_string(&log["txHash"], "txHash");
+    assert_hex_string(&log["txIndex"], "txIndex");
+    assert_hex_string(&log["logIndexInTx"], "logIndexInTx");
+    assert_hex_string(&log["logIndexInBlock"], "logIndexInBlock");
+    assert!(log["address"].is_string(), "expected address string, got: {log:?}");
+    assert!(log["topics"].is_array(), "expected topics array, got: {log:?}");
+    assert_hex_string(&log["data"], "data");
+    assert!(log.get("removed").is_none(), "did not expect removed flag, got: {log:?}");
+}
+
+fn assert_fast_flashblock_transaction(tx: &serde_json::Value) {
+    assert_hex_string(&tx["hash"], "hash");
+    assert_hex_string(&tx["index"], "index");
+    assert_hex_string(&tx["status"], "status");
+}
+
 #[tokio::test]
 async fn test_eth_subscribe_new_flashblock_transactions_hashes() -> eyre::Result<()> {
     let setup = TestSetup::new().await?;
@@ -1500,6 +2048,267 @@ async fn test_eth_subscribe_new_flashblock_logs_batch_null_params() -> eyre::Res
     }
 
     assert!(saw_trigger_tx, "expected tx metadata for log trigger tx, got: {transactions:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_fast_flashblock_logs_unfiltered() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+    let subscription_id = sub["result"].as_str().expect("subscription id expected");
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["method"], "eth_subscription");
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let delta = &notif["params"]["result"];
+    assert_eq!(delta["blockNumber"], "0x1");
+    assert_eq!(delta["flashblockIndex"], "0x0");
+    assert!(delta.get("batchHash").is_none(), "did not expect batchHash in fast delta: {delta:?}");
+    assert_fast_flashblock_snapshot_id(&delta["snapshotId"]);
+    assert_eq!(delta["snapshotId"]["blockNumber"], delta["blockNumber"]);
+    assert_eq!(delta["snapshotId"]["flashblockIndex"], delta["flashblockIndex"]);
+    let snapshot_id: FlashblockSnapshotId = serde_json::from_value(delta["snapshotId"].clone())?;
+    assert!(
+        setup.harness.flashblocks_state().get_snapshot(snapshot_id).is_some(),
+        "expected first fast update snapshot to be cached"
+    );
+    assert!(delta["logs"].is_array(), "expected logs array, got: {delta:?}");
+    assert!(delta["transactions"].is_array(), "expected transactions array, got: {delta:?}");
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let delta = &notif["params"]["result"];
+    assert_eq!(delta["blockNumber"], "0x1");
+    assert_eq!(delta["flashblockIndex"], "0x1");
+    assert!(delta.get("batchHash").is_none(), "did not expect batchHash in fast delta: {delta:?}");
+    assert_fast_flashblock_snapshot_id(&delta["snapshotId"]);
+
+    let logs = delta["logs"].as_array().expect("logs array expected");
+    assert!(logs.len() >= 2, "expected at least 2 logs, got: {logs:?}");
+
+    let expected_trigger_hash = setup.txn_details.log_trigger_hash.to_string().to_lowercase();
+    let expected_log_emitter_a = setup.txn_details.log_emitter_a_address.to_string().to_lowercase();
+    let expected_log_emitter_b = setup.txn_details.log_emitter_b_address.to_string().to_lowercase();
+    let mut seen_log_emitter_a = false;
+    let mut seen_log_emitter_b = false;
+
+    for log in logs {
+        assert_fast_flashblock_log(log);
+
+        let address = log["address"].as_str().expect("log address string expected").to_lowercase();
+        let tx_hash = log["txHash"].as_str().expect("log txHash string expected").to_lowercase();
+        assert_eq!(tx_hash, expected_trigger_hash);
+
+        if address == expected_log_emitter_a {
+            seen_log_emitter_a = true;
+        }
+        if address == expected_log_emitter_b {
+            seen_log_emitter_b = true;
+        }
+    }
+
+    assert!(seen_log_emitter_a, "expected unfiltered logs to include LogEmitterA");
+    assert!(seen_log_emitter_b, "expected unfiltered logs to include LogEmitterB");
+
+    let transactions = delta["transactions"].as_array().expect("transactions array expected");
+    assert!(
+        !transactions.is_empty(),
+        "expected at least 1 transaction metadata entry, got: {transactions:?}"
+    );
+
+    let mut saw_trigger_tx = false;
+    for tx in transactions {
+        assert_fast_flashblock_transaction(tx);
+
+        if tx["hash"]
+            .as_str()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(expected_trigger_hash.as_str()))
+        {
+            saw_trigger_tx = true;
+        }
+    }
+
+    assert!(saw_trigger_tx, "expected tx metadata for log trigger tx, got: {transactions:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_fast_flashblock_logs_filter() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": [
+                    "newFastFlashblockLogs",
+                    { "address": setup.txn_details.log_emitter_a_address }
+                ]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+    let subscription_id = sub["result"].as_str().expect("subscription id expected");
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let delta = &notif["params"]["result"];
+    assert!(delta.get("batchHash").is_none(), "did not expect batchHash in fast delta: {delta:?}");
+    assert!(delta["logs"].as_array().expect("logs array expected").is_empty());
+    assert!(delta["transactions"].as_array().expect("transactions array expected").is_empty());
+
+    setup.send_flashblock(setup.create_second_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let delta = &notif["params"]["result"];
+    let logs = delta["logs"].as_array().expect("logs array expected");
+    assert_eq!(logs.len(), 1, "expected exactly one filtered log, got: {logs:?}");
+
+    let expected_trigger_hash = setup.txn_details.log_trigger_hash.to_string().to_lowercase();
+    let filter_address = setup.txn_details.log_emitter_a_address.to_string().to_lowercase();
+    for log in logs {
+        assert_fast_flashblock_log(log);
+        let address = log["address"].as_str().expect("log address string expected");
+        let tx_hash = log["txHash"].as_str().expect("log txHash string expected");
+        assert_eq!(address.to_lowercase(), filter_address);
+        assert_eq!(tx_hash.to_lowercase(), expected_trigger_hash);
+    }
+
+    let transactions = delta["transactions"].as_array().expect("transactions array expected");
+    assert_eq!(
+        transactions.len(),
+        1,
+        "expected only referenced tx metadata to remain, got: {transactions:?}"
+    );
+    assert_fast_flashblock_transaction(&transactions[0]);
+    assert_eq!(
+        transactions[0]["hash"].as_str().expect("tx hash string expected").to_lowercase(),
+        expected_trigger_hash
+    );
+    assert_eq!(transactions[0]["index"], logs[0]["txIndex"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_fast_flashblock_logs_invalid_params() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs", true]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let error: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(error["jsonrpc"], "2.0");
+    assert_eq!(error["id"], 1);
+    assert!(error.get("error").is_some(), "expected error response, got: {error:?}");
+    let message = error["error"]["message"].as_str().expect("error message expected");
+    assert!(message.contains("newFastFlashblockLogs"), "unexpected error message: {message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_fast_flashblock_logs_null_params() -> eyre::Result<()> {
+    let setup = TestSetup::new().await?;
+    let _provider = setup.harness.provider();
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs", null]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+    let subscription_id = sub["result"].as_str().expect("subscription id expected");
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+    assert_eq!(notif["method"], "eth_subscription");
+    assert_eq!(notif["params"]["subscription"], subscription_id);
+
+    let delta = &notif["params"]["result"];
+    assert_eq!(delta["blockNumber"], "0x1");
+    assert_eq!(delta["flashblockIndex"], "0x0");
+    assert!(delta.get("batchHash").is_none(), "did not expect batchHash in fast delta: {delta:?}");
+    assert_fast_flashblock_snapshot_id(&delta["snapshotId"]);
+    assert!(delta["logs"].is_array(), "expected logs array, got: {delta:?}");
+    assert!(delta["transactions"].is_array(), "expected transactions array, got: {delta:?}");
 
     Ok(())
 }

@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 
 /// A [`BlockNumberOrTag`] wrapper that also accepts `"unsafe"` as an alias for `"latest"`.
 ///
@@ -78,7 +78,9 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use crate::{FlashblocksAPI, PendingBlocksAPI, metrics::Metrics};
+use crate::{
+    FlashblockSnapshotId, FlashblocksAPI, PendingBlocks, PendingBlocksAPI, metrics::Metrics,
+};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
 const MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS: u64 = 6_000;
@@ -144,6 +146,30 @@ pub trait EthApiOverride {
         block_number: Option<BlockId>,
         overrides: Option<StateOverride>,
     ) -> RpcResult<U256>;
+
+    /// Estimates gas against a cached flashblock snapshot.
+    ///
+    /// This pins the snapshot state on top of the canonical parent block state, but it does not
+    /// pin the synthetic flashblock header fields. Upstream gas estimation only accepts state
+    /// overrides, so block env values like `block.number`, `block.timestamp`, and `block.basefee`
+    /// remain best-effort and come from the canonical parent block used as the estimation base.
+    #[method(name = "baseEstimateGasAtFlashblock")]
+    async fn base_estimate_gas_at_flashblock(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+        overrides: Option<StateOverride>,
+    ) -> RpcResult<U256>;
+
+    /// Executes a call against a cached flashblock snapshot.
+    #[method(name = "baseCallAtFlashblock")]
+    async fn base_call_at_flashblock(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<alloy_primitives::Bytes>;
 
     /// Simulates transactions with flashblock state support.
     #[method(name = "simulateV1")]
@@ -450,6 +476,78 @@ where
             .map_err(Into::into)
     }
 
+    async fn base_estimate_gas_at_flashblock(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+        overrides: Option<StateOverride>,
+    ) -> RpcResult<U256> {
+        debug!(
+            message = "rpc::base_estimate_gas_at_flashblock",
+            snapshot_id = ?snapshot_id,
+            transaction = ?transaction,
+            overrides = ?overrides,
+        );
+
+        let snapshot = self.get_flashblock_snapshot(snapshot_id)?;
+        let _pinned_estimate_gas_timer =
+            base_metrics::timed!(Metrics::pinned_estimate_gas_duration());
+        let mut state_overrides_builder =
+            StateOverridesBuilder::new(snapshot.get_state_overrides().unwrap_or_default());
+        state_overrides_builder = state_overrides_builder.extend(overrides.unwrap_or_default());
+        let final_overrides = state_overrides_builder.build();
+
+        // Best effort only: we pin the cached flashblock state exactly, but upstream
+        // `estimate_gas_at` does not accept block overrides. Estimation therefore still executes
+        // against the canonical parent block env instead of the snapshot's synthetic pending
+        // header.
+        EthCall::estimate_gas_at(
+            &self.eth_api,
+            transaction,
+            Self::flashblock_snapshot_base_block_id(snapshot.as_ref()),
+            Some(final_overrides),
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn base_call_at_flashblock(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<alloy_primitives::Bytes> {
+        debug!(
+            message = "rpc::base_call_at_flashblock",
+            snapshot_id = ?snapshot_id,
+            transaction = ?transaction,
+            state_overrides = ?state_overrides,
+            block_overrides = ?block_overrides,
+        );
+
+        let snapshot = self.get_flashblock_snapshot(snapshot_id)?;
+        let _pinned_call_timer = base_metrics::timed!(Metrics::pinned_call_duration());
+        let mut state_overrides_builder =
+            StateOverridesBuilder::new(snapshot.get_state_overrides().unwrap_or_default());
+        state_overrides_builder =
+            state_overrides_builder.extend(state_overrides.unwrap_or_default());
+        let final_state_overrides = state_overrides_builder.build();
+
+        let snapshot_block_overrides = Self::flashblock_snapshot_block_overrides(snapshot.as_ref());
+        let final_block_overrides =
+            Self::merge_block_overrides(snapshot_block_overrides, block_overrides);
+
+        EthCall::call(
+            &self.eth_api,
+            transaction,
+            Some(Self::flashblock_snapshot_base_block_id(snapshot.as_ref())),
+            EvmOverrides::new(Some(final_state_overrides), final_block_overrides),
+        )
+        .await
+        .map_err(Into::into)
+    }
+
     async fn simulate_v1(
         &self,
         opts: SimulatePayload<BaseTransactionRequest>,
@@ -586,6 +684,75 @@ where
     Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
     FB: FlashblocksAPI + Send + Sync + 'static,
 {
+    fn invalid_flashblock_snapshot(message: impl Into<String>) -> ErrorObjectOwned {
+        ErrorObjectOwned::owned(INVALID_PARAMS_CODE, message.into(), None::<()>)
+    }
+
+    fn get_flashblock_snapshot(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+    ) -> RpcResult<Arc<PendingBlocks>> {
+        // The snapshot cache is keyed by the full `FlashblockSnapshotId`, so a successful lookup
+        // is already authoritative for snapshot identity.
+        let Some(snapshot) = self.flashblocks_state.get_snapshot(snapshot_id) else {
+            return Err(Self::invalid_flashblock_snapshot("unknown flashblock snapshot"));
+        };
+
+        Ok(snapshot)
+    }
+
+    fn flashblock_snapshot_base_block_id(snapshot: &PendingBlocks) -> BlockId {
+        // Pinned execution still resolves from the canonical parent of the earliest pending block.
+        // That base parent can differ from the fast delta's emitted `snapshot_id.parent_hash()`
+        // when the cached pending window spans multiple block numbers.
+        BlockId::Hash(RpcBlockHash::from_hash(snapshot.parent_hash(), Some(true)))
+    }
+
+    fn flashblock_snapshot_block_overrides(snapshot: &PendingBlocks) -> BlockOverrides {
+        let header = snapshot.latest_header();
+
+        BlockOverrides {
+            number: Some(U256::from(header.number)),
+            difficulty: Some(header.difficulty),
+            time: Some(header.timestamp),
+            gas_limit: Some(header.gas_limit),
+            coinbase: Some(header.beneficiary),
+            random: Some(header.mix_hash),
+            base_fee: header.base_fee_per_gas.map(U256::from),
+            // `blob_base_fee` requires chain blob params; the cached snapshot header alone does not
+            // carry enough information to reconstruct it generically here.
+            blob_base_fee: None,
+            beacon_root: header.parent_beacon_block_root,
+            block_hash: None,
+        }
+    }
+
+    fn merge_block_overrides(
+        flashblock_overrides: BlockOverrides,
+        user_overrides: Option<Box<BlockOverrides>>,
+    ) -> Option<Box<BlockOverrides>> {
+        match user_overrides {
+            Some(user_overrides) => {
+                let user_overrides = *user_overrides;
+                Some(Box::new(BlockOverrides {
+                    number: user_overrides.number.or(flashblock_overrides.number),
+                    difficulty: user_overrides.difficulty.or(flashblock_overrides.difficulty),
+                    time: user_overrides.time.or(flashblock_overrides.time),
+                    gas_limit: user_overrides.gas_limit.or(flashblock_overrides.gas_limit),
+                    coinbase: user_overrides.coinbase.or(flashblock_overrides.coinbase),
+                    random: user_overrides.random.or(flashblock_overrides.random),
+                    base_fee: user_overrides.base_fee.or(flashblock_overrides.base_fee),
+                    blob_base_fee: user_overrides
+                        .blob_base_fee
+                        .or(flashblock_overrides.blob_base_fee),
+                    beacon_root: user_overrides.beacon_root.or(flashblock_overrides.beacon_root),
+                    block_hash: user_overrides.block_hash.or(flashblock_overrides.block_hash),
+                }))
+            }
+            None => (!flashblock_overrides.is_empty()).then_some(Box::new(flashblock_overrides)),
+        }
+    }
+
     async fn wait_for_flashblocks_receipt(&self, tx_hash: TxHash) -> Option<RpcReceipt<Base>> {
         let mut receiver = self.flashblocks_state.subscribe_to_flashblocks();
 

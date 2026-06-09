@@ -159,6 +159,12 @@ pub enum BaseSubscriptionKind {
     /// Returns batch-oriented log updates for each flashblock applied to the pending block,
     /// including per-log indices and referenced transaction metadata.
     NewFlashblockLogsBatch,
+    /// New fast flashblock logs subscription.
+    ///
+    /// Returns the local fast-path logs delta emitted by the in-process fast-update broadcaster.
+    /// This payload includes a `snapshotId` cursor but intentionally does not include a
+    /// `batchHash`.
+    NewFastFlashblockLogs,
 }
 
 impl ExtendedSubscriptionKind {
@@ -366,6 +372,16 @@ mod tests {
 
         let encoded = serde_json::to_string(&kind).unwrap();
         assert_eq!(encoded, r#""newFlashblockLogsBatch""#);
+    }
+
+    #[test]
+    fn base_subscription_kind_decodes_new_fast_flashblock_logs() {
+        let kind: BaseSubscriptionKind =
+            serde_json::from_str(r#""newFastFlashblockLogs""#).unwrap();
+        assert_eq!(kind, BaseSubscriptionKind::NewFastFlashblockLogs);
+
+        let encoded = serde_json::to_string(&kind).unwrap();
+        assert_eq!(encoded, r#""newFastFlashblockLogs""#);
     }
 
     #[test]

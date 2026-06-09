@@ -12,7 +12,7 @@ use reth_rpc_convert::RpcTransaction;
 use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
 use tokio::sync::broadcast;
 
-use crate::PendingBlocks;
+use crate::{FlashblockSnapshotId, FlashblockUpdate, PendingBlocks};
 
 /// Trait for receiving flashblock updates.
 pub trait FlashblocksReceiver {
@@ -24,6 +24,16 @@ pub trait FlashblocksReceiver {
 pub trait FlashblocksAPI {
     /// Retrieves the pending blocks.
     fn get_pending_blocks(&self) -> Guard<Option<Arc<PendingBlocks>>>;
+
+    /// Subscribes to fast flashblock log deltas paired with their pending snapshots.
+    fn subscribe_to_fast_flashblock_logs(&self) -> broadcast::Receiver<Arc<FlashblockUpdate>>;
+
+    /// Returns a cached pending snapshot for a previously emitted fast update.
+    ///
+    /// This lookup is best effort. After pending-state reset, cache clear, or cache eviction, a
+    /// previously buffered fast update may no longer resolve even if the update itself is still
+    /// readable from the broadcast channel. Callers must treat `None` as a resync signal.
+    fn get_snapshot(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<PendingBlocks>>;
 
     /// Subscribes to flashblock updates.
     fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>>;
