@@ -443,8 +443,8 @@ where
         HotSnapshot,
     )> {
         let evm_config = BaseEvmConfig::base(self.client.chain_spec());
-        let block_header = execution_block.header.clone();
-        let block_timestamp = Some(block_header.timestamp);
+        let suffix_header = execution_block.header.clone();
+        let block_timestamp = Some(suffix_header.timestamp);
         let start_tx_index = pending_block.next_tx_index;
         let start_log_index = pending_block.next_log_index;
         let mut cumulative_gas_used = pending_block.cumulative_gas_used;
@@ -452,7 +452,7 @@ where
         let tx_count = decoded_transactions.len();
         let next_log_index_usize = Self::usize_from_u64(start_log_index, "next_log_index")?;
         let evm_env = evm_config
-            .evm_env(&block_header)
+            .evm_env(&suffix_header)
             .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?;
         let evm = evm_config.evm_with_env(execution.db, evm_env);
         let mut pending_state_builder = PendingStateBuilder::new_with_cursors(
@@ -500,7 +500,6 @@ where
 
         let (mut db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         db.merge_transitions(BundleRetention::Reverts);
-        let latest_header = Self::seal_header(block_header);
 
         let delta = {
             let _delta_build_timer = base_metrics::timed!(Metrics::hot_delta_build_duration());
@@ -559,11 +558,12 @@ where
 
         pending_block.payload_id = flashblock.payload_id;
         pending_block.latest_flashblock_index = flashblock.index;
-        pending_block.latest_header = latest_header.clone();
         pending_block.next_tx_index = start_tx_index.saturating_add(tx_count as u64);
         pending_block.next_log_index = next_log_index;
         pending_block.cumulative_gas_used = cumulative_gas_used;
         pending_block.flashblocks.push(flashblock.clone());
+        let latest_header = Self::assembled_pending_header(&pending_block)?;
+        pending_block.latest_header = latest_header.clone();
 
         execution.db = db;
         execution.last_header = latest_header.clone();
@@ -607,7 +607,8 @@ where
         pending_block: &HotPendingBlock,
         block: &RecoveredBlock<BaseBlock>,
     ) -> bool {
-        let Ok(assembled_pending_block) = BlockAssembler::assemble(&pending_block.flashblocks) else {
+        let Ok(assembled_pending_block) = BlockAssembler::assemble(&pending_block.flashblocks)
+        else {
             return false;
         };
         let assembled_header = &assembled_pending_block.block.header;
@@ -636,6 +637,11 @@ where
     fn seal_header(header: Header) -> Sealed<Header> {
         let hash = header.hash_slow();
         Sealed::new_unchecked(header, hash)
+    }
+
+    fn assembled_pending_header(pending_block: &HotPendingBlock) -> Result<Sealed<Header>> {
+        let assembled = BlockAssembler::assemble(&pending_block.flashblocks)?;
+        Ok(Self::seal_header(assembled.block.header))
     }
 
     fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
@@ -966,6 +972,68 @@ mod tests {
                 .number,
             2,
         );
+    }
+
+    #[test]
+    fn hot_engine_rolls_over_after_multiple_flashblocks_using_assembled_parent_hash() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_deploy_tx = create_deploy_log_tx(0x33);
+        let first_block_contract =
+            first_block_deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
+        let first_block_call_tx = create_call_log_tx(first_block_contract, 0x34);
+        let second_block_deploy_tx = create_deploy_log_tx_with_gas_limit(0x35, 120_000);
+        seed_sender_balance(&client, &first_block_deploy_tx);
+        seed_sender_balance(&client, &first_block_call_tx);
+        seed_sender_balance(&client, &second_block_deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x23; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_deploy_tx.clone()],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let second_flashblock = flashblock(
+            1,
+            1,
+            PayloadId::new([0x24; 8]),
+            canonical_parent_hash,
+            false,
+            vec![first_block_call_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
+
+        let assembled_parent_hash =
+            BlockAssembler::assemble(&[first_flashblock.clone(), second_flashblock.clone()])
+                .expect("block should assemble")
+                .block
+                .header
+                .hash_slow();
+        let third_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0x25; 8]),
+            assembled_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), second_block_deploy_tx],
+        );
+
+        let HotApplyOutcome::Delta { delta, .. } = engine
+            .apply_flashblock(&third_flashblock)
+            .expect("next block should roll over from assembled parent hash")
+        else {
+            panic!("expected next-block delta outcome after multi-flashblock parent");
+        };
+
+        assert_eq!(delta.transactions.len(), 2);
+        assert_eq!(engine.window.blocks.len(), 2);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(1));
+        assert_eq!(engine.window.blocks.back().map(|block| block.block_number), Some(2));
     }
 
     #[test]
