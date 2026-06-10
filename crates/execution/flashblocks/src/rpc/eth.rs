@@ -79,7 +79,8 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    FlashblockSnapshotId, FlashblocksAPI, PendingBlocks, PendingBlocksAPI, metrics::Metrics,
+    FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode, HotSnapshot, PendingBlocks,
+    PendingBlocksAPI, metrics::Metrics, rpc::types::unsupported_in_hot_only,
 };
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
@@ -224,6 +225,10 @@ where
         );
 
         if number.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only("eth_getBlockByNumber(\"pending\")", None));
+            }
+
             Metrics::rpc_get_block_by_number().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             if pending_blocks.as_ref().is_some() {
@@ -255,6 +260,10 @@ where
             return Ok(Some(canonical_receipt));
         }
 
+        if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+            return Ok(None);
+        }
+
         // Fall back to flashblocks for pending transactions
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
         if let Some(fb_receipt) = pending_blocks.get_transaction_receipt(tx_hash) {
@@ -276,6 +285,10 @@ where
         );
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only("eth_getBalance(..., \"pending\")", None));
+            }
+
             Metrics::rpc_get_balance().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             if let Some(balance) = pending_blocks.get_balance(address) {
@@ -298,6 +311,13 @@ where
 
         let block_id = block_number.unwrap_or_default();
         if block_id.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only(
+                    "eth_getTransactionCount(..., \"pending\")",
+                    None,
+                ));
+            }
+
             Metrics::rpc_get_transaction_count().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             let canon_block = pending_blocks.get_canonical_block_number();
@@ -334,6 +354,10 @@ where
             return Ok(Some(canonical_tx));
         }
 
+        if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+            return Ok(None);
+        }
+
         // Fall back to flashblocks for pending transactions
         let pending_blocks = self.flashblocks_state.get_pending_blocks();
         if let Some(fb_transaction) = pending_blocks.get_transaction_by_hash(tx_hash) {
@@ -350,6 +374,10 @@ where
         timeout_ms: Option<u64>,
     ) -> RpcResult<RpcReceipt<Base>> {
         debug!(message = "rpc::send_raw_transaction_sync");
+
+        if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+            return Err(unsupported_in_hot_only("eth_sendRawTransactionSync", None));
+        }
 
         let timeout_ms = match timeout_ms {
             Some(ms) if ms > MAX_TIMEOUT_SEND_RAW_TX_SYNC_MS => {
@@ -419,6 +447,13 @@ where
         let mut pending_overrides = EvmOverrides::default();
         // If the call is to pending block use cached override (if it exists)
         if block_id.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only(
+                    "eth_call(..., \"pending\")",
+                    Some("eth_baseCallAtFlashblock"),
+                ));
+            }
+
             Metrics::rpc_call().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
@@ -460,6 +495,13 @@ where
         let mut pending_overrides = EvmOverrides::default();
         // If the call is to pending block use cached override (if it exists)
         if block_id.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only(
+                    "eth_estimateGas(..., \"pending\")",
+                    Some("eth_baseEstimateGasAtFlashblock"),
+                ));
+            }
+
             Metrics::rpc_estimate_gas().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
@@ -489,26 +531,53 @@ where
             overrides = ?overrides,
         );
 
-        let snapshot = self.get_flashblock_snapshot(snapshot_id)?;
         let _pinned_estimate_gas_timer =
             base_metrics::timed!(Metrics::pinned_estimate_gas_duration());
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(snapshot.get_state_overrides().unwrap_or_default());
-        state_overrides_builder = state_overrides_builder.extend(overrides.unwrap_or_default());
-        let final_overrides = state_overrides_builder.build();
 
-        // Best effort only: we pin the cached flashblock state exactly, but upstream
-        // `estimate_gas_at` does not accept block overrides. Estimation therefore still executes
-        // against the canonical parent block env instead of the snapshot's synthetic pending
-        // header.
-        EthCall::estimate_gas_at(
-            &self.eth_api,
-            transaction,
-            Self::flashblock_snapshot_base_block_id(snapshot.as_ref()),
-            Some(final_overrides),
-        )
-        .await
-        .map_err(Into::into)
+        match self.flashblocks_state.mode() {
+            FlashblocksMode::Legacy => {
+                let snapshot = self.get_flashblock_snapshot(snapshot_id)?;
+                let mut state_overrides_builder =
+                    StateOverridesBuilder::new(snapshot.get_state_overrides().unwrap_or_default());
+                state_overrides_builder =
+                    state_overrides_builder.extend(overrides.unwrap_or_default());
+                let final_overrides = state_overrides_builder.build();
+
+                // Best effort only: we pin the cached flashblock state exactly, but upstream
+                // `estimate_gas_at` does not accept block overrides. Estimation therefore still executes
+                // against the canonical parent block env instead of the snapshot's synthetic pending
+                // header.
+                EthCall::estimate_gas_at(
+                    &self.eth_api,
+                    transaction,
+                    Self::flashblock_snapshot_base_block_id(snapshot.as_ref()),
+                    Some(final_overrides),
+                )
+                .await
+                .map_err(Into::into)
+            }
+            FlashblocksMode::HotOnly => {
+                let snapshot = self.get_hot_flashblock_snapshot(snapshot_id)?;
+                let mut state_overrides_builder =
+                    StateOverridesBuilder::new(snapshot.state_overrides.clone());
+                state_overrides_builder =
+                    state_overrides_builder.extend(overrides.unwrap_or_default());
+                let final_overrides = state_overrides_builder.build();
+
+                // Best effort only: we pin the cached flashblock state exactly, but upstream
+                // `estimate_gas_at` does not accept block overrides. Estimation therefore still executes
+                // against the canonical parent block env instead of the snapshot's synthetic pending
+                // header.
+                EthCall::estimate_gas_at(
+                    &self.eth_api,
+                    transaction,
+                    snapshot.canonical_base_block.clone(),
+                    Some(final_overrides),
+                )
+                .await
+                .map_err(Into::into)
+            }
+        }
     }
 
     async fn base_call_at_flashblock(
@@ -526,26 +595,52 @@ where
             block_overrides = ?block_overrides,
         );
 
-        let snapshot = self.get_flashblock_snapshot(snapshot_id)?;
         let _pinned_call_timer = base_metrics::timed!(Metrics::pinned_call_duration());
-        let mut state_overrides_builder =
-            StateOverridesBuilder::new(snapshot.get_state_overrides().unwrap_or_default());
-        state_overrides_builder =
-            state_overrides_builder.extend(state_overrides.unwrap_or_default());
-        let final_state_overrides = state_overrides_builder.build();
 
-        let snapshot_block_overrides = Self::flashblock_snapshot_block_overrides(snapshot.as_ref());
-        let final_block_overrides =
-            Self::merge_block_overrides(snapshot_block_overrides, block_overrides);
+        match self.flashblocks_state.mode() {
+            FlashblocksMode::Legacy => {
+                let snapshot = self.get_flashblock_snapshot(snapshot_id)?;
+                let mut state_overrides_builder =
+                    StateOverridesBuilder::new(snapshot.get_state_overrides().unwrap_or_default());
+                state_overrides_builder =
+                    state_overrides_builder.extend(state_overrides.unwrap_or_default());
+                let final_state_overrides = state_overrides_builder.build();
 
-        EthCall::call(
-            &self.eth_api,
-            transaction,
-            Some(Self::flashblock_snapshot_base_block_id(snapshot.as_ref())),
-            EvmOverrides::new(Some(final_state_overrides), final_block_overrides),
-        )
-        .await
-        .map_err(Into::into)
+                let snapshot_block_overrides =
+                    Self::flashblock_snapshot_block_overrides(snapshot.as_ref());
+                let final_block_overrides =
+                    Self::merge_block_overrides(snapshot_block_overrides, block_overrides);
+
+                EthCall::call(
+                    &self.eth_api,
+                    transaction,
+                    Some(Self::flashblock_snapshot_base_block_id(snapshot.as_ref())),
+                    EvmOverrides::new(Some(final_state_overrides), final_block_overrides),
+                )
+                .await
+                .map_err(Into::into)
+            }
+            FlashblocksMode::HotOnly => {
+                let snapshot = self.get_hot_flashblock_snapshot(snapshot_id)?;
+                let mut state_overrides_builder =
+                    StateOverridesBuilder::new(snapshot.state_overrides.clone());
+                state_overrides_builder =
+                    state_overrides_builder.extend(state_overrides.unwrap_or_default());
+                let final_state_overrides = state_overrides_builder.build();
+
+                let final_block_overrides =
+                    Self::merge_block_overrides(snapshot.block_overrides.clone(), block_overrides);
+
+                EthCall::call(
+                    &self.eth_api,
+                    transaction,
+                    Some(snapshot.canonical_base_block.clone()),
+                    EvmOverrides::new(Some(final_state_overrides), final_block_overrides),
+                )
+                .await
+                .map_err(Into::into)
+            }
+        }
     }
 
     async fn simulate_v1(
@@ -563,6 +658,10 @@ where
 
         // If the call is to pending block use cached override (if it exists)
         if block_id.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only("eth_simulateV1(..., \"pending\")", None));
+            }
+
             Metrics::rpc_simulate_v1().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
@@ -607,6 +706,13 @@ where
         // If toBlock is not pending, delegate to eth API
         if !matches!(to_block, Some(BlockNumberOrTag::Pending)) {
             return self.eth_filter.logs(filter).await;
+        }
+
+        if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+            return Err(unsupported_in_hot_only(
+                "eth_getLogs with toBlock: \"pending\"",
+                Some("eth_subscribe(\"newFastFlashblockLogs\")"),
+            ));
         }
 
         // Mixed query: toBlock is pending, so we need to combine historical + pending logs
@@ -656,6 +762,13 @@ where
         );
 
         if number.is_pending() {
+            if matches!(self.flashblocks_state.mode(), FlashblocksMode::HotOnly) {
+                return Err(unsupported_in_hot_only(
+                    "eth_getBlockTransactionCountByNumber(\"pending\")",
+                    None,
+                ));
+            }
+
             Metrics::rpc_get_block_transaction_count_by_number().increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             if let Some(block) = pending_blocks.get_block(false) {
@@ -695,6 +808,17 @@ where
         // The snapshot cache is keyed by the full `FlashblockSnapshotId`, so a successful lookup
         // is already authoritative for snapshot identity.
         let Some(snapshot) = self.flashblocks_state.get_snapshot(snapshot_id) else {
+            return Err(Self::invalid_flashblock_snapshot("unknown flashblock snapshot"));
+        };
+
+        Ok(snapshot)
+    }
+
+    fn get_hot_flashblock_snapshot(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+    ) -> RpcResult<Arc<HotSnapshot>> {
+        let Some(snapshot) = self.flashblocks_state.get_hot_snapshot(snapshot_id) else {
             return Err(Self::invalid_flashblock_snapshot("unknown flashblock snapshot"));
         };
 

@@ -23,9 +23,21 @@ pub use error::{
 
 mod fast_logs;
 pub use fast_logs::{
-    FastFlashblockLog, FastFlashblockLogsDelta, FastFlashblockLogsDeltaError, FastFlashblockTxMeta,
-    FlashblockSnapshotId, FlashblockUpdate,
+    FastFlashblockFeedEvent, FastFlashblockLog, FastFlashblockLogsDelta,
+    FastFlashblockLogsDeltaError, FastFlashblockTxMeta, FlashblockSnapshotId,
 };
+
+mod hot_engine;
+pub use hot_engine::{HotApplyOutcome, HotEngine, HotExecutionDb};
+
+mod hot_mode;
+pub use hot_mode::FlashblocksMode;
+
+mod hot_snapshot;
+pub use hot_snapshot::{HotSnapshot, HotSnapshotRing};
+
+mod hot_window;
+pub use hot_window::{HotExecutionState, HotPendingBlock, HotPendingWindow};
 
 mod metrics;
 pub use metrics::Metrics;

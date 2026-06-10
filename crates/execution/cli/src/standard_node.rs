@@ -1,7 +1,7 @@
 //! Standard Base execution-node arguments and runner wiring.
 
 use base_bundle_extension::BundleExtension;
-use base_flashblocks::FlashblocksConfig;
+use base_flashblocks::{FlashblocksConfig, FlashblocksMode};
 use base_flashblocks_node::FlashblocksExtension;
 use base_metering::{MeteredOpcodes, MeteringConfig, MeteringExtension, MeteringResourceLimits};
 use base_node_core::args::RollupArgs;
@@ -29,6 +29,15 @@ pub struct StandardNodeArgs {
     /// block tag will use the pending state based on flashblocks.
     #[arg(long, alias = "websocket-url")]
     pub flashblocks_url: Option<Url>,
+
+    /// Flashblocks processing mode.
+    #[arg(
+        long = "flashblocks.mode",
+        value_name = "FLASHBLOCKS_MODE",
+        default_value = "legacy",
+        requires = "flashblocks_url"
+    )]
+    pub flashblocks_mode: FlashblocksMode,
 
     /// The max pending blocks depth.
     #[arg(
@@ -142,7 +151,11 @@ pub struct StandardNodeArgs {
 impl From<&StandardNodeArgs> for Option<FlashblocksConfig> {
     fn from(args: &StandardNodeArgs) -> Self {
         args.flashblocks_url.clone().map(|url| {
-            let mut config = FlashblocksConfig::new(url, args.max_pending_blocks_depth);
+            let mut config = FlashblocksConfig::new_with_mode(
+                url,
+                args.max_pending_blocks_depth,
+                args.flashblocks_mode,
+            );
             config.cached_execution = args.flashblocks_cached_execution;
             config
         })
@@ -240,5 +253,52 @@ impl StandardBaseRethNode {
         args: StandardNodeArgs,
     ) -> eyre::Result<LaunchedBaseNode> {
         Self::runner_with_version_metrics(args)?.launch(builder).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{Args, Parser};
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct CommandParser<T: Args> {
+        #[command(flatten)]
+        args: T,
+    }
+
+    #[test]
+    fn standard_node_args_default_flashblocks_mode_is_legacy() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from(["reth"]).args;
+
+        assert_eq!(args.flashblocks_mode, FlashblocksMode::Legacy);
+        assert!(args.flashblocks_url.is_none());
+    }
+
+    #[test]
+    fn standard_node_args_parses_explicit_hot_only_mode() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--flashblocks-url",
+            "ws://localhost:1234",
+            "--flashblocks.mode",
+            "hot-only",
+        ])
+        .args;
+
+        assert_eq!(args.flashblocks_mode, FlashblocksMode::HotOnly);
+        assert_eq!(args.flashblocks_url, Some(Url::parse("ws://localhost:1234").unwrap()));
+    }
+
+    #[test]
+    fn standard_node_args_require_flashblocks_url_for_mode_override() {
+        let result = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "reth",
+            "--flashblocks.mode",
+            "hot-only",
+        ]);
+
+        assert!(result.is_err());
     }
 }

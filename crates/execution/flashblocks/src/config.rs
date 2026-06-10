@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::FlashblocksState;
+use crate::{FlashblocksMode, FlashblocksState};
 
 /// Flashblocks-specific configuration knobs.
 #[derive(Debug, Clone)]
@@ -18,9 +18,51 @@ pub struct FlashblocksConfig {
 }
 
 impl FlashblocksConfig {
-    /// Create a new Flashblocks configuration.
+    /// Create a new Flashblocks configuration using the legacy runtime mode.
     pub fn new(websocket_url: Url, max_pending_blocks_depth: u64) -> Self {
-        let state = Arc::new(FlashblocksState::new(max_pending_blocks_depth));
+        Self::new_with_mode(websocket_url, max_pending_blocks_depth, FlashblocksMode::Legacy)
+    }
+
+    /// Create a new Flashblocks configuration with an explicit runtime mode.
+    pub fn new_with_mode(
+        websocket_url: Url,
+        max_pending_blocks_depth: u64,
+        mode: FlashblocksMode,
+    ) -> Self {
+        let state = Arc::new(FlashblocksState::new_with_mode(max_pending_blocks_depth, mode));
         Self { websocket_url, max_pending_blocks_depth, cached_execution: false, state }
+    }
+
+    /// Returns the configured flashblocks runtime mode.
+    ///
+    /// The shared [`FlashblocksState`] is the single source of truth for the selected mode.
+    pub fn mode(&self) -> FlashblocksMode {
+        self.state.mode()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::*;
+
+    #[test]
+    fn flashblocks_config_new_defaults_to_legacy_mode() {
+        let config = FlashblocksConfig::new(Url::parse("ws://localhost:12345").unwrap(), 5);
+
+        assert_eq!(config.mode(), FlashblocksMode::Legacy);
+    }
+
+    #[test]
+    fn flashblocks_config_new_with_mode_stores_hot_mode() {
+        let config = FlashblocksConfig::new_with_mode(
+            Url::parse("ws://localhost:12345").unwrap(),
+            5,
+            FlashblocksMode::HotOnly,
+        );
+
+        assert_eq!(config.mode(), FlashblocksMode::HotOnly);
+        assert_eq!(config.state.mode(), FlashblocksMode::HotOnly);
     }
 }

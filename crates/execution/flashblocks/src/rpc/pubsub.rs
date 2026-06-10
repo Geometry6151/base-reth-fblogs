@@ -28,9 +28,12 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::error;
 
 use crate::{
-    FlashblockUpdate, FlashblocksAPI, TransactionWithLogs,
+    FastFlashblockFeedEvent, FlashblocksAPI, TransactionWithLogs,
     metrics::Metrics,
-    rpc::types::{BaseSubscriptionKind, ExtendedSubscriptionKind},
+    rpc::types::{
+        BaseSubscriptionKind, ExtendedSubscriptionKind, FlashblockLogsBatch,
+        unsupported_in_hot_only,
+    },
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -305,14 +308,36 @@ where
                             return Ok(());
                         }
                     };
-                let sink = pending.accept().await?;
-                let flashblocks_state = Arc::clone(&self.flashblocks_state);
+                if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
+                    let sink = pending.accept().await?;
+                    // Subscribe before spawning so fast update creation sees this subscriber
+                    // immediately via `receiver_count()`.
+                    let receiver = self.flashblocks_state.subscribe_to_fast_flashblock_logs();
 
-                tokio::spawn(async move {
-                    pipe_flashblock_logs_batch_subscription(sink, flashblocks_state, filter).await;
-                });
+                    tokio::spawn(async move {
+                        pipe_flashblock_logs_batch_from_fast_delta_subscription(
+                            sink, receiver, filter,
+                        )
+                        .await;
+                    });
+                } else {
+                    let sink = pending.accept().await?;
+                    let flashblocks_state = Arc::clone(&self.flashblocks_state);
+
+                    tokio::spawn(async move {
+                        pipe_flashblock_logs_batch_subscription(sink, flashblocks_state, filter)
+                            .await;
+                    });
+                }
             }
             BaseSubscriptionKind::NewFlashblocks => {
+                if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
+                    pending
+                        .reject(unsupported_in_hot_only("eth_subscribe(\"newFlashblocks\")", None))
+                        .await;
+                    return Ok(());
+                }
+
                 let sink = pending.accept().await?;
                 let stream = Self::new_flashblocks_stream(Arc::clone(&self.flashblocks_state));
 
@@ -321,6 +346,13 @@ where
                 });
             }
             BaseSubscriptionKind::PendingLogs => {
+                if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
+                    pending
+                        .reject(unsupported_in_hot_only("eth_subscribe(\"pendingLogs\")", None))
+                        .await;
+                    return Ok(());
+                }
+
                 let sink = pending.accept().await?;
                 // Extract filter from params, default to empty filter (match all)
                 let filter = match params {
@@ -335,6 +367,15 @@ where
                 });
             }
             BaseSubscriptionKind::NewFlashblockTransactions => match params {
+                _ if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) => {
+                    pending
+                        .reject(unsupported_in_hot_only(
+                            "eth_subscribe(\"newFlashblockTransactions\")",
+                            None,
+                        ))
+                        .await;
+                    return Ok(());
+                }
                 Some(Params::Logs(filter)) => {
                     let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_filtered_stream(
@@ -367,6 +408,48 @@ where
         }
 
         Ok(())
+    }
+}
+
+async fn pipe_flashblock_logs_batch_from_fast_delta_subscription(
+    sink: SubscriptionSink,
+    mut receiver: broadcast::Receiver<FastFlashblockFeedEvent>,
+    filter: Option<Filter>,
+) {
+    loop {
+        tokio::select! {
+            _ = sink.closed() => return,
+            result = receiver.recv() => {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(skipped)) => {
+                        error!(
+                            target: "flashblocks_rpc::pubsub",
+                            skipped,
+                            "closing newFlashblockLogsBatch subscription after broadcast lag"
+                        );
+                        return;
+                    }
+                };
+                let delta = match event {
+                    FastFlashblockFeedEvent::Delta(delta) => delta,
+                    FastFlashblockFeedEvent::Resync => return,
+                };
+
+                let batch = base_metrics::time!(Metrics::logs_batch_build_duration(), {
+                    if let Some(filter) = filter.as_ref() {
+                        FlashblockLogsBatch::from_fast_delta(&delta.filtered(filter))
+                    } else {
+                        FlashblockLogsBatch::from_fast_delta(delta.as_ref())
+                    }
+                });
+
+                if !send_subscription_item(&sink, &batch, Some(PubSubMetric::LogsBatch)).await {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -413,15 +496,15 @@ async fn pipe_flashblock_logs_batch_subscription<FB>(
 
 async fn pipe_fast_flashblock_logs_subscription(
     sink: SubscriptionSink,
-    mut receiver: broadcast::Receiver<Arc<FlashblockUpdate>>,
+    mut receiver: broadcast::Receiver<FastFlashblockFeedEvent>,
     filter: Option<Filter>,
 ) {
     loop {
         tokio::select! {
             _ = sink.closed() => return,
             result = receiver.recv() => {
-                let update = match result {
-                    Ok(update) => update,
+                let event = match result {
+                    Ok(event) => event,
                     Err(RecvError::Closed) => return,
                     Err(RecvError::Lagged(skipped)) => {
                         error!(
@@ -432,13 +515,17 @@ async fn pipe_fast_flashblock_logs_subscription(
                         return;
                     }
                 };
+                let delta = match event {
+                    FastFlashblockFeedEvent::Delta(delta) => delta,
+                    FastFlashblockFeedEvent::Resync => return,
+                };
 
                 if let Some(filter) = filter.as_ref() {
-                    let filtered_delta = update.delta.filtered(filter);
+                    let filtered_delta = delta.filtered(filter);
                     if !send_subscription_item(&sink, &filtered_delta, Some(PubSubMetric::FastLogs)).await {
                         return;
                     }
-                } else if !send_subscription_item(&sink, update.delta.as_ref(), Some(PubSubMetric::FastLogs)).await {
+                } else if !send_subscription_item(&sink, delta.as_ref(), Some(PubSubMetric::FastLogs)).await {
                     return;
                 }
             }
@@ -565,9 +652,52 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use alloy_primitives::Address;
+    use jsonrpsee::{
+        RpcModule,
+        core::{EmptyServerParams, SubscriptionResult},
+    };
+    use serde_json::Value;
+    use tokio::{sync::broadcast, time::timeout};
 
     use super::*;
+
+    #[tokio::test]
+    async fn fast_flashblock_update_resync_closes_fast_subscription() {
+        let (sender, _) = broadcast::channel(1);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "fast_flashblock_update_resync",
+                "fast_flashblock_update_resync",
+                "fast_flashblock_update_resync_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_fast_flashblock_logs_subscription(sink, receiver, None).await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded("fast_flashblock_update_resync", EmptyServerParams::new())
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::Resync).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        assert!(next.is_none());
+    }
 
     #[test]
     fn logs_batch_filter_accepts_missing_params() {

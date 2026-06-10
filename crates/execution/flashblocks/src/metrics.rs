@@ -16,6 +16,20 @@ base_metrics::define_metrics! {
     state_queue_delay_duration: histogram,
     #[describe("Time taken to build pending state from flashblocks")]
     pending_state_build_duration: histogram,
+    #[describe("Time taken to execute only the new hot suffix transactions")]
+    hot_suffix_execute_duration: histogram,
+    #[describe("Number of transactions executed in one hot suffix apply")]
+    hot_suffix_tx_count: histogram,
+    #[describe("Time taken to build a hot fast-log delta from executed suffix results")]
+    hot_delta_build_duration: histogram,
+    #[describe("Time taken to roll the hot window to the next pending block")]
+    hot_window_rollover_duration: histogram,
+    #[describe("Count of times the hot window was reset from flashblock sequencing or parent mismatch")]
+    hot_window_reset_count: counter,
+    #[describe("Time taken to materialize an optional hot snapshot from carried execution state")]
+    hot_snapshot_materialize_duration: histogram,
+    #[describe("Count of times canonical processing forced a hot window reset")]
+    hot_canonical_reset_count: counter,
     #[describe("Time taken to build the newFastFlashblockLogs delta from pending state")]
     fast_delta_build_duration: histogram,
     #[describe("Time taken to build the newFlashblocks block payload from pending state")]

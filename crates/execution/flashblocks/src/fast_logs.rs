@@ -7,8 +7,6 @@ use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::Filter;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::PendingBlocks;
-
 /// Snapshot identifier for a flashblock logs state.
 ///
 /// This is a local cursor for the fast-logs stream emitted by this process. The
@@ -71,19 +69,20 @@ impl FlashblockSnapshotId {
     }
 }
 
-/// Fast flashblock update containing the pending snapshot and its latest logs delta.
+/// Internal event for the fast-log feed.
 ///
-/// The embedded [`FastFlashblockLogsDelta::snapshot_id`] is a best-effort handle for
-/// [`crate::FlashblocksAPI::get_snapshot`]. If pending state resets or the snapshot cache is
-/// cleared before a consumer resolves that id, the cached snapshot may be gone even while this
-/// update is still buffered on the fast broadcast channel. Consumers must treat an unresolved
-/// snapshot as a resync signal.
+/// Current legacy producers emit [`Self::Delta`] only. [`Self::Resync`] is reserved for a future
+/// hot-only pending-state reset path and may not be emitted until that producer-side reset
+/// signaling exists.
 #[derive(Clone, Debug)]
-pub struct FlashblockUpdate {
-    /// Pending blocks snapshot after applying the latest flashblock.
-    pub pending_blocks: Arc<PendingBlocks>,
-    /// Incremental fast logs delta for the latest flashblock.
-    pub delta: Arc<FastFlashblockLogsDelta>,
+pub enum FastFlashblockFeedEvent {
+    /// Exact log delta for one flashblock.
+    Delta(Arc<FastFlashblockLogsDelta>),
+    /// Reserved for future hot-only reset signaling.
+    ///
+    /// Consumers that receive this must treat the fast stream as out of sync and close or
+    /// recreate the subscription, but the current legacy path does not emit it yet.
+    Resync,
 }
 
 /// Returned when a [`FastFlashblockLogsDelta`] duplicates identity fields that disagree with its

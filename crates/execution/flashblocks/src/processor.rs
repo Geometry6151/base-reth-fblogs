@@ -32,7 +32,8 @@ use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
 use crate::{
-    BlockAssembler, ExecutionError, FlashblockCache, FlashblockUpdate, PendingBlocks,
+    BlockAssembler, ExecutionError, FastFlashblockFeedEvent, FastFlashblockLogsDelta,
+    FlashblockCache, FlashblocksMode, HotApplyOutcome, HotEngine, HotSnapshotRing, PendingBlocks,
     PendingBlocksBuilder, PendingStateBuilder, ProviderError, Result, SnapshotCache,
     StateProcessorError,
     metrics::Metrics,
@@ -62,12 +63,15 @@ pub struct StateProcessor<Client> {
     rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
     max_depth: u64,
+    mode: FlashblocksMode,
     client: Client,
-    fast_sender: Sender<Arc<FlashblockUpdate>>,
+    fast_sender: Sender<FastFlashblockFeedEvent>,
     sender: Sender<Arc<PendingBlocks>>,
     cache: Arc<Mutex<FlashblockCache>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
+    hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
     next_snapshot_nonce: Arc<AtomicU64>,
+    hot_engine: Option<Arc<Mutex<HotEngine<Client>>>>,
 }
 
 impl<Client> StateProcessor<Client>
@@ -78,31 +82,69 @@ where
         + Clone
         + 'static,
 {
-    /// Creates a new state processor wired to the provided channels and state.
+    /// Creates a new state processor wired to the provided channels and state using the legacy
+    /// runtime mode.
     pub fn new(
         client: Client,
         pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
         max_depth: u64,
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
-        fast_sender: Sender<Arc<FlashblockUpdate>>,
+        fast_sender: Sender<FastFlashblockFeedEvent>,
         sender: Sender<Arc<PendingBlocks>>,
         snapshot_cache: Arc<StdMutex<SnapshotCache>>,
+        hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    ) -> Self {
+        Self::new_with_mode(
+            client,
+            pending_blocks,
+            max_depth,
+            FlashblocksMode::Legacy,
+            rx,
+            fast_sender,
+            sender,
+            snapshot_cache,
+            hot_snapshot_ring,
+        )
+    }
+
+    /// Creates a new state processor wired to the provided channels and state with an explicit
+    /// runtime mode.
+    pub fn new_with_mode(
+        client: Client,
+        pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
+        max_depth: u64,
+        mode: FlashblocksMode,
+        rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
+        fast_sender: Sender<FastFlashblockFeedEvent>,
+        sender: Sender<Arc<PendingBlocks>>,
+        snapshot_cache: Arc<StdMutex<SnapshotCache>>,
+        hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
     ) -> Self {
         let cache = client
             .best_block_number()
             .map_or_else(|_| FlashblockCache::new(0), FlashblockCache::new);
+        let hot_engine = (mode == FlashblocksMode::HotOnly)
+            .then(|| Arc::new(Mutex::new(HotEngine::new(client.clone(), max_depth))));
 
         Self {
             pending_blocks,
             client,
             max_depth,
+            mode,
             rx,
             fast_sender,
             sender,
             cache: Arc::new(Mutex::new(cache)),
             snapshot_cache,
+            hot_snapshot_ring,
             next_snapshot_nonce: Arc::new(AtomicU64::new(0)),
+            hot_engine,
         }
+    }
+
+    /// Returns the configured flashblocks runtime mode.
+    pub fn mode(&self) -> FlashblocksMode {
+        self.mode
     }
 
     /// Processes updates from the queue until the channel closes.
@@ -112,36 +154,41 @@ where
                 Metrics::state_queue_delay_duration().record(enqueued_at.elapsed());
             }
 
-            let prev_pending_blocks = self.pending_blocks.load_full();
             match update {
                 StateUpdate::Canonical(block) => {
                     debug!(message = "processing canonical block", block_number = block.number);
-                    match self.process_canonical_block(prev_pending_blocks, &block) {
-                        Ok(new_pending_blocks) => {
-                            if new_pending_blocks.is_none() {
-                                self.clear_snapshot_cache();
-                            }
-                            self.pending_blocks.swap(new_pending_blocks);
+                    if self.mode == FlashblocksMode::HotOnly {
+                        self.apply_hot_only_canonical(block).await;
+                    } else {
+                        let prev_pending_blocks = self.pending_blocks.load_full();
+                        match self.process_canonical_block(prev_pending_blocks, &block) {
+                            Ok(new_pending_blocks) => {
+                                if new_pending_blocks.is_none() {
+                                    self.clear_snapshot_cache();
+                                }
+                                self.pending_blocks.swap(new_pending_blocks);
 
-                            let mut cache = self.cache.lock().await;
-                            cache.update_canonical(block.number);
-                            let cached = cache.drain(block.number + 1);
-                            drop(cache);
+                                let mut cache = self.cache.lock().await;
+                                cache.update_canonical(block.number);
+                                let cached = cache.drain(block.number + 1);
+                                drop(cache);
 
-                            if !cached.is_empty() {
-                                debug!(
-                                    message = "replaying cached flashblocks after canonical block",
-                                    canonical_block = block.number,
-                                    cached_count = cached.len(),
-                                );
-                                for flashblock in cached {
-                                    let fb_prev = self.pending_blocks.load_full();
-                                    self.apply_flashblock(fb_prev, flashblock).await;
+                                if !cached.is_empty() {
+                                    debug!(
+                                        message =
+                                            "replaying cached flashblocks after canonical block",
+                                        canonical_block = block.number,
+                                        cached_count = cached.len(),
+                                    );
+                                    for flashblock in cached {
+                                        let fb_prev = self.pending_blocks.load_full();
+                                        self.apply_flashblock(fb_prev, flashblock).await;
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            error!(message = "could not process canonical block", error = %e);
+                            Err(e) => {
+                                error!(message = "could not process canonical block", error = %e);
+                            }
                         }
                     }
                 }
@@ -151,8 +198,128 @@ where
                         block_number = flashblock.metadata.block_number,
                         flashblock_index = flashblock.index
                     );
-                    self.apply_flashblock(prev_pending_blocks, flashblock).await;
+                    if self.mode == FlashblocksMode::HotOnly {
+                        self.apply_hot_only_flashblock(flashblock).await;
+                    } else {
+                        let prev_pending_blocks = self.pending_blocks.load_full();
+                        self.apply_flashblock(prev_pending_blocks, flashblock).await;
+                    }
                 }
+            }
+        }
+    }
+
+    fn hot_engine(&self) -> &Arc<Mutex<HotEngine<Client>>> {
+        self.hot_engine.as_ref().expect("hot engine should exist in hot-only mode")
+    }
+
+    async fn apply_hot_only_canonical(&self, block: RecoveredBlock<BaseBlock>) {
+        let outcome = self.hot_engine().lock().await.process_canonical_block(&block);
+        match outcome {
+            Ok(HotApplyOutcome::Delta { delta, snapshot }) => {
+                _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(delta)));
+                if let Some(snapshot) = snapshot {
+                    self.hot_snapshot_ring
+                        .lock()
+                        .expect("hot snapshot ring mutex poisoned")
+                        .insert(Arc::new(snapshot));
+                }
+            }
+            Ok(HotApplyOutcome::Duplicate) => {}
+            Ok(HotApplyOutcome::Reset) => {
+                self.clear_hot_snapshot_ring();
+                _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
+            }
+            Err(e) => {
+                error!(message = "could not process canonical block", error = %e);
+                return;
+            }
+        }
+
+        let mut cache = self.cache.lock().await;
+        cache.update_canonical(block.number);
+        let cached = cache.drain(block.number + 1);
+        drop(cache);
+
+        if !cached.is_empty() {
+            debug!(
+                message = "replaying cached flashblocks after canonical block",
+                canonical_block = block.number,
+                cached_count = cached.len(),
+            );
+            for flashblock in cached {
+                self.apply_hot_only_flashblock(flashblock).await;
+            }
+        }
+    }
+
+    async fn apply_hot_only_flashblock(&self, flashblock: Flashblock) {
+        let _flashblock_apply_timer = base_metrics::timed!(Metrics::flashblock_apply_duration());
+        let block_processing_start = Instant::now();
+        let (outcome, missing_first_flashblock, hot_window_invalidated) = {
+            let mut hot_engine = self.hot_engine().lock().await;
+            let missing_first_flashblock = (hot_engine.window.execution.is_none()
+                || hot_engine.window.blocks.is_empty())
+                && flashblock.index > 0;
+            let outcome = hot_engine.apply_flashblock(&flashblock);
+            let hot_window_invalidated =
+                hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
+            (outcome, missing_first_flashblock, hot_window_invalidated)
+        };
+
+        match outcome {
+            Ok(HotApplyOutcome::Delta { delta, snapshot }) => {
+                _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(delta)));
+                if let Some(snapshot) = snapshot {
+                    self.hot_snapshot_ring
+                        .lock()
+                        .expect("hot snapshot ring mutex poisoned")
+                        .insert(Arc::new(snapshot));
+                }
+                Metrics::block_processing_duration().record(block_processing_start.elapsed());
+            }
+            Ok(HotApplyOutcome::Duplicate) => {
+                Metrics::block_processing_duration().record(block_processing_start.elapsed());
+            }
+            Ok(HotApplyOutcome::Reset) => {
+                if hot_window_invalidated {
+                    self.clear_hot_snapshot_ring();
+                }
+
+                if missing_first_flashblock {
+                    let cached = {
+                        let mut cache = self.cache.lock().await;
+                        cache.has_flashblock(flashblock.metadata.block_number, flashblock.index - 1)
+                            && cache.insert(flashblock)
+                    };
+                    if cached {
+                        return;
+                    }
+                }
+
+                if hot_window_invalidated {
+                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
+                }
+                Metrics::block_processing_duration().record(block_processing_start.elapsed());
+            }
+            Err(e) => {
+                if let StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
+                    ..
+                }) = e
+                {
+                    if self.cache.lock().await.insert(flashblock) {
+                        debug!(message = "cached flashblock pending canonical block", error = %e);
+                    }
+                    return;
+                }
+
+                if hot_window_invalidated {
+                    self.clear_hot_snapshot_ring();
+                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
+                }
+
+                error!(message = "could not process Flashblock", error = %e);
+                Metrics::block_processing_error().increment(1);
             }
         }
     }
@@ -174,8 +341,8 @@ where
                     self.clear_snapshot_cache();
                 }
                 self.pending_blocks.swap(new_pending_blocks.clone());
-                if let Some(update) = fast_update {
-                    _ = self.fast_sender.send(update);
+                if let Some(delta) = fast_update {
+                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(delta));
                 }
                 if let Some(ref pb) = new_pending_blocks {
                     _ = self.sender.send(Arc::clone(pb));
@@ -393,6 +560,10 @@ where
         self.snapshot_cache.lock().expect("snapshot cache mutex poisoned").clear();
     }
 
+    fn clear_hot_snapshot_ring(&self) {
+        self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").clear();
+    }
+
     fn next_snapshot_nonce(&self) -> u64 {
         self.next_snapshot_nonce.fetch_add(1, Ordering::Relaxed).saturating_add(1)
     }
@@ -401,7 +572,7 @@ where
         &self,
         prev_pending_blocks: Option<&Arc<PendingBlocks>>,
         new_pending_blocks: Option<&Arc<PendingBlocks>>,
-    ) -> Option<Arc<FlashblockUpdate>> {
+    ) -> Option<Arc<FastFlashblockLogsDelta>> {
         if self.fast_sender.receiver_count() == 0 {
             return None;
         }
@@ -412,18 +583,14 @@ where
             (_, Some(next)) => next,
         };
 
-        let delta = base_metrics::time!(Metrics::fast_delta_build_duration(), {
+        let delta = Arc::new(base_metrics::time!(Metrics::fast_delta_build_duration(), {
             pending_blocks.get_latest_fast_flashblock_logs_delta(self.next_snapshot_nonce(), None)
-        });
-        let update = Arc::new(FlashblockUpdate {
-            pending_blocks: Arc::clone(pending_blocks),
-            delta: Arc::new(delta),
-        });
+        }));
         self.snapshot_cache
             .lock()
             .expect("snapshot cache mutex poisoned")
-            .insert(update.delta.snapshot_id, Arc::clone(&update.pending_blocks));
-        Some(update)
+            .insert(delta.snapshot_id, Arc::clone(pending_blocks));
+        Some(delta)
     }
 
     #[instrument(level = "debug", skip_all, fields(num_flashblocks = flashblocks.len()))]
@@ -578,5 +745,65 @@ where
         pending_blocks_builder.with_state_overrides(state_overrides);
 
         Ok(Some(Arc::new(pending_blocks_builder.build()?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use arc_swap::ArcSwapOption;
+    use base_common_consensus::BasePrimitives;
+    use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
+    use reth_provider::test_utils::MockEthProvider;
+    use tokio::sync::{Mutex, broadcast, mpsc};
+
+    use super::StateProcessor;
+    use crate::{FlashblocksMode, HotSnapshotRing, SnapshotCache};
+
+    fn test_client() -> MockEthProvider<BasePrimitives, Arc<BaseChainSpec>> {
+        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
+        MockEthProvider::<BasePrimitives>::new().with_chain_spec(chain_spec).with_genesis_block()
+    }
+
+    #[test]
+    fn state_processor_new_defaults_to_legacy_mode() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (fast_sender, _) = broadcast::channel(1);
+        let (sender, _) = broadcast::channel(1);
+
+        let processor = StateProcessor::new(
+            test_client(),
+            Arc::new(ArcSwapOption::new(None)),
+            5,
+            Arc::new(Mutex::new(rx)),
+            fast_sender,
+            sender,
+            Arc::new(std::sync::Mutex::new(SnapshotCache::new(1, Duration::from_secs(1)))),
+            Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(1))),
+        );
+
+        assert_eq!(processor.mode(), FlashblocksMode::Legacy);
+    }
+
+    #[test]
+    fn state_processor_new_with_mode_stores_hot_mode() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (fast_sender, _) = broadcast::channel(1);
+        let (sender, _) = broadcast::channel(1);
+
+        let processor = StateProcessor::new_with_mode(
+            test_client(),
+            Arc::new(ArcSwapOption::new(None)),
+            5,
+            FlashblocksMode::HotOnly,
+            Arc::new(Mutex::new(rx)),
+            fast_sender,
+            sender,
+            Arc::new(std::sync::Mutex::new(SnapshotCache::new(1, Duration::from_secs(1)))),
+            Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(1))),
+        );
+
+        assert_eq!(processor.mode(), FlashblocksMode::HotOnly);
     }
 }

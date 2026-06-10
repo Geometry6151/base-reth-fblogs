@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Instant};
 use alloy_consensus::{Header, Sealed, TxReceipt};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{
-    Address, B256, BlockNumber, TxHash, U256, keccak256,
+    Address, B256, BlockNumber, TxHash, U256,
     map::foldhash::{HashMap, HashMapExt},
 };
 use alloy_provider::network::TransactionResponse;
@@ -657,7 +657,7 @@ impl PendingBlocks {
             logs,
             transactions,
         };
-        batch.batch_hash = compute_flashblock_logs_batch_hash(&batch);
+        batch.refresh_batch_hash();
         batch
     }
 
@@ -799,41 +799,6 @@ impl PendingBlocks {
         let prev_count = self.previous_flashblocks_tx_count();
         self.transactions.iter().skip(prev_count).map(|tx| tx.tx_hash()).collect()
     }
-}
-
-fn compute_flashblock_logs_batch_hash(batch: &FlashblockLogsBatch) -> B256 {
-    let mut bytes = Vec::new();
-    push_u64(&mut bytes, batch.block_number);
-    push_u64(&mut bytes, batch.flashblock_index);
-    bytes.extend_from_slice(batch.payload_id.to_string().as_bytes());
-    bytes.extend_from_slice(batch.parent_hash.as_slice());
-
-    for tx in &batch.transactions {
-        bytes.extend_from_slice(tx.hash.as_slice());
-        push_u64(&mut bytes, tx.index);
-        push_u64(&mut bytes, tx.status.unwrap_or(u64::MAX));
-    }
-
-    for log in &batch.logs {
-        bytes.extend_from_slice(log.tx_hash.as_slice());
-        push_u64(&mut bytes, log.tx_index);
-        push_u64(&mut bytes, log.log_index_in_tx);
-        push_u64(&mut bytes, log.log_index_in_block);
-        bytes.extend_from_slice(log.address.as_slice());
-        push_u64(&mut bytes, log.topics.len() as u64);
-        for topic in &log.topics {
-            bytes.extend_from_slice(topic.as_slice());
-        }
-        push_u64(&mut bytes, log.data.len() as u64);
-        bytes.extend_from_slice(log.data.as_ref());
-        bytes.push(u8::from(log.removed));
-    }
-
-    keccak256(bytes)
-}
-
-fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_be_bytes());
 }
 
 impl PendingBlocksAPI for Guard<Option<Arc<PendingBlocks>>> {
@@ -1437,7 +1402,7 @@ mod tests {
         assert_eq!(batch.flashblock_index, 1);
         assert!(batch.logs.is_empty());
         assert!(batch.transactions.is_empty());
-        assert_eq!(batch.batch_hash, compute_flashblock_logs_batch_hash(&batch));
+        assert_eq!(batch.batch_hash, batch.compute_batch_hash());
     }
 
     #[test]
@@ -1731,19 +1696,19 @@ mod tests {
         );
 
         let batch = pending.get_latest_flashblock_logs_batch(None);
-        let original_hash = compute_flashblock_logs_batch_hash(&batch);
+        let original_hash = batch.compute_batch_hash();
 
         let mut tx_mutation = batch.clone();
         tx_mutation.transactions[0].index = tx_mutation.transactions[0].index.saturating_add(1);
-        assert_ne!(compute_flashblock_logs_batch_hash(&tx_mutation), original_hash);
+        assert_ne!(tx_mutation.compute_batch_hash(), original_hash);
 
         let mut log_mutation = batch.clone();
         log_mutation.logs[0].removed = true;
-        assert_ne!(compute_flashblock_logs_batch_hash(&log_mutation), original_hash);
+        assert_ne!(log_mutation.compute_batch_hash(), original_hash);
 
         let mut batch_hash_mutation = batch;
         batch_hash_mutation.batch_hash = B256::with_last_byte(0xFF);
-        assert_eq!(compute_flashblock_logs_batch_hash(&batch_hash_mutation), original_hash);
+        assert_eq!(batch_hash_mutation.compute_batch_hash(), original_hash);
     }
 
     #[test]

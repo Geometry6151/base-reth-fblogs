@@ -20,8 +20,8 @@ use tokio::sync::{
 };
 
 use crate::{
-    FlashblockSnapshotId, FlashblockUpdate, FlashblocksAPI, FlashblocksReceiver, PendingBlocks,
-    SnapshotCache,
+    FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode,
+    FlashblocksReceiver, HotSnapshot, HotSnapshotRing, PendingBlocks, SnapshotCache,
     processor::{StateProcessor, StateUpdate},
     snapshot_cache::{DEFAULT_SNAPSHOT_CACHE_CAPACITY, DEFAULT_SNAPSHOT_CACHE_TTL},
 };
@@ -44,18 +44,25 @@ pub struct FlashblocksState {
     pending_blocks: Arc<ArcSwapOption<PendingBlocks>>,
     queue: mpsc::UnboundedSender<StateUpdate>,
     rx: Arc<Mutex<mpsc::UnboundedReceiver<StateUpdate>>>,
-    fast_flashblock_sender: Sender<Arc<FlashblockUpdate>>,
+    fast_flashblock_sender: Sender<FastFlashblockFeedEvent>,
     flashblock_sender: Sender<Arc<PendingBlocks>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
+    hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
     max_pending_blocks_depth: u64,
+    mode: FlashblocksMode,
 }
 
 impl FlashblocksState {
-    /// Creates a new flashblocks state manager.
+    /// Creates a new flashblocks state manager using the legacy runtime mode.
     ///
     /// The state is created without a client. Call [`start`](Self::start) with a client
     /// to spawn the state processor after the node is launched.
     pub fn new(max_pending_blocks_depth: u64) -> Self {
+        Self::new_with_mode(max_pending_blocks_depth, FlashblocksMode::Legacy)
+    }
+
+    /// Creates a new flashblocks state manager with an explicit runtime mode.
+    pub fn new_with_mode(max_pending_blocks_depth: u64, mode: FlashblocksMode) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<StateUpdate>();
         let pending_blocks: Arc<ArcSwapOption<PendingBlocks>> = Arc::new(ArcSwapOption::new(None));
         let (fast_flashblock_sender, _) = broadcast::channel(FLASHBLOCK_BROADCAST_BUFFER_CAPACITY);
@@ -71,8 +78,22 @@ impl FlashblocksState {
                 SNAPSHOT_CACHE_CAPACITY,
                 SNAPSHOT_CACHE_RETENTION_TTL,
             ))),
+            hot_snapshot_ring: Arc::new(StdMutex::new(HotSnapshotRing::new(
+                SNAPSHOT_CACHE_CAPACITY,
+            ))),
             max_pending_blocks_depth,
+            mode,
         }
+    }
+
+    /// Returns the configured flashblocks runtime mode.
+    pub fn mode(&self) -> FlashblocksMode {
+        self.mode
+    }
+
+    /// Returns the shared hot snapshot ring used by the processor and RPC readers.
+    pub fn hot_snapshot_ring(&self) -> Arc<StdMutex<HotSnapshotRing>> {
+        Arc::clone(&self.hot_snapshot_ring)
     }
 
     /// Starts the flashblocks state processor with the given client.
@@ -87,14 +108,16 @@ impl FlashblocksState {
             + Clone
             + 'static,
     {
-        let state_processor = StateProcessor::new(
+        let state_processor = StateProcessor::new_with_mode(
             client,
             Arc::clone(&self.pending_blocks),
             self.max_pending_blocks_depth,
+            self.mode,
             Arc::clone(&self.rx),
             self.fast_flashblock_sender.clone(),
             self.flashblock_sender.clone(),
             Arc::clone(&self.snapshot_cache),
+            Arc::clone(&self.hot_snapshot_ring),
         );
 
         tokio::spawn(async move {
@@ -146,12 +169,24 @@ impl FlashblocksAPI for FlashblocksState {
         self.pending_blocks.load()
     }
 
-    fn subscribe_to_fast_flashblock_logs(&self) -> broadcast::Receiver<Arc<FlashblockUpdate>> {
+    fn subscribe_to_fast_flashblock_logs(&self) -> broadcast::Receiver<FastFlashblockFeedEvent> {
         self.fast_flashblock_sender.subscribe()
     }
 
     fn get_snapshot(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<PendingBlocks>> {
         self.snapshot_cache.lock().expect("snapshot cache mutex poisoned").get(&snapshot_id)
+    }
+
+    fn get_hot_snapshot(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<HotSnapshot>> {
+        if self.mode != FlashblocksMode::HotOnly {
+            return None;
+        }
+
+        self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").get(snapshot_id)
+    }
+
+    fn mode(&self) -> FlashblocksMode {
+        self.mode
     }
 
     fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>> {
@@ -181,11 +216,12 @@ mod tests {
         ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
     };
     use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
+    use reth_chainspec::ChainSpecProvider;
     use reth_provider::test_utils::MockEthProvider;
     use tokio::{sync::broadcast, time::timeout};
 
     use super::*;
-    use crate::{FlashblockUpdate, FlashblocksAPI, FlashblocksReceiver};
+    use crate::{FastFlashblockFeedEvent, FlashblocksAPI, FlashblocksReceiver};
 
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -235,12 +271,12 @@ mod tests {
         }
     }
 
-    async fn recv_fast_flashblock_update(
-        receiver: &mut broadcast::Receiver<Arc<FlashblockUpdate>>,
-    ) -> Arc<FlashblockUpdate> {
+    async fn recv_fast_flashblock_event(
+        receiver: &mut broadcast::Receiver<FastFlashblockFeedEvent>,
+    ) -> FastFlashblockFeedEvent {
         timeout(RECV_TIMEOUT, receiver.recv())
             .await
-            .expect("fast flashblock update should arrive")
+            .expect("fast flashblock event should arrive")
             .expect("fast flashblock channel should stay open")
     }
 
@@ -266,6 +302,36 @@ mod tests {
         .expect("pending state should clear");
     }
 
+    async fn wait_for_hot_snapshot_clear(
+        state: &FlashblocksState,
+        snapshot_id: FlashblockSnapshotId,
+    ) {
+        timeout(RECV_TIMEOUT, async {
+            loop {
+                if state.get_hot_snapshot(snapshot_id).is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hot snapshot should clear");
+    }
+
+    #[test]
+    fn flashblocks_state_new_defaults_to_legacy_mode() {
+        let state = FlashblocksState::new(5);
+
+        assert_eq!(state.mode(), FlashblocksMode::Legacy);
+    }
+
+    #[test]
+    fn flashblocks_state_new_with_mode_stores_hot_mode() {
+        let state = FlashblocksState::new_with_mode(5, FlashblocksMode::HotOnly);
+
+        assert_eq!(state.mode(), FlashblocksMode::HotOnly);
+    }
+
     #[tokio::test]
     async fn fast_flashblock_update_emits_snapshot_and_preserves_compatibility_broadcast() {
         let state = FlashblocksState::new(10);
@@ -279,19 +345,22 @@ mod tests {
         let flashblock = test_flashblock(0, 1, payload_id, parent_hash);
         state.on_flashblock_received(flashblock.clone());
 
-        let update = recv_fast_flashblock_update(&mut fast_receiver).await;
+        let update = recv_fast_flashblock_event(&mut fast_receiver).await;
         let compat_pending_blocks = recv_pending_blocks(&mut compat_receiver).await;
 
-        assert_eq!(update.delta.snapshot_id.block_number(), flashblock.metadata.block_number);
-        assert_eq!(update.delta.snapshot_id.flashblock_index(), flashblock.index);
-        assert_eq!(update.delta.snapshot_id.payload_id(), flashblock.payload_id);
-        assert_eq!(update.delta.snapshot_id.parent_hash(), parent_hash);
+        let FastFlashblockFeedEvent::Delta(delta) = update else {
+            panic!("expected fast flashblock delta event");
+        };
+
+        assert_eq!(delta.snapshot_id.block_number(), flashblock.metadata.block_number);
+        assert_eq!(delta.snapshot_id.flashblock_index(), flashblock.index);
+        assert_eq!(delta.snapshot_id.payload_id(), flashblock.payload_id);
+        assert_eq!(delta.snapshot_id.parent_hash(), parent_hash);
 
         let snapshot = state
-            .get_snapshot(update.delta.snapshot_id)
+            .get_snapshot(delta.snapshot_id)
             .expect("snapshot id should resolve to cached pending blocks");
-        assert!(Arc::ptr_eq(&update.pending_blocks, &snapshot));
-        assert!(Arc::ptr_eq(&update.pending_blocks, &compat_pending_blocks));
+        assert!(Arc::ptr_eq(&snapshot, &compat_pending_blocks));
     }
 
     #[tokio::test]
@@ -306,7 +375,7 @@ mod tests {
             test_flashblock(0, 1, PayloadId::new([0x33; 8]), B256::with_last_byte(0x44));
         state.on_flashblock_received(flashblock.clone());
 
-        let _ = recv_fast_flashblock_update(&mut fast_receiver).await;
+        let _ = recv_fast_flashblock_event(&mut fast_receiver).await;
         let _ = recv_pending_blocks(&mut compat_receiver).await;
 
         state.on_flashblock_received(flashblock);
@@ -342,6 +411,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hot_only_emits_fast_delta_without_populating_pending_blocks() {
+        let state = FlashblocksState::new_with_mode(10, FlashblocksMode::HotOnly);
+        let mut fast_receiver = state.subscribe_to_fast_flashblock_logs();
+        let mut compat_receiver = state.subscribe_to_flashblocks();
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        state.start(client);
+
+        let flashblock = test_flashblock(0, 1, PayloadId::new([0x42; 8]), parent_hash);
+        state.on_flashblock_received(flashblock);
+
+        let event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(delta) = event else {
+            panic!("expected hot-only fast flashblock delta event");
+        };
+
+        assert!(state.get_hot_snapshot(delta.snapshot_id).is_some());
+        assert!((*state.get_pending_blocks()).is_none());
+        assert!(matches!(compat_receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn hot_only_emits_resync_and_clears_hot_snapshots_after_non_cacheable_error() {
+        let state = FlashblocksState::new_with_mode(10, FlashblocksMode::HotOnly);
+        let mut fast_receiver = state.subscribe_to_fast_flashblock_logs();
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        state.start(client);
+
+        let first_flashblock = test_flashblock(0, 1, PayloadId::new([0x51; 8]), parent_hash);
+        state.on_flashblock_received(first_flashblock);
+
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected initial hot-only fast flashblock delta event");
+        };
+
+        let mut malformed_flashblock =
+            test_flashblock(1, 1, PayloadId::new([0x52; 8]), parent_hash);
+        malformed_flashblock.diff.transactions = vec![Bytes::from_static(&[0x01])];
+        state.on_flashblock_received(malformed_flashblock);
+
+        let resync_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(resync_event, FastFlashblockFeedEvent::Resync));
+
+        wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+    }
+
+    #[tokio::test]
+    async fn hot_only_missing_first_cache_reset_clears_stale_hot_snapshot_ring() {
+        let state = FlashblocksState::new_with_mode(10, FlashblocksMode::HotOnly);
+        let mut fast_receiver = state.subscribe_to_fast_flashblock_logs();
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        state.start(client);
+
+        let first_flashblock = test_flashblock(0, 1, PayloadId::new([0x61; 8]), parent_hash);
+        state.on_flashblock_received(first_flashblock);
+
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected initial hot-only fast flashblock delta event");
+        };
+        let stale_snapshot = state
+            .get_hot_snapshot(first_delta.snapshot_id)
+            .expect("initial hot snapshot should be retained");
+
+        let mut malformed_flashblock =
+            test_flashblock(1, 1, PayloadId::new([0x62; 8]), parent_hash);
+        malformed_flashblock.diff.transactions = vec![Bytes::from_static(&[0x01])];
+        state.on_flashblock_received(malformed_flashblock);
+
+        let resync_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(resync_event, FastFlashblockFeedEvent::Resync));
+        wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+
+        state
+            .hot_snapshot_ring()
+            .lock()
+            .expect("hot snapshot ring mutex poisoned")
+            .insert(Arc::clone(&stale_snapshot));
+        assert!(state.get_hot_snapshot(first_delta.snapshot_id).is_some());
+
+        state.on_flashblock_received(test_flashblock(
+            0,
+            2,
+            PayloadId::new([0x63; 8]),
+            B256::with_last_byte(0x11),
+        ));
+        state.on_flashblock_received(test_flashblock(
+            1,
+            2,
+            PayloadId::new([0x64; 8]),
+            B256::with_last_byte(0x11),
+        ));
+
+        wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+    }
+
+    #[tokio::test]
+    async fn hot_only_missing_first_non_cacheable_reset_emits_resync_and_clears_ring() {
+        let state = FlashblocksState::new_with_mode(10, FlashblocksMode::HotOnly);
+        let mut fast_receiver = state.subscribe_to_fast_flashblock_logs();
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        state.start(client);
+
+        let first_flashblock = test_flashblock(0, 1, PayloadId::new([0x71; 8]), parent_hash);
+        state.on_flashblock_received(first_flashblock);
+
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected initial hot-only fast flashblock delta event");
+        };
+        let stale_snapshot = state
+            .get_hot_snapshot(first_delta.snapshot_id)
+            .expect("initial hot snapshot should be retained");
+
+        let mut malformed_flashblock =
+            test_flashblock(1, 1, PayloadId::new([0x72; 8]), parent_hash);
+        malformed_flashblock.diff.transactions = vec![Bytes::from_static(&[0x01])];
+        state.on_flashblock_received(malformed_flashblock);
+
+        let resync_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(resync_event, FastFlashblockFeedEvent::Resync));
+        wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+
+        state
+            .hot_snapshot_ring()
+            .lock()
+            .expect("hot snapshot ring mutex poisoned")
+            .insert(Arc::clone(&stale_snapshot));
+        assert!(state.get_hot_snapshot(first_delta.snapshot_id).is_some());
+
+        state.on_flashblock_received(test_flashblock(
+            1,
+            2,
+            PayloadId::new([0x73; 8]),
+            B256::with_last_byte(0x22),
+        ));
+
+        let resync_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(resync_event, FastFlashblockFeedEvent::Resync));
+        wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+    }
+
+    #[tokio::test]
     async fn snapshot_cache_may_not_resolve_buffered_fast_updates_after_reset() {
         let state = FlashblocksState::new(10);
         let mut fast_receiver = state.subscribe_to_fast_flashblock_logs();
@@ -357,7 +577,10 @@ mod tests {
 
         wait_for_pending_clear(&state).await;
 
-        let buffered_update = recv_fast_flashblock_update(&mut fast_receiver).await;
-        assert!(state.get_snapshot(buffered_update.delta.snapshot_id).is_none());
+        let buffered_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(buffered_delta) = buffered_event else {
+            panic!("expected buffered fast flashblock delta event");
+        };
+        assert!(state.get_snapshot(buffered_delta.snapshot_id).is_none());
     }
 }

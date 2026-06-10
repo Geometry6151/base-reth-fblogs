@@ -3,16 +3,18 @@
 //! This module provides the [`BlockAssembler`] which reconstructs blocks from flashblocks.
 
 use alloy_consensus::{Header, Sealed};
-use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
+use alloy_eips::{Decodable2718, Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types::Withdrawal;
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
     PraguePayloadFields,
 };
-use base_common_consensus::BaseBlock;
+use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_common_evm::L1BlockInfo;
-use base_common_flashblocks::{ExecutionPayloadBaseV1, Flashblock};
+use base_common_flashblocks::{
+    ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock,
+};
 use base_common_rpc_types_engine::{
     BaseExecutionPayload, BaseExecutionPayloadSidecar, BaseExecutionPayloadV4,
 };
@@ -57,6 +59,38 @@ impl BlockAssembler {
         Self
     }
 
+    /// Returns the base payload from the first flashblock in a sequence.
+    pub fn base_from_first_flashblock(flashblock: &Flashblock) -> Result<ExecutionPayloadBaseV1> {
+        flashblock.base.clone().ok_or(ProtocolError::MissingBase.into())
+    }
+
+    /// Decodes only the transactions present in the provided flashblock suffix.
+    pub fn decode_flashblock_transactions(flashblock: &Flashblock) -> Result<Vec<BaseTxEnvelope>> {
+        flashblock
+            .diff
+            .transactions
+            .iter()
+            .map(|transaction| {
+                BaseTxEnvelope::decode_2718_exact(transaction.as_ref())
+                    .map_err(|error| ExecutionError::BlockConversion(error.to_string()).into())
+            })
+            .collect()
+    }
+
+    /// Builds a synthetic execution block from base metadata plus one flashblock suffix.
+    pub fn execution_block_from_base_and_suffix(
+        base: &ExecutionPayloadBaseV1,
+        flashblock: &Flashblock,
+        transactions: Vec<BaseTxEnvelope>,
+    ) -> Result<BaseBlock> {
+        Self::execution_block_from_parts(
+            base,
+            &flashblock.diff,
+            flashblock.diff.withdrawals.clone(),
+            transactions.into_iter().map(|transaction| transaction.encoded_2718().into()).collect(),
+        )
+    }
+
     /// Assembles a complete block from a slice of flashblocks.
     ///
     /// # Arguments
@@ -72,7 +106,7 @@ impl BlockAssembler {
     /// - Block conversion fails
     pub fn assemble(flashblocks: &[Flashblock]) -> Result<AssembledBlock> {
         let first = flashblocks.first().ok_or(ProtocolError::EmptyFlashblocks)?;
-        let base = first.base.clone().ok_or(ProtocolError::MissingBase)?;
+        let base = Self::base_from_first_flashblock(first)?;
         let latest_flashblock = flashblocks.last().ok_or(ProtocolError::EmptyFlashblocks)?;
 
         let transactions: Vec<Bytes> = flashblocks
@@ -83,35 +117,52 @@ impl BlockAssembler {
         let withdrawals: Vec<Withdrawal> =
             flashblocks.iter().flat_map(|flashblock| flashblock.diff.withdrawals.clone()).collect();
 
-        // BaseExecutionPayloadV4 sets withdrawals_root directly instead of computing from list.
+        let block = Self::execution_block_from_parts(
+            &base,
+            &latest_flashblock.diff,
+            withdrawals,
+            transactions,
+        )?;
+
+        // Zero block hash for flashblocks since the final hash isn't known yet
+        let sealed_header = block.header.clone().seal(B256::ZERO);
+
+        Ok(AssembledBlock { block, base, flashblocks: flashblocks.to_vec(), header: sealed_header })
+    }
+
+    fn execution_block_from_parts(
+        base: &ExecutionPayloadBaseV1,
+        diff: &ExecutionPayloadFlashblockDeltaV1,
+        withdrawals: Vec<Withdrawal>,
+        transactions: Vec<Bytes>,
+    ) -> Result<BaseBlock> {
         let execution_payload = BaseExecutionPayloadV4 {
             payload_inner: ExecutionPayloadV3 {
-                blob_gas_used: latest_flashblock.diff.blob_gas_used.unwrap_or_default(),
+                blob_gas_used: diff.blob_gas_used.unwrap_or_default(),
                 excess_blob_gas: 0,
                 payload_inner: ExecutionPayloadV2 {
                     withdrawals,
                     payload_inner: ExecutionPayloadV1 {
                         parent_hash: base.parent_hash,
                         fee_recipient: base.fee_recipient,
-                        state_root: latest_flashblock.diff.state_root,
-                        receipts_root: latest_flashblock.diff.receipts_root,
-                        logs_bloom: latest_flashblock.diff.logs_bloom,
+                        state_root: diff.state_root,
+                        receipts_root: diff.receipts_root,
+                        logs_bloom: diff.logs_bloom,
                         prev_randao: base.prev_randao,
                         block_number: base.block_number,
                         gas_limit: base.gas_limit,
-                        gas_used: latest_flashblock.diff.gas_used,
+                        gas_used: diff.gas_used,
                         timestamp: base.timestamp,
                         extra_data: base.extra_data.clone(),
                         base_fee_per_gas: base.base_fee_per_gas,
-                        block_hash: latest_flashblock.diff.block_hash,
+                        block_hash: diff.block_hash,
                         transactions,
                     },
                 },
             },
-            withdrawals_root: latest_flashblock.diff.withdrawals_root,
+            withdrawals_root: diff.withdrawals_root,
         };
 
-        // Create sidecar with fields passed separately to Engine API
         let sidecar = BaseExecutionPayloadSidecar::v4(
             CancunPayloadFields {
                 parent_beacon_block_root: base.parent_beacon_block_root,
@@ -120,27 +171,25 @@ impl BlockAssembler {
             PraguePayloadFields::new(EMPTY_REQUESTS_HASH),
         );
 
-        let block: BaseBlock = BaseExecutionPayload::V4(execution_payload)
+        BaseExecutionPayload::V4(execution_payload)
             .try_into_block_with_sidecar(&sidecar)
-            .map_err(|e| ExecutionError::BlockConversion(e.to_string()))?;
-
-        // Zero block hash for flashblocks since the final hash isn't known yet
-        let sealed_header = block.header.clone().seal(B256::ZERO);
-
-        Ok(AssembledBlock { block, base, flashblocks: flashblocks.to_vec(), header: sealed_header })
+            .map_err(|error| ExecutionError::BlockConversion(error.to_string()).into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::{Signed, TxLegacy};
+    use alloy_eips::Encodable2718;
     use alloy_primitives::{Address, Bloom, U256};
     use alloy_rpc_types_engine::PayloadId;
+    use base_common_consensus::BaseTxEnvelope;
     use base_common_flashblocks::{
         ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Metadata,
     };
 
     use super::*;
-    use crate::ProtocolError;
+    use crate::{ExecutionError, ProtocolError};
 
     fn create_test_flashblock(index: u64, with_base: bool) -> Flashblock {
         Flashblock {
@@ -174,6 +223,25 @@ mod tests {
             },
             metadata: Metadata { block_number: 100 },
         }
+    }
+
+    fn create_encoded_legacy_tx() -> Bytes {
+        let tx = TxLegacy {
+            chain_id: Some(8453),
+            nonce: 0,
+            gas_price: 1_000_000_000,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Default::default(),
+        };
+        let envelope = BaseTxEnvelope::Legacy(Signed::new_unchecked(
+            tx,
+            alloy_primitives::Signature::test_signature(),
+            B256::ZERO,
+        ));
+
+        envelope.encoded_2718().into()
     }
 
     #[test]
@@ -234,5 +302,40 @@ mod tests {
             result,
             Err(crate::StateProcessorError::Protocol(ProtocolError::MissingBase))
         ));
+    }
+
+    #[test]
+    fn test_base_from_first_flashblock_missing_base_fails() {
+        let flashblock = create_test_flashblock(0, false);
+
+        let result = BlockAssembler::base_from_first_flashblock(&flashblock);
+
+        assert!(matches!(
+            result,
+            Err(crate::StateProcessorError::Protocol(ProtocolError::MissingBase))
+        ));
+    }
+
+    #[test]
+    fn test_decode_flashblock_transactions_rejects_malformed_transaction() {
+        let mut flashblock = create_test_flashblock(0, true);
+        flashblock.diff.transactions = vec![Bytes::from_static(&[0x03])];
+
+        let result = BlockAssembler::decode_flashblock_transactions(&flashblock);
+
+        assert!(matches!(
+            result,
+            Err(crate::StateProcessorError::Execution(ExecutionError::BlockConversion(_)))
+        ));
+    }
+
+    #[test]
+    fn test_decode_flashblock_transactions_decodes_only_current_flashblock_suffix() {
+        let mut flashblock = create_test_flashblock(7, true);
+        flashblock.diff.transactions = vec![create_encoded_legacy_tx()];
+
+        let transactions = BlockAssembler::decode_flashblock_transactions(&flashblock).unwrap();
+
+        assert_eq!(transactions.len(), 1);
     }
 }

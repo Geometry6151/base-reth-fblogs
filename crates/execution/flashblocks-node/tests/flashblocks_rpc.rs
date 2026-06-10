@@ -22,7 +22,10 @@ use base_common_flashblocks::{
 };
 use base_common_network::Base;
 use base_common_rpc_types::BaseTransactionRequest;
-use base_flashblocks::{FlashblockSnapshotId, FlashblocksAPI};
+use base_flashblocks::{
+    FastFlashblockLogsDelta, FlashblockLogsBatch, FlashblockSnapshotId, FlashblocksAPI,
+    FlashblocksMode,
+};
 use base_flashblocks_node::test_harness::FlashblocksHarness;
 use base_node_runner::test_utils::L1_BLOCK_INFO_DEPOSIT_TX;
 use base_test_utils::{Account, DoubleCounter};
@@ -31,7 +34,8 @@ use futures::{SinkExt, StreamExt};
 use reth_revm::context::TransactionType;
 use reth_rpc_eth_api::RpcReceipt;
 use serde_json::json;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 // LogEmitterB: Emits LOG1 with TEST_LOG_TOPIC_0 when called
 // Runtime bytecode:
@@ -215,10 +219,13 @@ fn unique_l1_block_info_deposit_tx(block_number: u64) -> Bytes {
 }
 
 struct TestSetup {
+    mode: FlashblocksMode,
     harness: FlashblocksHarness,
     txn_details: TransactionDetails,
     canonical_parent_hash: B256,
 }
+
+type TestWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct TransactionDetails {
     counter_deployment_tx: Bytes,
@@ -247,7 +254,11 @@ struct TransactionDetails {
 
 impl TestSetup {
     async fn new() -> Result<Self> {
-        let harness = FlashblocksHarness::new().await?;
+        Self::new_with_mode(FlashblocksMode::Legacy).await
+    }
+
+    async fn new_with_mode(mode: FlashblocksMode) -> Result<Self> {
+        let harness = FlashblocksHarness::new_with_mode(mode).await?;
 
         let provider = harness.provider();
         let canonical_parent_hash = harness.latest_block().hash();
@@ -337,7 +348,7 @@ impl TestSetup {
             balance_transfer_tx,
         };
 
-        Ok(Self { harness, txn_details, canonical_parent_hash })
+        Ok(Self { mode, harness, txn_details, canonical_parent_hash })
     }
 
     fn create_first_payload(&self) -> Flashblock {
@@ -446,6 +457,101 @@ impl TestSetup {
         self.send_flashblock(second_payload).await?;
 
         Ok(())
+    }
+
+    async fn subscribe_fast_flashblock_logs(&self) -> Result<TestWsStream> {
+        let ws_url = self.harness.ws_url();
+        let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+        ws_stream
+            .send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_subscribe",
+                    "params": ["newFastFlashblockLogs"]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+
+        let response = ws_stream.next().await.unwrap()?;
+        let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+        assert_eq!(sub["jsonrpc"], "2.0");
+        assert_eq!(sub["id"], 1);
+
+        Ok(ws_stream)
+    }
+
+    async fn send_flashblock_and_collect_fast_delta(
+        &self,
+        ws_stream: &mut TestWsStream,
+        flashblock: Flashblock,
+    ) -> Result<FastFlashblockLogsDelta> {
+        self.send_flashblock(flashblock).await?;
+
+        let notification = ws_stream.next().await.unwrap()?;
+        let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+        Ok(serde_json::from_value(notif["params"]["result"].clone())?)
+    }
+
+    async fn collect_fast_deltas(
+        &self,
+        payloads: Vec<Flashblock>,
+    ) -> Result<Vec<FastFlashblockLogsDelta>> {
+        let mut ws_stream = self.subscribe_fast_flashblock_logs().await?;
+        let mut deltas = Vec::with_capacity(payloads.len());
+
+        for payload in payloads {
+            deltas
+                .push(self.send_flashblock_and_collect_fast_delta(&mut ws_stream, payload).await?);
+        }
+
+        Ok(deltas)
+    }
+
+    async fn collect_fast_deltas_with_rollover(
+        &self,
+    ) -> Result<(Vec<FastFlashblockLogsDelta>, B256)> {
+        let mut ws_stream = self.subscribe_fast_flashblock_logs().await?;
+        let first_delta = self
+            .send_flashblock_and_collect_fast_delta(&mut ws_stream, self.create_first_payload())
+            .await?;
+        let second_delta = self
+            .send_flashblock_and_collect_fast_delta(&mut ws_stream, self.create_second_payload())
+            .await?;
+        let next_block_parent_hash = self.pending_parent_hash_for_next_block(&second_delta).await?;
+        let third_delta = self
+            .send_flashblock_and_collect_fast_delta(
+                &mut ws_stream,
+                self.create_third_payload(next_block_parent_hash),
+            )
+            .await?;
+
+        Ok((vec![first_delta, second_delta, third_delta], next_block_parent_hash))
+    }
+
+    async fn pending_parent_hash_for_next_block(
+        &self,
+        latest_delta: &FastFlashblockLogsDelta,
+    ) -> Result<B256> {
+        match self.mode {
+            FlashblocksMode::Legacy => Ok(self
+                .harness
+                .provider()
+                .get_block_by_number(BlockNumberOrTag::Pending)
+                .await?
+                .expect("legacy mode should expose a pending block after the second flashblock")
+                .hash()),
+            FlashblocksMode::HotOnly => Ok(self
+                .harness
+                .flashblocks_state()
+                .get_hot_snapshot(latest_delta.snapshot_id)
+                .expect("hot-only delta should retain a hot snapshot")
+                .latest_header
+                .hash()),
+        }
     }
 
     async fn send_raw_transaction_sync(
@@ -874,6 +980,104 @@ async fn test_base_estimate_gas_at_flashblock() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_base_estimate_gas_at_flashblock_hot_only() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let canonical_parent_number = setup
+        .harness
+        .provider()
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await?
+        .expect("latest block expected")
+        .number();
+    let snapshot_block_number = setup
+        .create_first_payload()
+        .base
+        .as_ref()
+        .expect("flashblock base payload expected")
+        .block_number;
+
+    let deltas = setup
+        .collect_fast_deltas(vec![setup.create_first_payload(), setup.create_second_payload()])
+        .await?;
+    let snapshot_id = deltas[1].snapshot_id;
+
+    let url = setup.harness.rpc_url();
+    let client = RpcClient::new_http(url.parse()?);
+    let estimate_guard_address = address!("0x1000000000000000000000000000000000000011");
+    let estimate_overrides = code_override(
+        estimate_guard_address,
+        count1_snapshot_guard_runtime(setup.txn_details.counter_address),
+    );
+    let estimate_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(estimate_guard_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let estimate: U256 = client
+        .request(
+            "eth_baseEstimateGasAtFlashblock",
+            (snapshot_id, estimate_request(), Some(estimate_overrides.clone())),
+        )
+        .await?;
+
+    assert!(estimate > U256::ZERO, "expected snapshot-pinned estimate to succeed");
+
+    let block_env_guard_address = address!("0x1000000000000000000000000000000000000012");
+    let block_env_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(block_env_guard_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let snapshot_block_number_result: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id,
+                block_env_request(),
+                Some(code_override(block_env_guard_address, block_env_reader_runtime(0x43))),
+                None::<Box<BlockOverrides>>,
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        snapshot_block_number_result,
+        u256_return_data(snapshot_block_number),
+        "base call should execute against the synthetic flashblock header env"
+    );
+
+    let parent_block_number_guard = code_override(
+        block_env_guard_address,
+        block_number_revert_if_eq_runtime(
+            canonical_parent_number
+                .try_into()
+                .expect("test harness parent block number must fit in PUSH1"),
+        ),
+    );
+
+    let error = client
+        .request::<_, U256>(
+            "eth_baseEstimateGasAtFlashblock",
+            (snapshot_id, block_env_request(), Some(parent_block_number_guard)),
+        )
+        .await
+        .expect_err("snapshot estimate should still use the canonical parent block env");
+
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert!(
+        error.message.contains("revert"),
+        "unexpected parent-env estimate error message: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_base_call_at_flashblock() -> Result<()> {
     let setup = TestSetup::new().await?;
     let ws_url = setup.harness.ws_url();
@@ -993,6 +1197,78 @@ async fn test_base_call_at_flashblock() -> Result<()> {
         error.message.contains("unknown flashblock snapshot"),
         "unexpected error message: {}",
         error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_base_call_at_flashblock_hot_only() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let deltas = setup
+        .collect_fast_deltas(vec![setup.create_first_payload(), setup.create_second_payload()])
+        .await?;
+    let snapshot_id = deltas[1].snapshot_id;
+
+    let url = setup.harness.rpc_url();
+    let client = RpcClient::new_http(url.parse()?);
+    let result: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (snapshot_id, setup.count1(), None::<serde_json::Value>, None::<serde_json::Value>),
+        )
+        .await?;
+
+    assert_eq!(
+        result,
+        bytes!("0x0000000000000000000000000000000000000000000000000000000000000002")
+    );
+
+    let block_env_reader_address = address!("0x1000000000000000000000000000000000000013");
+    let block_env_request = || {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .to(block_env_reader_address)
+            .input(TransactionInput::new(bytes!("0x")))
+    };
+
+    let snapshot_block_number: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id,
+                block_env_request(),
+                Some(code_override(block_env_reader_address, block_env_reader_runtime(0x43))),
+                None::<Box<BlockOverrides>>,
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        snapshot_block_number,
+        u256_return_data(1),
+        "snapshot header block number should be visible by default"
+    );
+
+    let overridden_block_number: Bytes = client
+        .request(
+            "eth_baseCallAtFlashblock",
+            (
+                snapshot_id,
+                block_env_request(),
+                Some(code_override(block_env_reader_address, block_env_reader_runtime(0x43))),
+                Some(Box::new(BlockOverrides {
+                    number: Some(U256::from(42)),
+                    ..Default::default()
+                })),
+            ),
+        )
+        .await?;
+
+    assert_eq!(
+        overridden_block_number,
+        u256_return_data(42),
+        "user block overrides should take precedence over snapshot defaults"
     );
 
     Ok(())
@@ -1645,6 +1921,50 @@ fn assert_fast_flashblock_transaction(tx: &serde_json::Value) {
     assert_hex_string(&tx["status"], "status");
 }
 
+fn assert_hot_only_unsupported_response(code: i64, message: &str, surface: &str) {
+    assert_eq!(code, -32602, "unexpected error code for {surface}: {code}");
+    assert!(
+        message.contains("unsupported in flashblocks hot-only mode"),
+        "unexpected hot-only error message for {surface}: {message}"
+    );
+    assert!(message.contains(surface), "expected {surface} in error message: {message}");
+}
+
+fn assert_fast_delta_matches(
+    hot_delta: &FastFlashblockLogsDelta,
+    legacy_delta: &FastFlashblockLogsDelta,
+) {
+    assert_eq!(hot_delta.block_number, legacy_delta.block_number);
+    assert_eq!(hot_delta.flashblock_index, legacy_delta.flashblock_index);
+    assert_eq!(hot_delta.payload_id, legacy_delta.payload_id);
+    assert_eq!(hot_delta.parent_hash, legacy_delta.parent_hash);
+    assert_eq!(hot_delta.block_timestamp, legacy_delta.block_timestamp);
+    assert_eq!(hot_delta.logs, legacy_delta.logs);
+    assert_eq!(hot_delta.transactions, legacy_delta.transactions);
+}
+
+fn assert_fast_delta_matches_ignoring_parent_hash(
+    hot_delta: &FastFlashblockLogsDelta,
+    legacy_delta: &FastFlashblockLogsDelta,
+) {
+    assert_eq!(hot_delta.block_number, legacy_delta.block_number);
+    assert_eq!(hot_delta.flashblock_index, legacy_delta.flashblock_index);
+    assert_eq!(hot_delta.payload_id, legacy_delta.payload_id);
+    assert_eq!(hot_delta.block_timestamp, legacy_delta.block_timestamp);
+    assert_eq!(hot_delta.logs, legacy_delta.logs);
+    assert_eq!(hot_delta.transactions, legacy_delta.transactions);
+}
+
+fn assert_fast_delta_sequence_matches(
+    hot_deltas: &[FastFlashblockLogsDelta],
+    legacy_deltas: &[FastFlashblockLogsDelta],
+) {
+    assert_eq!(hot_deltas.len(), legacy_deltas.len());
+    for (hot_delta, legacy_delta) in hot_deltas.iter().zip(legacy_deltas.iter()) {
+        assert_fast_delta_matches(hot_delta, legacy_delta);
+    }
+}
+
 #[tokio::test]
 async fn test_eth_subscribe_new_flashblock_transactions_hashes() -> eyre::Result<()> {
     let setup = TestSetup::new().await?;
@@ -2048,6 +2368,345 @@ async fn test_eth_subscribe_new_flashblock_logs_batch_null_params() -> eyre::Res
     }
 
     assert!(saw_trigger_tx, "expected tx metadata for log trigger tx, got: {transactions:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_new_flashblock_logs_batch_hot_only_is_derived_from_fast_delta() -> eyre::Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let ws_url = setup.harness.ws_url();
+
+    let (mut batch_ws, _) = connect_async(&ws_url).await?;
+    batch_ws
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFlashblockLogsBatch"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let batch_sub = batch_ws.next().await.unwrap()?;
+    let batch_sub: serde_json::Value = serde_json::from_str(batch_sub.to_text()?)?;
+    assert!(batch_sub["result"].is_string(), "batch subscription should be accepted");
+
+    let (mut fast_ws, _) = connect_async(&ws_url).await?;
+    fast_ws
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let fast_sub = fast_ws.next().await.unwrap()?;
+    let fast_sub: serde_json::Value = serde_json::from_str(fast_sub.to_text()?)?;
+    assert!(fast_sub["result"].is_string(), "fast subscription should be accepted");
+
+    for flashblock in [setup.create_first_payload(), setup.create_second_payload()] {
+        setup.send_flashblock(flashblock).await?;
+        assert!(
+            setup.harness.flashblocks_state().get_pending_blocks().as_ref().is_none(),
+            "hot-only logs batch must not depend on PendingBlocks"
+        );
+
+        let fast_notification = fast_ws.next().await.unwrap()?;
+        let fast_notification: serde_json::Value =
+            serde_json::from_str(fast_notification.to_text()?)?;
+        let fast_delta: FastFlashblockLogsDelta =
+            serde_json::from_value(fast_notification["params"]["result"].clone())?;
+
+        let batch_notification = batch_ws.next().await.unwrap()?;
+        let batch_notification: serde_json::Value =
+            serde_json::from_str(batch_notification.to_text()?)?;
+        let batch: FlashblockLogsBatch =
+            serde_json::from_value(batch_notification["params"]["result"].clone())?;
+
+        assert_eq!(batch, FlashblockLogsBatch::from_fast_delta(&fast_delta));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_subscribe_new_fast_flashblock_logs_hot_only_mode() -> eyre::Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    ws_stream
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newFastFlashblockLogs"]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let response = ws_stream.next().await.unwrap()?;
+    let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+    assert_eq!(sub["jsonrpc"], "2.0");
+    assert_eq!(sub["id"], 1);
+
+    setup.send_flashblock(setup.create_first_payload()).await?;
+    let notification = ws_stream.next().await.unwrap()?;
+    let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
+
+    assert_fast_flashblock_snapshot_id(&notif["params"]["result"]["snapshotId"]);
+    assert!(notif["params"]["result"]["logs"].is_array());
+    assert!(notif["params"]["result"]["transactions"].is_array());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_only_pending_compatibility_subscriptions_are_rejected() -> eyre::Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let ws_url = setup.harness.ws_url();
+    let (mut ws_stream, _) = connect_async(&ws_url).await?;
+
+    for (id, params, surface) in [
+        (1, json!(["newFlashblocks"]), "newFlashblocks"),
+        (2, json!(["pendingLogs"]), "pendingLogs"),
+        (3, json!(["newFlashblockTransactions"]), "newFlashblockTransactions"),
+    ] {
+        ws_stream
+            .send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "eth_subscribe",
+                    "params": params,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+
+        let response = ws_stream.next().await.unwrap()?;
+        let response: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+        assert_hot_only_unsupported_response(
+            response["error"]["code"].as_i64().expect("error code expected"),
+            response["error"]["message"].as_str().expect("error message expected"),
+            surface,
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_only_pending_style_rpcs_are_rejected() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let provider = setup.harness.provider();
+    let url = setup.harness.rpc_url();
+    let client = RpcClient::new_http(url.parse()?);
+
+    let call_request = BaseTransactionRequest::default()
+        .from(Account::Alice.address())
+        .to(Account::Bob.address())
+        .gas_limit(21_000)
+        .value(U256::from(1u64))
+        .input(TransactionInput::new(bytes!("0x")));
+
+    let error = provider
+        .get_block_by_number(BlockNumberOrTag::Pending)
+        .await
+        .expect_err("pending block must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(
+        i64::from(error.code),
+        &error.message,
+        "eth_getBlockByNumber",
+    );
+
+    let error = provider
+        .get_balance(TEST_ADDRESS)
+        .pending()
+        .await
+        .expect_err("pending balance must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(i64::from(error.code), &error.message, "eth_getBalance");
+
+    let error = provider
+        .get_transaction_count(Account::Alice.address())
+        .pending()
+        .await
+        .expect_err("pending transaction count must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(
+        i64::from(error.code),
+        &error.message,
+        "eth_getTransactionCount",
+    );
+
+    let error = provider
+        .call(call_request.clone())
+        .block(BlockNumberOrTag::Pending.into())
+        .await
+        .expect_err("pending eth_call must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(i64::from(error.code), &error.message, "eth_call");
+    assert!(
+        error.message.contains("eth_baseCallAtFlashblock"),
+        "pending eth_call should recommend eth_baseCallAtFlashblock: {}",
+        error.message
+    );
+
+    let error = provider
+        .estimate_gas(call_request.clone())
+        .block(BlockNumberOrTag::Pending.into())
+        .await
+        .expect_err("pending estimate gas must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(i64::from(error.code), &error.message, "eth_estimateGas");
+    assert!(
+        error.message.contains("eth_baseEstimateGasAtFlashblock"),
+        "pending eth_estimateGas should recommend eth_baseEstimateGasAtFlashblock: {}",
+        error.message
+    );
+
+    let simulate_payload = SimulatePayload {
+        block_state_calls: vec![SimBlock {
+            calls: vec![call_request.clone().into()],
+            block_overrides: None,
+            state_overrides: None,
+        }],
+        trace_transfers: false,
+        validation: true,
+        return_full_transactions: true,
+    };
+    let error = provider
+        .simulate(&simulate_payload)
+        .block_id(BlockNumberOrTag::Pending.into())
+        .await
+        .expect_err("pending simulateV1 must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(i64::from(error.code), &error.message, "eth_simulateV1");
+
+    let error = provider
+        .get_logs(
+            &alloy_rpc_types_eth::Filter::default()
+                .from_block(BlockNumberOrTag::Latest)
+                .to_block(BlockNumberOrTag::Pending),
+        )
+        .await
+        .expect_err("pending getLogs must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(i64::from(error.code), &error.message, "eth_getLogs");
+    assert!(
+        error.message.contains("newFastFlashblockLogs"),
+        "pending getLogs should recommend newFastFlashblockLogs: {}",
+        error.message
+    );
+
+    let error = client
+        .request::<_, Option<U256>>("eth_getBlockTransactionCountByNumber", ("pending",))
+        .await
+        .expect_err("pending block transaction count must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(
+        i64::from(error.code),
+        &error.message,
+        "eth_getBlockTransactionCountByNumber",
+    );
+
+    let error = client
+        .request::<_, RpcReceipt<Base>>(
+            "eth_sendRawTransactionSync",
+            (setup.txn_details.alice_eth_transfer_tx.clone(), Option::<u64>::None),
+        )
+        .await
+        .expect_err("sendRawTransactionSync must be rejected in hot-only mode");
+    let error = error.as_error_resp().expect("json-rpc error response expected");
+    assert_hot_only_unsupported_response(
+        i64::from(error.code),
+        &error.message,
+        "eth_sendRawTransactionSync",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_only_get_transaction_by_hash_uses_canonical_only() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let provider = setup.harness.provider();
+
+    setup.send_test_payloads().await?;
+
+    assert!(provider.get_transaction_by_hash(DEPOSIT_TX_HASH).await?.is_none());
+    assert!(
+        provider
+            .get_transaction_by_hash(setup.txn_details.alice_eth_transfer_hash)
+            .await?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_only_get_transaction_receipt_uses_canonical_only() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let provider = setup.harness.provider();
+
+    setup.send_test_payloads().await?;
+
+    assert!(provider.get_transaction_receipt(DEPOSIT_TX_HASH).await?.is_none());
+    assert!(
+        provider
+            .get_transaction_receipt(setup.txn_details.alice_eth_transfer_hash)
+            .await?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_only_fast_delta_matches_legacy_rebuild_output() -> Result<()> {
+    let legacy = TestSetup::new_with_mode(FlashblocksMode::Legacy).await?;
+    let hot = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+
+    let legacy_deltas = legacy
+        .collect_fast_deltas(vec![legacy.create_first_payload(), legacy.create_second_payload()])
+        .await?;
+    let hot_deltas = hot
+        .collect_fast_deltas(vec![hot.create_first_payload(), hot.create_second_payload()])
+        .await?;
+
+    assert_fast_delta_sequence_matches(&hot_deltas, &legacy_deltas);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hot_only_fast_delta_matches_legacy_rebuild_output_across_rollover() -> Result<()> {
+    let legacy = TestSetup::new_with_mode(FlashblocksMode::Legacy).await?;
+    let hot = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+
+    let (hot_deltas, hot_pending_hash) = hot.collect_fast_deltas_with_rollover().await?;
+    let (legacy_deltas, legacy_pending_hash) = legacy.collect_fast_deltas_with_rollover().await?;
+
+    assert_fast_delta_sequence_matches(&hot_deltas[..2], &legacy_deltas[..2]);
+    assert_eq!(legacy_deltas[2].parent_hash, legacy_pending_hash);
+    assert_eq!(hot_deltas[2].parent_hash, hot_pending_hash);
+    assert_ne!(legacy_deltas[2].parent_hash, legacy.canonical_parent_hash);
+    assert_ne!(hot_deltas[2].parent_hash, hot.canonical_parent_hash);
+    assert_fast_delta_matches_ignoring_parent_hash(&hot_deltas[2], &legacy_deltas[2]);
 
     Ok(())
 }
