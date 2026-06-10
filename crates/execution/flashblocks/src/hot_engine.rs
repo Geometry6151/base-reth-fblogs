@@ -84,6 +84,7 @@ where
             return if flashblock.index == 0 {
                 self.start_first_flashblock(flashblock)
             } else {
+                Metrics::hot_window_reset_non_zero_first_index_count().increment(1);
                 Ok(self.reset_for_flashblock())
             };
         }
@@ -106,8 +107,12 @@ where
             SequenceValidationResult::NextInSequence => self.append_same_block_suffix(flashblock),
             SequenceValidationResult::FirstOfNextBlock => self.rollover_to_next_block(flashblock),
             SequenceValidationResult::Duplicate => Ok(HotApplyOutcome::Duplicate),
-            SequenceValidationResult::NonSequentialGap { .. }
-            | SequenceValidationResult::InvalidNewBlockIndex { .. } => {
+            SequenceValidationResult::NonSequentialGap { .. } => {
+                Metrics::hot_window_reset_sequence_gap_count().increment(1);
+                Ok(self.reset_for_flashblock())
+            }
+            SequenceValidationResult::InvalidNewBlockIndex { .. } => {
+                Metrics::hot_window_reset_invalid_new_block_index_count().increment(1);
                 Ok(self.reset_for_flashblock())
             }
         }
@@ -250,6 +255,7 @@ where
         let canonical_parent_hash = canonical_header.hash_slow();
 
         if base.parent_hash != canonical_parent_hash {
+            Metrics::hot_window_reset_first_parent_mismatch_count().increment(1);
             return Ok(self.reset_for_flashblock());
         }
         let base_parent_hash = base.parent_hash;
@@ -286,11 +292,13 @@ where
 
     fn append_same_block_suffix(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
         let Some(active_block) = self.window.active_block() else {
+            Metrics::hot_window_reset_missing_active_block_count().increment(1);
             return Ok(self.reset_for_flashblock());
         };
 
         if flashblock.base.as_ref().is_some_and(|base| base.parent_hash != active_block.parent_hash)
         {
+            Metrics::hot_window_reset_same_block_parent_mismatch_count().increment(1);
             return Ok(self.reset_for_flashblock());
         }
 
@@ -336,6 +344,7 @@ where
         let expected_parent_hash = execution.last_header.hash();
 
         if base.parent_hash != expected_parent_hash {
+            Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
             return Ok(self.reset_for_flashblock());
         }
 

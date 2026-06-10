@@ -26,6 +26,20 @@ base_metrics::define_metrics! {
     hot_window_rollover_duration: histogram,
     #[describe("Count of times the hot window was reset from flashblock sequencing or parent mismatch")]
     hot_window_reset_count: counter,
+    #[describe("Count of hot window resets caused by receiving a non-zero flashblock index without an active window")]
+    hot_window_reset_non_zero_first_index_count: counter,
+    #[describe("Count of hot window resets caused by a non-sequential same-block flashblock gap")]
+    hot_window_reset_sequence_gap_count: counter,
+    #[describe("Count of hot window resets caused by receiving a new block without flashblock index zero")]
+    hot_window_reset_invalid_new_block_index_count: counter,
+    #[describe("Count of hot window resets caused by first-flashblock parent mismatch against canonical")]
+    hot_window_reset_first_parent_mismatch_count: counter,
+    #[describe("Count of hot window resets caused by missing active block state")]
+    hot_window_reset_missing_active_block_count: counter,
+    #[describe("Count of hot window resets caused by same-block parent mismatch")]
+    hot_window_reset_same_block_parent_mismatch_count: counter,
+    #[describe("Count of hot window resets caused by rollover parent mismatch")]
+    hot_window_reset_rollover_parent_mismatch_count: counter,
     #[describe("Time taken to materialize an optional hot snapshot from carried execution state")]
     hot_snapshot_materialize_duration: histogram,
     #[describe("Count of times canonical processing forced a hot window reset")]
