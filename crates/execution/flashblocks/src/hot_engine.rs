@@ -344,8 +344,14 @@ where
         let expected_parent_hash = execution.last_header.hash();
 
         if base.parent_hash != expected_parent_hash {
-            Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
-            return Ok(self.reset_for_flashblock());
+            self.reset();
+            let outcome = self.start_first_flashblock(flashblock)?;
+            if matches!(outcome, HotApplyOutcome::Delta { .. }) {
+                Metrics::hot_window_reanchor_canonical_parent_count().increment(1);
+            } else {
+                Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
+            }
+            return Ok(outcome);
         }
 
         let (execution_block, decoded_transactions) =
@@ -1043,6 +1049,81 @@ mod tests {
         assert_eq!(engine.window.blocks.len(), 2);
         assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(1));
         assert_eq!(engine.window.blocks.back().map(|block| block.block_number), Some(2));
+    }
+
+    #[test]
+    fn hot_engine_reanchors_rollover_to_available_canonical_parent_hash() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_deploy_tx = create_deploy_log_tx(0x36);
+        let first_block_contract =
+            first_block_deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
+        let first_block_call_tx = create_call_log_tx(first_block_contract, 0x37);
+        let second_block_deploy_tx = create_deploy_log_tx_with_gas_limit(0x38, 120_000);
+        seed_sender_balance(&client, &first_block_deploy_tx);
+        seed_sender_balance(&client, &first_block_call_tx);
+        seed_sender_balance(&client, &second_block_deploy_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x26; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let second_flashblock = flashblock(
+            1,
+            1,
+            PayloadId::new([0x27; 8]),
+            canonical_parent_hash,
+            false,
+            vec![first_block_call_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
+
+        let canonical_header = Header {
+            number: 1,
+            parent_hash: canonical_parent_hash,
+            extra_data: Bytes::from_static(b"canonical-parent"),
+            ..Default::default()
+        };
+        let canonical_block = canonical_block_with_header(canonical_header, vec![]);
+        let canonical_hash = canonical_block.header().hash_slow();
+        assert_ne!(
+            engine
+                .window
+                .execution
+                .as_ref()
+                .expect("execution state should exist")
+                .last_header
+                .hash(),
+            canonical_hash
+        );
+        insert_canonical_header(&client, &canonical_block);
+
+        let third_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0x28; 8]),
+            canonical_hash,
+            true,
+            vec![decoded_l1_info_tx(), second_block_deploy_tx],
+        );
+
+        let HotApplyOutcome::Delta { delta, .. } = engine
+            .apply_flashblock(&third_flashblock)
+            .expect("next block should reanchor to canonical parent")
+        else {
+            panic!("expected next-block delta outcome after canonical reanchor");
+        };
+
+        assert_eq!(delta.transactions.len(), 2);
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
     }
 
     #[test]

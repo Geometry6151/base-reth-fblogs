@@ -40,6 +40,8 @@ base_metrics::define_metrics! {
     hot_window_reset_same_block_parent_mismatch_count: counter,
     #[describe("Count of hot window resets caused by rollover parent mismatch")]
     hot_window_reset_rollover_parent_mismatch_count: counter,
+    #[describe("Count of hot rollover parent mismatches recovered by reanchoring to canonical state")]
+    hot_window_reanchor_canonical_parent_count: counter,
     #[describe("Time taken to materialize an optional hot snapshot from carried execution state")]
     hot_snapshot_materialize_duration: histogram,
     #[describe("Count of times canonical processing forced a hot window reset")]
