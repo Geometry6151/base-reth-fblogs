@@ -434,7 +434,7 @@ async fn pipe_flashblock_logs_batch_from_fast_delta_subscription(
                 };
                 let delta = match event {
                     FastFlashblockFeedEvent::Delta(delta) => delta,
-                    FastFlashblockFeedEvent::Resync => return,
+                    FastFlashblockFeedEvent::Resync => continue,
                 };
 
                 let batch = base_metrics::time!(Metrics::logs_batch_build_duration(), {
@@ -517,7 +517,7 @@ async fn pipe_fast_flashblock_logs_subscription(
                 };
                 let delta = match event {
                     FastFlashblockFeedEvent::Delta(delta) => delta,
-                    FastFlashblockFeedEvent::Resync => return,
+                    FastFlashblockFeedEvent::Resync => continue,
                 };
 
                 if let Some(filter) = filter.as_ref() {
@@ -654,7 +654,8 @@ where
 mod tests {
     use std::time::Duration;
 
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
+    use alloy_rpc_types_engine::PayloadId;
     use jsonrpsee::{
         RpcModule,
         core::{EmptyServerParams, SubscriptionResult},
@@ -662,11 +663,13 @@ mod tests {
     use serde_json::Value;
     use tokio::{sync::broadcast, time::timeout};
 
+    use crate::{FastFlashblockLogsDelta, FlashblockSnapshotId};
+
     use super::*;
 
     #[tokio::test]
-    async fn fast_flashblock_update_resync_closes_fast_subscription() {
-        let (sender, _) = broadcast::channel(1);
+    async fn fast_flashblock_update_resync_keeps_fast_subscription_open() {
+        let (sender, _) = broadcast::channel(4);
         let mut module = RpcModule::new(());
         module
             .register_subscription::<SubscriptionResult, _, _>(
@@ -694,9 +697,60 @@ mod tests {
             .unwrap();
 
         sender.send(FastFlashblockFeedEvent::Resync).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
 
         let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
-        assert!(next.is_none());
+        let (value, _) = next.expect("subscription should stay open after resync").unwrap();
+        assert_eq!(value["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn fast_flashblock_update_resync_keeps_logs_batch_subscription_open() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "logs_batch_update_resync",
+                "logs_batch_update_resync",
+                "logs_batch_update_resync_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_flashblock_logs_batch_from_fast_delta_subscription(
+                                sink, receiver, None,
+                            )
+                            .await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded("logs_batch_update_resync", EmptyServerParams::new())
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::Resync).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        let (value, _) = next.expect("subscription should stay open after resync").unwrap();
+        assert_eq!(value["blockNumber"], "0x1");
+    }
+
+    fn test_fast_delta() -> FastFlashblockLogsDelta {
+        FastFlashblockLogsDelta::new(
+            FlashblockSnapshotId::new(7, 1, 0, PayloadId::new([2; 8]), B256::with_last_byte(3)),
+            Some(4),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     #[test]

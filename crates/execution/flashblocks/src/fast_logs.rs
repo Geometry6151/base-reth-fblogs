@@ -71,17 +71,16 @@ impl FlashblockSnapshotId {
 
 /// Internal event for the fast-log feed.
 ///
-/// Current legacy producers emit [`Self::Delta`] only. [`Self::Resync`] is reserved for a future
-/// hot-only pending-state reset path and may not be emitted until that producer-side reset
-/// signaling exists.
+/// Current legacy producers emit [`Self::Delta`] only. Hot-only producers may emit
+/// [`Self::Resync`] when the local pending window is invalidated.
 #[derive(Clone, Debug)]
 pub enum FastFlashblockFeedEvent {
     /// Exact log delta for one flashblock.
     Delta(Arc<FastFlashblockLogsDelta>),
-    /// Reserved for future hot-only reset signaling.
+    /// Hot-only reset signaling.
     ///
-    /// Consumers that receive this must treat the fast stream as out of sync and close or
-    /// recreate the subscription, but the current legacy path does not emit it yet.
+    /// Consumers that receive this must treat the fast stream as discontinuous until a later
+    /// [`Self::Delta`] arrives.
     Resync,
 }
 
