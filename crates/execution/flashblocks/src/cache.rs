@@ -98,6 +98,11 @@ impl FlashblockCache {
         self.drain_cached(block_number).into_iter().map(|cached| cached.flashblock).collect()
     }
 
+    /// Removes every cached flashblock while preserving the latest canonical watermark.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Updates the latest canonical block number and evicts any cached entries
     /// at or below it (they can no longer be useful).
     pub fn update_canonical(&mut self, block_number: BlockNumber) {
@@ -245,5 +250,17 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].flashblock.index, flashblock.index);
         assert_eq!(drained[0].inserted_at, inserted_at);
+    }
+
+    #[test]
+    fn clear_removes_entries_without_losing_canonical_watermark() {
+        let mut cache = FlashblockCache::new(10);
+
+        assert!(cache.insert(make_flashblock(11, 0)));
+        assert!(cache.insert(make_flashblock(12, 0)));
+        cache.clear();
+
+        assert!(cache.is_empty());
+        assert!(cache.insert(make_flashblock(13, 0)));
     }
 }

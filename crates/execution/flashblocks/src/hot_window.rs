@@ -84,15 +84,32 @@ pub struct HotPendingBlock {
     pub local_header_parts: Option<HotExecutedHeaderParts>,
 }
 
+/// Locally retained proof for one speculative block that was verified by a child rollover.
+#[derive(Clone, Debug)]
+pub struct RetainedVerifiedBlock {
+    /// Speculative block number represented by this retained proof.
+    pub block_number: BlockNumber,
+    /// Parent hash for the retained speculative block.
+    pub parent_hash: B256,
+    /// Locally sealed speculative header used for canonical reconciliation.
+    pub sealed_header: Sealed<Header>,
+    /// Ordered transaction hashes used to cross-check canonical equivalence.
+    pub transaction_hashes: Vec<TxHash>,
+}
+
 /// Small multi-block pending window for exact hot execution continuity.
 #[derive(Debug)]
 pub struct HotPendingWindow<DB> {
     /// Maximum number of pending blocks retained in the window.
     pub max_depth: usize,
-    /// Canonical parent hash below the oldest pending block in the window.
+    /// Canonical anchor block number beneath the current speculative chain.
+    pub speculative_anchor_block: BlockNumber,
+    /// Canonical anchor block hash beneath the current speculative chain.
     pub canonical_base_parent_hash: B256,
     /// Carried execution state used to continue pending execution.
     pub execution: Option<HotExecutionState<DB>>,
+    /// Retained proofs for speculative blocks already verified by child rollovers.
+    pub verified_blocks: VecDeque<RetainedVerifiedBlock>,
     /// Bounded append-only pending blocks ordered oldest to newest.
     pub blocks: VecDeque<HotPendingBlock>,
 }
@@ -102,25 +119,26 @@ impl<DB> HotPendingWindow<DB> {
     pub fn new(max_depth: usize) -> Self {
         Self {
             max_depth,
+            speculative_anchor_block: 0,
             canonical_base_parent_hash: B256::ZERO,
             execution: None,
+            verified_blocks: VecDeque::with_capacity(max_depth),
             blocks: VecDeque::with_capacity(max_depth),
         }
     }
 
     /// Clears the execution state and pending blocks.
     pub fn reset(&mut self) {
+        self.speculative_anchor_block = 0;
         self.canonical_base_parent_hash = B256::ZERO;
         self.execution = None;
+        self.verified_blocks.clear();
         self.blocks.clear();
     }
 
-    /// Pushes a new pending block into the bounded window.
+    /// Pushes a new pending block into the append-only speculative window.
     pub fn push_block(&mut self, block: HotPendingBlock) {
         self.blocks.push_back(block);
-        while self.blocks.len() > self.max_depth {
-            self.blocks.pop_front();
-        }
     }
 
     /// Returns the active pending block.
@@ -151,7 +169,10 @@ mod tests {
     use alloy_rpc_types_engine::PayloadId;
     use base_common_flashblocks::ExecutionPayloadBaseV1;
 
-    use super::{HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow};
+    use super::{
+        HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow,
+        RetainedVerifiedBlock,
+    };
 
     fn test_header(block_number: u64, parent_hash: B256) -> Sealed<Header> {
         Sealed::new_unchecked(
@@ -199,15 +220,15 @@ mod tests {
     }
 
     #[test]
-    fn hot_pending_window_push_block_keeps_recent_blocks_within_max_depth() {
+    fn hot_pending_window_push_block_retains_blocks_until_reconciliation_prunes_them() {
         let mut window = HotPendingWindow::<()>::new(2);
 
         window.push_block(test_pending_block(1, 0));
         window.push_block(test_pending_block(2, 1));
         window.push_block(test_pending_block(3, 2));
 
-        assert_eq!(window.blocks.len(), 2);
-        assert_eq!(window.blocks.front().map(|block| block.block_number), Some(2));
+        assert_eq!(window.blocks.len(), 3);
+        assert_eq!(window.blocks.front().map(|block| block.block_number), Some(1));
         assert_eq!(window.active_block_number(), Some(3));
         assert_eq!(window.latest_flashblock_index(), Some(2));
     }
@@ -215,6 +236,7 @@ mod tests {
     #[test]
     fn hot_pending_window_reset_clears_execution_and_blocks() {
         let mut window = HotPendingWindow::new(2);
+        window.speculative_anchor_block = 6;
         window.canonical_base_parent_hash = B256::with_last_byte(0x44);
         window.execution = Some(HotExecutionState {
             db: (),
@@ -222,12 +244,20 @@ mod tests {
             state_overrides: alloy_rpc_types::state::StateOverride::default(),
             l1_block_info: base_common_evm::L1BlockInfo::default(),
         });
+        window.verified_blocks.push_back(RetainedVerifiedBlock {
+            block_number: 6,
+            parent_hash: B256::with_last_byte(0x11),
+            sealed_header: test_header(6, B256::with_last_byte(0x11)),
+            transaction_hashes: vec![B256::with_last_byte(0x22)],
+        });
         window.push_block(test_pending_block(7, 9));
 
         window.reset();
 
+        assert_eq!(window.speculative_anchor_block, 0);
         assert_eq!(window.canonical_base_parent_hash, B256::ZERO);
         assert!(window.execution.is_none());
+        assert!(window.verified_blocks.is_empty());
         assert!(window.blocks.is_empty());
         assert!(window.active_block().is_none());
         assert!(window.active_block_mut().is_none());

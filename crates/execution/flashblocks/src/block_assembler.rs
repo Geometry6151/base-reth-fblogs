@@ -124,16 +124,14 @@ impl BlockAssembler {
             blob_gas_used: header_parts.blob_gas_used,
         };
 
-        Ok(
-            Self::execution_block_from_parts(
-                base,
-                &local_diff,
-                withdrawals,
-                transactions,
-                header_parts.requests_hash,
-            )?
-            .header,
-        )
+        Ok(Self::execution_block_from_parts(
+            base,
+            &local_diff,
+            withdrawals,
+            transactions,
+            header_parts.requests_hash,
+        )?
+        .header)
     }
 
     /// Assembles a complete block from a slice of flashblocks.

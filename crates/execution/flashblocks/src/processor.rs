@@ -34,8 +34,8 @@ use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 use crate::{
     BlockAssembler, CachedFlashblock, ExecutionError, FastFlashblockFeedEvent,
     FastFlashblockLogsDelta, FlashblockCache, FlashblocksMode, HotApplyOutcome, HotEngine,
-    HotSnapshotRing, PendingBlocks, PendingBlocksBuilder, PendingStateBuilder, ProviderError,
-    Result, SnapshotCache, StateProcessorError,
+    HotInvalidationReason, HotSnapshotRing, PendingBlocks, PendingBlocksBuilder,
+    PendingStateBuilder, ProviderError, Result, SnapshotCache, StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -230,6 +230,10 @@ where
                 self.clear_hot_snapshot_ring();
                 _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
             }
+            Ok(HotApplyOutcome::InvalidateSession { reason }) => {
+                self.handle_hot_invalidation(Some(block.number), reason).await;
+                return;
+            }
             Err(e) => {
                 error!(message = "could not process canonical block", error = %e);
                 return;
@@ -249,7 +253,9 @@ where
                 cached_count = cached.len(),
             );
             for flashblock in cached {
-                self.apply_hot_only_flashblock(flashblock.flashblock).await;
+                if self.apply_hot_only_flashblock(flashblock.flashblock).await {
+                    return;
+                }
             }
         }
     }
@@ -261,9 +267,13 @@ where
         }
     }
 
-    async fn apply_hot_only_flashblock(&self, flashblock: Flashblock) {
+    async fn apply_hot_only_flashblock(&self, flashblock: Flashblock) -> bool {
         let mut replay_queue = VecDeque::from([flashblock]);
 
+        self.apply_hot_only_replay_queue(&mut replay_queue).await
+    }
+
+    async fn apply_hot_only_replay_queue(&self, replay_queue: &mut VecDeque<Flashblock>) -> bool {
         while let Some(flashblock) = replay_queue.pop_front() {
             let _flashblock_apply_timer =
                 base_metrics::timed!(Metrics::flashblock_apply_duration());
@@ -340,6 +350,11 @@ where
                     }
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
+                Ok(HotApplyOutcome::InvalidateSession { reason }) => {
+                    self.handle_hot_invalidation(None, reason).await;
+                    Metrics::block_processing_duration().record(block_processing_start.elapsed());
+                    return true;
+                }
                 Err(e) => {
                     if let StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
@@ -362,6 +377,8 @@ where
                 }
             }
         }
+
+        false
     }
 
     async fn cache_missing_first_hot_flashblock(&self, flashblock: &Flashblock) -> bool {
@@ -634,6 +651,24 @@ where
         self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").clear();
     }
 
+    async fn handle_hot_invalidation(
+        &self,
+        canonical_block_number: Option<BlockNumber>,
+        reason: HotInvalidationReason,
+    ) {
+        warn!(reason = ?reason, "invalidated hot flashblock session");
+        self.clear_hot_snapshot_ring();
+
+        let mut cache = self.cache.lock().await;
+        cache.clear();
+        if let Some(canonical_block_number) = canonical_block_number {
+            cache.update_canonical(canonical_block_number);
+        }
+        drop(cache);
+
+        _ = self.fast_sender.send(FastFlashblockFeedEvent::InvalidateSession);
+    }
+
     fn next_snapshot_nonce(&self) -> u64 {
         self.next_snapshot_nonce.fetch_add(1, Ordering::Relaxed).saturating_add(1)
     }
@@ -820,7 +855,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::VecDeque, sync::Arc, time::Duration};
 
     use alloy_primitives::{Address, B256, Bloom, Bytes, U256, hex_literal::hex};
     use alloy_rpc_types_engine::PayloadId;
@@ -1066,5 +1101,259 @@ mod tests {
         let active_block = hot_engine.window.blocks.back().expect("active block should exist");
         assert_eq!(active_block.block_number, 2);
         assert_eq!(active_block.latest_flashblock_index, 1);
+    }
+
+    #[tokio::test]
+    async fn hot_only_flashblock_invalidate_session_emits_terminal_event() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (fast_sender, mut fast_receiver) = broadcast::channel(8);
+        let (sender, _) = broadcast::channel(1);
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        let processor = StateProcessor::new_with_mode(
+            client,
+            Arc::new(ArcSwapOption::new(None)),
+            3,
+            FlashblocksMode::HotOnly,
+            Arc::new(Mutex::new(rx)),
+            fast_sender,
+            sender,
+            Arc::new(std::sync::Mutex::new(SnapshotCache::new(8, Duration::from_secs(1)))),
+            Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(8))),
+        );
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                1,
+                PayloadId::new([0x91; 8]),
+                parent_hash,
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected initial hot-only delta event");
+        };
+        assert!(
+            processor
+                .hot_snapshot_ring
+                .lock()
+                .expect("hot snapshot ring mutex poisoned")
+                .get(first_delta.snapshot_id)
+                .is_some()
+        );
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                2,
+                PayloadId::new([0x92; 8]),
+                B256::with_last_byte(0xee),
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+
+        let invalidation_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(invalidation_event, FastFlashblockFeedEvent::InvalidateSession));
+        assert!(
+            processor
+                .hot_snapshot_ring
+                .lock()
+                .expect("hot snapshot ring mutex poisoned")
+                .get(first_delta.snapshot_id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_only_replay_queue_invalidate_session_stops_remaining_entries() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (fast_sender, mut fast_receiver) = broadcast::channel(8);
+        let (sender, _) = broadcast::channel(1);
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        let processor = StateProcessor::new_with_mode(
+            client,
+            Arc::new(ArcSwapOption::new(None)),
+            3,
+            FlashblocksMode::HotOnly,
+            Arc::new(Mutex::new(rx)),
+            fast_sender,
+            sender,
+            Arc::new(std::sync::Mutex::new(SnapshotCache::new(8, Duration::from_secs(1)))),
+            Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(8))),
+        );
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                1,
+                PayloadId::new([0x93; 8]),
+                parent_hash,
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected initial hot-only delta event");
+        };
+
+        let mut replay_queue = VecDeque::from([
+            test_hot_flashblock(
+                0,
+                2,
+                PayloadId::new([0x94; 8]),
+                B256::with_last_byte(0xee),
+                true,
+                vec![encoded_l1_info_tx()],
+            ),
+            test_hot_flashblock(
+                1,
+                2,
+                PayloadId::new([0x94; 8]),
+                B256::with_last_byte(0xee),
+                false,
+                vec![],
+            ),
+        ]);
+
+        assert!(processor.apply_hot_only_replay_queue(&mut replay_queue).await);
+
+        let invalidation_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(invalidation_event, FastFlashblockFeedEvent::InvalidateSession));
+        assert_eq!(replay_queue.len(), 1);
+        assert_eq!(replay_queue.front().map(|flashblock| flashblock.index), Some(1));
+        assert!(
+            processor
+                .hot_snapshot_ring
+                .lock()
+                .expect("hot snapshot ring mutex poisoned")
+                .get(first_delta.snapshot_id)
+                .is_none()
+        );
+        assert!(matches!(fast_receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn hot_only_canonical_conflict_invalidate_session_emits_terminal_event() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (fast_sender, mut fast_receiver) = broadcast::channel(8);
+        let (sender, _) = broadcast::channel(1);
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        let processor = StateProcessor::new_with_mode(
+            client.clone(),
+            Arc::new(ArcSwapOption::new(None)),
+            3,
+            FlashblocksMode::HotOnly,
+            Arc::new(Mutex::new(rx)),
+            fast_sender,
+            sender,
+            Arc::new(std::sync::Mutex::new(SnapshotCache::new(8, Duration::from_secs(1)))),
+            Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(8))),
+        );
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                1,
+                PayloadId::new([0xa1; 8]),
+                parent_hash,
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected first hot-only delta event");
+        };
+
+        let locally_sealed_parent = {
+            let mut hot_engine = processor.hot_engine().lock().await;
+            let chain_spec = hot_engine.client.chain_spec();
+            let HotPendingWindow { execution, blocks, .. } = &mut hot_engine.window;
+            let execution = execution
+                .as_mut()
+                .expect("hot execution state should exist after first flashblock");
+            let pending_block = blocks
+                .back_mut()
+                .expect("active pending block should exist after first flashblock");
+            let ordered_receipts = pending_block
+                .transactions
+                .iter()
+                .map(|transaction| {
+                    pending_block
+                        .receipts
+                        .get(&transaction.hash)
+                        .cloned()
+                        .expect("receipt should exist for executed transaction")
+                })
+                .collect::<Vec<_>>();
+            let header_parts = PendingHeaderBuilder::from_post_state(
+                chain_spec.as_ref(),
+                pending_block.base.timestamp,
+                pending_block.cumulative_gas_used,
+                &mut execution.db,
+                &ordered_receipts,
+            )
+            .expect("pending block should derive local header parts");
+
+            BlockAssembler::header_from_local_execution(
+                &pending_block.base,
+                &pending_block.flashblocks,
+                &header_parts,
+            )
+            .expect("pending block should assemble a locally sealed header")
+            .hash_slow()
+        };
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                2,
+                PayloadId::new([0xa2; 8]),
+                locally_sealed_parent,
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+        let _rollover_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+
+        let conflicting_canonical = BlockAssembler::assemble(&[test_hot_flashblock(
+            0,
+            1,
+            PayloadId::new([0xa3; 8]),
+            parent_hash,
+            true,
+            vec![],
+        )])
+        .expect("conflicting canonical flashblock should assemble")
+        .block;
+        processor
+            .apply_hot_only_canonical(reth_primitives::RecoveredBlock::new_unhashed(
+                conflicting_canonical,
+                Vec::new(),
+            ))
+            .await;
+
+        let invalidation_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        assert!(matches!(invalidation_event, FastFlashblockFeedEvent::InvalidateSession));
+        assert!(
+            processor
+                .hot_snapshot_ring
+                .lock()
+                .expect("hot snapshot ring mutex poisoned")
+                .get(first_delta.snapshot_id)
+                .is_none()
+        );
     }
 }

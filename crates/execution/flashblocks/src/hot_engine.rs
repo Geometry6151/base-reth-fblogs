@@ -1,5 +1,7 @@
 //! Suffix-only hot engine for speed-first flashblock logs.
 
+use std::collections::HashMap;
+
 use alloy_consensus::{
     Header, Sealed, TxReceipt,
     transaction::{Recovered, SignerRecoverable},
@@ -26,7 +28,7 @@ use crate::{
     BlockAssembler, ExecutionError, FastFlashblockLog, FastFlashblockLogsDelta,
     FastFlashblockTxMeta, FlashblockSequenceValidator, FlashblockSnapshotId, HotExecutionState,
     HotPendingBlock, HotPendingWindow, HotSnapshot, Metrics, PendingStateBuilder, ProviderError,
-    Result, SequenceValidationResult, StateProcessorError,
+    Result, RetainedVerifiedBlock, SequenceValidationResult, StateProcessorError,
 };
 
 /// Concrete DB state carried by the hot engine across pending flashblocks.
@@ -48,6 +50,24 @@ pub enum HotApplyOutcome {
     Duplicate,
     /// The hot engine requires a downstream reset/resync.
     Reset,
+    /// The hot engine encountered an unrecoverable speculative inconsistency.
+    InvalidateSession {
+        /// Reason the current speculative session must be terminated.
+        reason: HotInvalidationReason,
+    },
+}
+
+/// Hard invalidation reason for a speculative hot session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotInvalidationReason {
+    /// First child of a speculative rollover disagreed with the locally sealed parent hash.
+    SpeculativeParentMismatch,
+    /// A canonical block disagreed with a previously retained verified speculative proof.
+    CanonicalConflict,
+    /// Retained speculative suffixes could not be replayed soundly from canonical state.
+    UnrecoverableReplayFailure,
+    /// The speculative chain exceeded the anchor-relative depth limit without a sound soft rebase.
+    SpeculativeDepthExceeded,
 }
 
 /// Append-only exact-log engine.
@@ -131,12 +151,6 @@ where
             return Ok(HotApplyOutcome::Duplicate);
         }
 
-        let Some(oldest_pending_block) = self.window.blocks.front() else {
-            return Ok(HotApplyOutcome::Duplicate);
-        };
-        let oldest_pending_block_number = oldest_pending_block.block_number;
-        let oldest_pending_parent_hash = oldest_pending_block.parent_hash;
-
         let Some(latest_pending_block) = self.window.blocks.back() else {
             return Ok(HotApplyOutcome::Duplicate);
         };
@@ -145,6 +159,38 @@ where
         if block.number >= latest_pending_block_number {
             return Ok(self.reset_for_canonical());
         }
+
+        if let Some(retained_verified_block) = self
+            .window
+            .verified_blocks
+            .iter()
+            .find(|retained_verified_block| retained_verified_block.block_number == block.number)
+            .cloned()
+        {
+            if !Self::canonical_block_matches_verified_block(&retained_verified_block, block) {
+                return Ok(self.invalidate_session(HotInvalidationReason::CanonicalConflict));
+            }
+
+            let retained_flashblocks = Self::retained_flashblocks(
+                self.window
+                    .blocks
+                    .iter()
+                    .filter(|pending_block| pending_block.block_number > block.number),
+            );
+            let expected_verified_blocks = self.retained_verified_blocks_above(block.number);
+
+            return Ok(self.replay_retained_flashblocks_from_canonical(
+                retained_flashblocks,
+                expected_verified_blocks,
+                Some(HotInvalidationReason::UnrecoverableReplayFailure),
+            ));
+        }
+
+        let Some(oldest_pending_block) = self.window.blocks.front() else {
+            return Ok(HotApplyOutcome::Duplicate);
+        };
+        let oldest_pending_block_number = oldest_pending_block.block_number;
+        let oldest_pending_parent_hash = oldest_pending_block.parent_hash;
 
         if block.number > oldest_pending_block_number {
             return Ok(self.reset_for_canonical());
@@ -163,23 +209,51 @@ where
                     .iter()
                     .filter(|pending_block| pending_block.block_number > block.number),
             );
+            let expected_verified_blocks = self.retained_verified_blocks_above(block.number);
+            let failure_reason = (!expected_verified_blocks.is_empty())
+                .then_some(HotInvalidationReason::UnrecoverableReplayFailure);
 
-            return Ok(self.replay_retained_flashblocks_from_canonical(retained_flashblocks));
+            return Ok(self.replay_retained_flashblocks_from_canonical(
+                retained_flashblocks,
+                expected_verified_blocks,
+                failure_reason,
+            ));
         }
 
         if block.number + 1 == oldest_pending_block_number
             && block.header().hash_slow() != oldest_pending_parent_hash
         {
-            return Ok(self.reset_for_canonical());
+            let has_retained_verified_proofs =
+                self.window.verified_blocks.iter().any(|retained_verified_block| {
+                    retained_verified_block.block_number > block.number
+                });
+
+            return Ok(if has_retained_verified_proofs {
+                self.invalidate_session(HotInvalidationReason::CanonicalConflict)
+            } else {
+                self.reset_for_canonical()
+            });
         }
 
         let retained_flashblocks = Self::retained_flashblocks(self.window.blocks.iter());
-        Ok(self.replay_retained_flashblocks_from_canonical(retained_flashblocks))
+        let expected_verified_blocks = self.retained_verified_blocks_above(block.number);
+        let failure_reason = (!expected_verified_blocks.is_empty())
+            .then_some(HotInvalidationReason::UnrecoverableReplayFailure);
+        Ok(self.replay_retained_flashblocks_from_canonical(
+            retained_flashblocks,
+            expected_verified_blocks,
+            failure_reason,
+        ))
     }
 
     /// Resets the current pending hot window.
     pub fn reset(&mut self) {
         self.window.reset();
+    }
+
+    fn invalidate_session(&mut self, reason: HotInvalidationReason) -> HotApplyOutcome {
+        self.reset();
+        HotApplyOutcome::InvalidateSession { reason }
     }
 
     fn next_snapshot_nonce(&mut self) -> u64 {
@@ -202,20 +276,35 @@ where
     fn replay_retained_flashblocks_from_canonical(
         &mut self,
         flashblocks: Vec<Flashblock>,
+        expected_verified_blocks: Vec<RetainedVerifiedBlock>,
+        failure_reason: Option<HotInvalidationReason>,
     ) -> HotApplyOutcome {
         if flashblocks.is_empty() {
             self.reset();
             return HotApplyOutcome::Duplicate;
         }
 
-        if self.silently_replay_flashblocks(flashblocks) {
+        if self.silently_replay_flashblocks(flashblocks, &expected_verified_blocks) {
             HotApplyOutcome::Duplicate
+        } else if let Some(reason) = failure_reason {
+            self.invalidate_session(reason)
         } else {
             self.reset_for_canonical()
         }
     }
 
-    fn silently_replay_flashblocks(&mut self, flashblocks: Vec<Flashblock>) -> bool {
+    fn silently_replay_flashblocks(
+        &mut self,
+        flashblocks: Vec<Flashblock>,
+        expected_verified_blocks: &[RetainedVerifiedBlock],
+    ) -> bool {
+        let expected_verified_blocks = expected_verified_blocks
+            .iter()
+            .map(|retained_verified_block| {
+                (retained_verified_block.block_number, retained_verified_block.clone())
+            })
+            .collect::<HashMap<_, _>>();
+        let mut verified_matches = 0usize;
         let snapshot_nonce = self.next_snapshot_nonce;
         self.window.reset();
 
@@ -229,11 +318,47 @@ where
                 }
             };
 
-            if !matches!(outcome, HotApplyOutcome::Delta { .. } | HotApplyOutcome::Duplicate) {
-                self.next_snapshot_nonce = snapshot_nonce;
-                self.window.reset();
-                return false;
+            match outcome {
+                HotApplyOutcome::Delta { verified_parent_ready, .. } => {
+                    if let Some(verified_parent_ready) = verified_parent_ready {
+                        let Some(expected_verified_block) =
+                            expected_verified_blocks.get(&verified_parent_ready)
+                        else {
+                            self.next_snapshot_nonce = snapshot_nonce;
+                            self.window.reset();
+                            return false;
+                        };
+                        let Some(actual_verified_block) = self.window.verified_blocks.back() else {
+                            self.next_snapshot_nonce = snapshot_nonce;
+                            self.window.reset();
+                            return false;
+                        };
+
+                        if !Self::retained_verified_block_matches(
+                            actual_verified_block,
+                            expected_verified_block,
+                        ) {
+                            self.next_snapshot_nonce = snapshot_nonce;
+                            self.window.reset();
+                            return false;
+                        }
+
+                        verified_matches = verified_matches.saturating_add(1);
+                    }
+                }
+                HotApplyOutcome::Duplicate => {}
+                HotApplyOutcome::Reset | HotApplyOutcome::InvalidateSession { .. } => {
+                    self.next_snapshot_nonce = snapshot_nonce;
+                    self.window.reset();
+                    return false;
+                }
             }
+        }
+
+        if verified_matches != expected_verified_blocks.len() {
+            self.next_snapshot_nonce = snapshot_nonce;
+            self.window.reset();
+            return false;
         }
 
         self.next_snapshot_nonce = snapshot_nonce;
@@ -244,6 +369,122 @@ where
         blocks: impl Iterator<Item = &'a HotPendingBlock>,
     ) -> Vec<Flashblock> {
         blocks.flat_map(|block| block.flashblocks.iter().cloned()).collect()
+    }
+
+    fn retained_verified_blocks_above(
+        &self,
+        block_number: BlockNumber,
+    ) -> Vec<RetainedVerifiedBlock> {
+        self.window
+            .verified_blocks
+            .iter()
+            .filter(|retained_verified_block| retained_verified_block.block_number > block_number)
+            .cloned()
+            .collect()
+    }
+
+    fn with_verified_parent_ready(
+        outcome: HotApplyOutcome,
+        verified_parent_ready: Option<BlockNumber>,
+    ) -> HotApplyOutcome {
+        match outcome {
+            HotApplyOutcome::Delta { delta, snapshot, .. } => {
+                HotApplyOutcome::Delta { delta, snapshot, verified_parent_ready }
+            }
+            outcome => outcome,
+        }
+    }
+
+    fn speculative_depth_after_next_block(&self, next_block_number: BlockNumber) -> BlockNumber {
+        next_block_number.saturating_sub(self.window.speculative_anchor_block)
+    }
+
+    fn soft_rebase_for_depth(
+        &mut self,
+        eligible_anchor: &RetainedVerifiedBlock,
+        retained_previous_pending_block: &RetainedVerifiedBlock,
+    ) -> Result<Option<bool>> {
+        if eligible_anchor.block_number == retained_previous_pending_block.block_number {
+            self.reset();
+            return Ok(Some(true));
+        }
+
+        let retained_flashblocks = Self::retained_flashblocks(
+            self.window
+                .blocks
+                .iter()
+                .filter(|pending_block| pending_block.block_number > eligible_anchor.block_number),
+        );
+        let expected_verified_blocks = self
+            .window
+            .verified_blocks
+            .iter()
+            .filter(|retained_verified_block| {
+                retained_verified_block.block_number > eligible_anchor.block_number
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !self.silently_replay_flashblocks(retained_flashblocks, &expected_verified_blocks) {
+            return Ok(None);
+        }
+
+        let replayed_tip_header = self.seal_active_pending_block()?;
+        let replayed_tip = self.retained_verified_active_pending_block(replayed_tip_header)?;
+        if !Self::retained_verified_block_matches(&replayed_tip, retained_previous_pending_block) {
+            return Ok(None);
+        }
+
+        Ok(Some(false))
+    }
+
+    fn freshest_eligible_canonical_anchor(
+        &self,
+        retained_previous_pending_block: Option<&RetainedVerifiedBlock>,
+    ) -> Result<Option<RetainedVerifiedBlock>> {
+        for retained_verified_block in self
+            .window
+            .verified_blocks
+            .iter()
+            .chain(retained_previous_pending_block.into_iter())
+            .rev()
+        {
+            let Some(canonical_header) = self
+                .client
+                .header_by_number(retained_verified_block.block_number)
+                .map_err(|error| ProviderError::StateProvider(error.to_string()))?
+            else {
+                continue;
+            };
+
+            if canonical_header.hash_slow() == retained_verified_block.sealed_header.hash() {
+                return Ok(Some(retained_verified_block.clone()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn retained_verified_active_pending_block(
+        &self,
+        sealed_header: Sealed<Header>,
+    ) -> Result<RetainedVerifiedBlock> {
+        let pending_block = self.window.active_block().ok_or_else(|| {
+            StateProcessorError::HotEngine(
+                "missing active pending block while retaining speculative proof".to_string(),
+            )
+        })?;
+
+        Ok(RetainedVerifiedBlock {
+            block_number: pending_block.block_number,
+            parent_hash: pending_block.parent_hash,
+            sealed_header,
+            transaction_hashes: pending_block
+                .transactions
+                .iter()
+                .map(|transaction| transaction.hash)
+                .collect(),
+        })
     }
 
     fn start_first_flashblock(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
@@ -293,6 +534,7 @@ where
             base_parent_hash,
         )?;
 
+        self.window.speculative_anchor_block = canonical_block_number;
         self.window.canonical_base_parent_hash = base_parent_hash;
         self.window.execution = Some(execution);
         self.window.push_block(pending_block);
@@ -347,15 +589,47 @@ where
         let _rollover_timer = base_metrics::timed!(Metrics::hot_window_rollover_duration());
 
         let base = BlockAssembler::base_from_first_flashblock(flashblock)?;
-        let canonical_base_parent_hash = self.window.canonical_base_parent_hash;
         let sealed_previous_pending_block = self.seal_active_pending_block()?;
         let expected_parent_hash = sealed_previous_pending_block.hash();
 
         if base.parent_hash != expected_parent_hash {
             Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
-            return Ok(self.reset_for_flashblock());
+            return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeParentMismatch));
         }
 
+        let retained_previous_pending_block =
+            self.retained_verified_active_pending_block(sealed_previous_pending_block.clone())?;
+        let mut rebased_to_tip = false;
+
+        if self.speculative_depth_after_next_block(flashblock.metadata.block_number)
+            > self.max_depth
+        {
+            let Some(eligible_anchor) =
+                self.freshest_eligible_canonical_anchor(Some(&retained_previous_pending_block))?
+            else {
+                return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeDepthExceeded));
+            };
+
+            rebased_to_tip = match self
+                .soft_rebase_for_depth(&eligible_anchor, &retained_previous_pending_block)?
+            {
+                Some(rebased_to_tip) => rebased_to_tip,
+                None => {
+                    return Ok(
+                        self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure)
+                    );
+                }
+            };
+        }
+
+        if rebased_to_tip {
+            return Ok(Self::with_verified_parent_ready(
+                self.start_first_flashblock(flashblock)?,
+                Some(sealed_previous_pending_block.number),
+            ));
+        }
+
+        let canonical_base_parent_hash = self.window.canonical_base_parent_hash;
         let execution = self.window.execution.take().ok_or_else(|| {
             StateProcessorError::HotEngine("missing hot execution state".to_string())
         })?;
@@ -395,6 +669,7 @@ where
         )?;
 
         self.window.execution = Some(execution);
+        self.window.verified_blocks.push_back(retained_previous_pending_block);
         self.window.push_block(pending_block);
 
         Ok(HotApplyOutcome::Delta {
@@ -689,6 +964,33 @@ where
         pending_tx_hashes == canonical_tx_hashes
     }
 
+    fn canonical_block_matches_verified_block(
+        retained_verified_block: &RetainedVerifiedBlock,
+        block: &RecoveredBlock<BaseBlock>,
+    ) -> bool {
+        if block.header().parent_hash != retained_verified_block.parent_hash {
+            return false;
+        }
+
+        if block.header().hash_slow() != retained_verified_block.sealed_header.hash() {
+            return false;
+        }
+
+        let canonical_tx_hashes =
+            block.body().transactions().map(|tx| tx.tx_hash()).collect::<Vec<_>>();
+        retained_verified_block.transaction_hashes == canonical_tx_hashes
+    }
+
+    fn retained_verified_block_matches(
+        actual: &RetainedVerifiedBlock,
+        expected: &RetainedVerifiedBlock,
+    ) -> bool {
+        actual.block_number == expected.block_number
+            && actual.parent_hash == expected.parent_hash
+            && actual.sealed_header.hash() == expected.sealed_header.hash()
+            && actual.transaction_hashes == expected.transaction_hashes
+    }
+
     fn seal_header(header: Header) -> Sealed<Header> {
         let hash = header.hash_slow();
         Sealed::new_unchecked(header, hash)
@@ -798,7 +1100,7 @@ mod tests {
 
     use crate::BlockAssembler;
 
-    use super::{HotApplyOutcome, HotEngine, HotPendingBlock};
+    use super::{HotApplyOutcome, HotEngine, HotInvalidationReason, HotPendingBlock};
 
     fn test_client() -> MockEthProvider<BasePrimitives, Arc<BaseChainSpec>> {
         let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
@@ -1225,7 +1527,8 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_resets_when_child_parent_mismatches_locally_sealed_previous_block() {
+    fn hot_engine_rollover_invalidate_session_when_child_parent_mismatches_locally_sealed_previous_block()
+     {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let deploy_tx = create_deploy_log_tx(0x94);
@@ -1264,11 +1567,57 @@ mod tests {
 
         let outcome = engine
             .apply_flashblock(&next_flashblock)
-            .expect("rollover mismatch should return reset outcome");
+            .expect("rollover mismatch should return hard invalidation outcome");
 
-        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::SpeculativeParentMismatch
+            }
+        ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_invalidate_session_rollover_parent_mismatch_does_not_advance_child() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x98);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x87; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x88; 8]),
+                B256::with_last_byte(0xfe),
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("parent mismatch should return a hard invalidation outcome");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::SpeculativeParentMismatch
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
@@ -1381,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_resets_when_child_matches_canonical_but_mismatches_locally_sealed_previous_block()
+    fn hot_engine_rollover_invalidate_session_when_child_matches_canonical_but_mismatches_locally_sealed_previous_block()
      {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
@@ -1438,11 +1787,17 @@ mod tests {
 
         let outcome = engine
             .apply_flashblock(&third_flashblock)
-            .expect("rollover mismatch should reset even when canonical parent is available");
+            .expect("rollover mismatch should invalidate even when canonical parent is available");
 
-        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::SpeculativeParentMismatch
+            }
+        ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
@@ -1648,17 +2003,478 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_canonical_below_oldest_retained_resets_without_safe_replay_anchor() {
+    fn hot_engine_matching_canonical_block_prunes_retained_verified_proofs() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
-        let first_block_tx = create_deploy_log_tx(0x81);
-        let second_block_tx = create_deploy_log_tx_with_gas_limit(0x82, 110_000);
-        let third_block_tx = create_deploy_log_tx_with_gas_limit(0x83, 120_000);
+        let first_block_tx = create_deploy_log_tx(0xa1);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xa2, 110_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0xa1; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+
+        let second_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0xa2; 8]),
+            active_pending_block_hash(&mut engine),
+            true,
+            vec![decoded_l1_info_tx(), second_block_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first verified block should exist"),
+        );
+        insert_canonical_header(&client, &canonical_block);
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block)
+            .expect("matching canonical block should keep the session open");
+
+        assert!(matches!(outcome, HotApplyOutcome::Duplicate));
+        assert_eq!(engine.window.speculative_anchor_block, 1);
+        assert!(engine.window.verified_blocks.is_empty());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+    }
+
+    #[test]
+    fn hot_engine_canonical_conflict_invalidate_session_on_retained_verified_proof() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xb1);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xb2, 110_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0xb1; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+
+        let second_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0xb2; 8]),
+            active_pending_block_hash(&mut engine),
+            true,
+            vec![decoded_l1_info_tx(), second_block_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second block should apply");
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block_with_header(
+                Header {
+                    number: 1,
+                    parent_hash: canonical_parent_hash,
+                    extra_data: Bytes::from_static(b"canonical-conflict"),
+                    ..Default::default()
+                },
+                vec![],
+            ))
+            .expect("canonical conflict should return a hard invalidation");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession { reason: HotInvalidationReason::CanonicalConflict }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_canonical_parent_conflict_below_retained_verified_proofs_invalidates_session() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xb3);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xb4, 110_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xb3; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+        let second_parent_hash = active_pending_block_hash(&mut engine);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0xb4; 8]),
+                second_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), second_block_tx],
+            ))
+            .expect("second block should apply");
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block_with_header(
+                Header {
+                    number: 0,
+                    extra_data: Bytes::from_static(b"canonical-parent-conflict"),
+                    ..Default::default()
+                },
+                vec![],
+            ))
+            .expect("canonical parent conflict below retained proofs should hard invalidate");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession { reason: HotInvalidationReason::CanonicalConflict }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_speculative_depth_invalidate_session_without_eligible_anchor_keeps_proofs_until_close()
+     {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xc1);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xc2, 110_000);
+        let third_block_tx = create_deploy_log_tx_with_gas_limit(0xc3, 120_000);
         seed_sender_balance(&client, &first_block_tx);
         seed_sender_balance(&client, &second_block_tx);
         seed_sender_balance(&client, &third_block_tx);
 
-        let mut engine = HotEngine::new(client, 1);
+        let mut engine = HotEngine::new(client, 2);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0xc1; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+
+        let second_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0xc2; 8]),
+            active_pending_block_hash(&mut engine),
+            true,
+            vec![decoded_l1_info_tx(), second_block_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second block should apply");
+        assert_eq!(engine.window.verified_blocks.len(), 1);
+
+        let third_parent_hash = active_pending_block_hash(&mut engine);
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                0,
+                3,
+                PayloadId::new([0xc3; 8]),
+                third_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), third_block_tx],
+            ))
+            .expect("depth breach should return a hard invalidation");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::SpeculativeDepthExceeded
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_speculative_depth_soft_rebase_prunes_prefix_and_preserves_replayed_proofs() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd1);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xd2, 110_000);
+        let third_block_tx = create_deploy_log_tx_with_gas_limit(0xd3, 120_000);
+        let fourth_block_tx = create_deploy_log_tx_with_gas_limit(0xd4, 130_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+        seed_sender_balance(&client, &third_block_tx);
+        seed_sender_balance(&client, &fourth_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0xd1; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+
+        let second_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0xd2; 8]),
+            active_pending_block_hash(&mut engine),
+            true,
+            vec![decoded_l1_info_tx(), second_block_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second block should apply");
+
+        let third_flashblock = flashblock(
+            0,
+            3,
+            PayloadId::new([0xd3; 8]),
+            active_pending_block_hash(&mut engine),
+            true,
+            vec![decoded_l1_info_tx(), third_block_tx],
+        );
+        engine.apply_flashblock(&third_flashblock).expect("third block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first verified block should exist"),
+        );
+        insert_canonical_header(&client, &canonical_block);
+        let prior_second_block_proof = engine
+            .window
+            .verified_blocks
+            .back()
+            .expect("second speculative block should be retained as verified")
+            .sealed_header
+            .clone();
+
+        let fourth_parent_hash = active_pending_block_hash(&mut engine);
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                0,
+                4,
+                PayloadId::new([0xd4; 8]),
+                fourth_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), fourth_block_tx],
+            ))
+            .expect("depth breach should soft rebase when a matching canonical anchor exists");
+
+        let HotApplyOutcome::Delta { verified_parent_ready, .. } = outcome else {
+            panic!("soft rebase should keep the session open and publish the child delta");
+        };
+        assert_eq!(verified_parent_ready, Some(3));
+        assert_eq!(engine.window.speculative_anchor_block, 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert_eq!(engine.window.active_block_number(), Some(4));
+        assert_eq!(engine.window.verified_blocks.len(), 2);
+        assert_eq!(engine.window.verified_blocks.front().map(|block| block.block_number), Some(2));
+        assert_eq!(
+            engine.window.verified_blocks.front().map(|block| block.sealed_header.hash()),
+            Some(prior_second_block_proof.hash())
+        );
+    }
+
+    #[test]
+    fn hot_engine_speculative_depth_soft_rebase_replay_proof_mismatch_invalidates_session() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd5);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xd6, 110_000);
+        let third_block_tx = create_deploy_log_tx_with_gas_limit(0xd7, 120_000);
+        let fourth_block_tx = create_deploy_log_tx_with_gas_limit(0xd8, 130_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+        seed_sender_balance(&client, &third_block_tx);
+        seed_sender_balance(&client, &fourth_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd5; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+        let second_parent_hash = active_pending_block_hash(&mut engine);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0xd6; 8]),
+                second_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), second_block_tx],
+            ))
+            .expect("second block should apply");
+        let third_parent_hash = active_pending_block_hash(&mut engine);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                3,
+                PayloadId::new([0xd7; 8]),
+                third_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), third_block_tx],
+            ))
+            .expect("third block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first verified block should exist"),
+        );
+        insert_canonical_header(&client, &canonical_block);
+        engine
+            .window
+            .verified_blocks
+            .back_mut()
+            .expect("second speculative block should be retained as verified")
+            .transaction_hashes
+            .push(B256::with_last_byte(0xff));
+
+        let fourth_parent_hash = active_pending_block_hash(&mut engine);
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                0,
+                4,
+                PayloadId::new([0xd8; 8]),
+                fourth_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), fourth_block_tx],
+            ))
+            .expect("soft rebase proof mismatch should hard invalidate");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::UnrecoverableReplayFailure
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+        assert!(engine.window.verified_blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_speculative_depth_soft_rebase_anchor_canonical_update_keeps_window_open() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xe1);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xe2, 110_000);
+        let third_block_tx = create_deploy_log_tx_with_gas_limit(0xe3, 120_000);
+        let fourth_block_tx = create_deploy_log_tx_with_gas_limit(0xe4, 130_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+        seed_sender_balance(&client, &third_block_tx);
+        seed_sender_balance(&client, &fourth_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xe1; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+        let second_parent_hash = active_pending_block_hash(&mut engine);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0xe2; 8]),
+                second_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), second_block_tx],
+            ))
+            .expect("second block should apply");
+        let third_parent_hash = active_pending_block_hash(&mut engine);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                3,
+                PayloadId::new([0xe3; 8]),
+                third_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), third_block_tx],
+            ))
+            .expect("third block should apply");
+
+        let canonical_anchor_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("soft rebase anchor should exist"),
+        );
+        insert_canonical_header(&client, &canonical_anchor_block);
+
+        let fourth_parent_hash = active_pending_block_hash(&mut engine);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                4,
+                PayloadId::new([0xe4; 8]),
+                fourth_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), fourth_block_tx],
+            ))
+            .expect("depth breach should soft rebase when the anchor is canonical");
+
+        let retained_verified_hashes = engine
+            .window
+            .verified_blocks
+            .iter()
+            .map(|block| (block.block_number, block.sealed_header.hash()))
+            .collect::<Vec<_>>();
+
+        let outcome = engine
+            .process_canonical_block(&canonical_anchor_block)
+            .expect("canonical update for the rebased anchor should keep the window open");
+
+        assert!(matches!(outcome, HotApplyOutcome::Duplicate));
+        assert_eq!(engine.window.speculative_anchor_block, 1);
+        assert_eq!(engine.window.blocks.len(), 3);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert_eq!(engine.window.active_block_number(), Some(4));
+        assert!(engine.window.execution.is_some());
+        assert_eq!(
+            engine
+                .window
+                .verified_blocks
+                .iter()
+                .map(|block| (block.block_number, block.sealed_header.hash()))
+                .collect::<Vec<_>>(),
+            retained_verified_hashes
+        );
+    }
+
+    #[test]
+    fn hot_engine_reset_clears_retained_speculative_state() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0x81);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0x82, 110_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let mut engine = HotEngine::new(client, 3);
         let first_flashblock = flashblock(
             0,
             1,
@@ -1680,28 +2496,15 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
-        let third_parent_hash = active_pending_block_hash(&mut engine);
-        let third_flashblock = flashblock(
-            0,
-            3,
-            PayloadId::new([0x73; 8]),
-            third_parent_hash,
-            true,
-            vec![decoded_l1_info_tx(), third_block_tx],
-        );
-        engine.apply_flashblock(&third_flashblock).expect("third block should apply");
+        assert_eq!(engine.window.speculative_anchor_block, 0);
+        assert_eq!(engine.window.verified_blocks.len(), 1);
+        assert_eq!(engine.window.blocks.len(), 2);
 
-        assert_eq!(engine.window.blocks.len(), 1);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(3));
+        engine.reset();
 
-        let canonical_block =
-            canonical_block_from_flashblocks(std::slice::from_ref(&first_flashblock));
-        let outcome = engine
-            .process_canonical_block(&canonical_block)
-            .expect("unsafe below-oldest canonical should force reset");
-
-        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert_eq!(engine.window.speculative_anchor_block, 0);
         assert!(engine.window.execution.is_none());
+        assert!(engine.window.verified_blocks.is_empty());
         assert!(engine.window.blocks.is_empty());
     }
 }

@@ -28,7 +28,7 @@ pub use fast_logs::{
 };
 
 mod hot_engine;
-pub use hot_engine::{HotApplyOutcome, HotEngine, HotExecutionDb};
+pub use hot_engine::{HotApplyOutcome, HotEngine, HotExecutionDb, HotInvalidationReason};
 
 mod hot_mode;
 pub use hot_mode::FlashblocksMode;
@@ -37,7 +37,7 @@ mod hot_snapshot;
 pub use hot_snapshot::{HotSnapshot, HotSnapshotRing};
 
 mod hot_window;
-pub use hot_window::{HotExecutionState, HotPendingBlock, HotPendingWindow};
+pub use hot_window::{HotExecutionState, HotPendingBlock, HotPendingWindow, RetainedVerifiedBlock};
 
 mod metrics;
 pub use metrics::Metrics;
