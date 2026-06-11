@@ -302,6 +302,11 @@ where
         flashblocks: Vec<Flashblock>,
         expected_verified_blocks: &[RetainedVerifiedBlock],
     ) -> bool {
+        let _silent_replay_timer = base_metrics::timed!(Metrics::hot_silent_replay_duration());
+        Metrics::hot_silent_replay_flashblock_count().record(flashblocks.len() as f64);
+        Metrics::hot_silent_replay_expected_verified_count()
+            .record(expected_verified_blocks.len() as f64);
+
         let expected_verified_blocks = expected_verified_blocks
             .iter()
             .map(|retained_verified_block| {
@@ -408,7 +413,11 @@ where
         eligible_anchor: &RetainedVerifiedBlock,
         retained_previous_pending_block: &RetainedVerifiedBlock,
     ) -> Result<Option<bool>> {
+        let _soft_rebase_timer = base_metrics::timed!(Metrics::hot_soft_rebase_duration());
+
         if eligible_anchor.block_number == retained_previous_pending_block.block_number {
+            Metrics::hot_soft_rebase_replayed_flashblock_count().record(0.0);
+            Metrics::hot_soft_rebase_success_count().increment(1);
             self.reset();
             return Ok(Some(true));
         }
@@ -429,16 +438,22 @@ where
             .cloned()
             .collect::<Vec<_>>();
 
+        Metrics::hot_soft_rebase_replayed_flashblock_count()
+            .record(retained_flashblocks.len() as f64);
+
         if !self.silently_replay_flashblocks(retained_flashblocks, &expected_verified_blocks) {
+            Metrics::hot_soft_rebase_failure_count().increment(1);
             return Ok(None);
         }
 
         let replayed_tip_header = self.seal_active_pending_block()?;
         let replayed_tip = self.retained_verified_active_pending_block(replayed_tip_header)?;
         if !Self::retained_verified_block_matches(&replayed_tip, retained_previous_pending_block) {
+            Metrics::hot_soft_rebase_failure_count().increment(1);
             return Ok(None);
         }
 
+        Metrics::hot_soft_rebase_success_count().increment(1);
         Ok(Some(false))
     }
 
@@ -611,6 +626,7 @@ where
             let Some(eligible_anchor) =
                 self.freshest_eligible_canonical_anchor(Some(&retained_previous_pending_block))?
             else {
+                Metrics::hot_soft_rebase_no_eligible_anchor_count().increment(1);
                 return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeDepthExceeded));
             };
 
@@ -989,6 +1005,8 @@ where
         &self,
         block: &RecoveredBlock<BaseBlock>,
     ) -> Result<bool> {
+        let _canonical_catchup_timer =
+            base_metrics::timed!(Metrics::hot_canonical_catchup_reconcile_duration());
         let mut expected_child_parent_hash = block.header().parent_hash;
         let mut expected_block_number = block.number.saturating_sub(1);
 
@@ -1085,6 +1103,8 @@ where
         if pending_block.local_header_parts.is_some() {
             return Ok(pending_block.latest_header.clone());
         }
+
+        let _local_seal_timer = base_metrics::timed!(Metrics::hot_local_seal_duration());
 
         let ordered_receipts = Self::ordered_receipts(pending_block)?;
         let local_header_parts = PendingHeaderBuilder::from_post_state(

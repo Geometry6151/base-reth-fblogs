@@ -37,7 +37,7 @@ use revm::{
 use revm_database::states::bundle_state::BundleRetention;
 
 use crate::hot_window::HotExecutedHeaderParts;
-use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
+use crate::{ExecutionError, Metrics, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
 
 /// Represents the result of executing or fetching a cached pending transaction.
 #[derive(Debug, Clone)]
@@ -444,20 +444,31 @@ impl PendingHeaderBuilder {
         db: &mut State<StateProviderDatabase<StateProviderBox>>,
         receipts: &[BaseTransactionReceipt],
     ) -> Result<HotExecutedHeaderParts, StateProcessorError> {
-        db.merge_transitions(BundleRetention::Reverts);
+        let _header_parts_timer =
+            base_metrics::timed!(Metrics::hot_header_parts_from_post_state_duration());
+
+        let (state_root, withdrawals_storage) = {
+            let _state_root_timer = base_metrics::timed!(Metrics::hot_state_root_duration());
+            db.merge_transitions(BundleRetention::Reverts);
+
+            let state_provider = db.database.as_ref();
+            let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
+            let withdrawals_storage = hashed_state
+                .storages
+                .get(&keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER))
+                .cloned()
+                .unwrap_or_default();
+            let state_root = state_provider
+                .state_root(hashed_state)
+                .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?;
+
+            (state_root, withdrawals_storage)
+        };
 
         let state_provider = db.database.as_ref();
-        let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
-        let withdrawals_storage = hashed_state
-            .storages
-            .get(&keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER))
-            .cloned()
-            .unwrap_or_default();
-        let state_root = state_provider
-            .state_root(hashed_state)
-            .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?;
         let is_isthmus_active = chain_spec.is_isthmus_active_at_timestamp(timestamp);
         let withdrawals_root = if is_isthmus_active {
+            let _storage_root_timer = base_metrics::timed!(Metrics::hot_storage_root_duration());
             state_provider
                 .storage_root(Predeploys::L2_TO_L1_MESSAGE_PASSER, withdrawals_storage)
                 .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?
@@ -469,8 +480,14 @@ impl PendingHeaderBuilder {
 
         let receipt_envelopes =
             receipts.iter().cloned().map(BaseReceiptEnvelope::from).collect::<Vec<_>>();
-        let receipts_root = calculate_receipts_root(&receipt_envelopes, chain_spec, timestamp);
-        let logs_bloom = logs_bloom(receipt_envelopes.iter().flat_map(|receipt| receipt.logs()));
+        let receipts_root = {
+            let _receipts_root_timer = base_metrics::timed!(Metrics::hot_receipts_root_duration());
+            calculate_receipts_root(&receipt_envelopes, chain_spec, timestamp)
+        };
+        let logs_bloom = {
+            let _logs_bloom_timer = base_metrics::timed!(Metrics::hot_logs_bloom_build_duration());
+            logs_bloom(receipt_envelopes.iter().flat_map(|receipt| receipt.logs()))
+        };
         let blob_gas_used = if chain_spec.is_jovian_active_at_timestamp(timestamp) {
             Some(receipts.iter().filter_map(|receipt| receipt.inner.blob_gas_used).sum())
         } else if chain_spec.is_ecotone_active_at_timestamp(timestamp) {

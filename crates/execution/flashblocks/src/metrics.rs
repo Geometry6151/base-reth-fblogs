@@ -24,6 +24,36 @@ base_metrics::define_metrics! {
     hot_delta_build_duration: histogram,
     #[describe("Time taken to roll the hot window to the next pending block")]
     hot_window_rollover_duration: histogram,
+    #[describe("Time spent locally sealing an active pending block when header parts must be derived")]
+    hot_local_seal_duration: histogram,
+    #[describe("Time taken to derive pending header parts from carried post-state")]
+    hot_header_parts_from_post_state_duration: histogram,
+    #[describe("Time taken to merge transitions and derive the pending state root")]
+    hot_state_root_duration: histogram,
+    #[describe("Time taken to derive the pending withdrawals storage root when required")]
+    hot_storage_root_duration: histogram,
+    #[describe("Time taken to derive the pending receipts root")]
+    hot_receipts_root_duration: histogram,
+    #[describe("Time taken to build the pending logs bloom from ordered receipts")]
+    hot_logs_bloom_build_duration: histogram,
+    #[describe("Time taken to silently replay retained speculative flashblocks")]
+    hot_silent_replay_duration: histogram,
+    #[describe("Number of flashblocks attempted in one silent replay")]
+    hot_silent_replay_flashblock_count: histogram,
+    #[describe("Number of retained verified blocks expected to match in one silent replay")]
+    hot_silent_replay_expected_verified_count: histogram,
+    #[describe("Time taken to attempt a speculative soft rebase")]
+    hot_soft_rebase_duration: histogram,
+    #[describe("Count of successful speculative soft rebase attempts")]
+    hot_soft_rebase_success_count: counter,
+    #[describe("Count of failed speculative soft rebase attempts after an anchor was chosen")]
+    hot_soft_rebase_failure_count: counter,
+    #[describe("Count of speculative depth overflows with no eligible canonical rebase anchor")]
+    hot_soft_rebase_no_eligible_anchor_count: counter,
+    #[describe("Number of flashblocks replayed during one speculative soft rebase attempt")]
+    hot_soft_rebase_replayed_flashblock_count: histogram,
+    #[describe("Time taken to reconcile retained verified blocks across canonical catchup")]
+    hot_canonical_catchup_reconcile_duration: histogram,
     #[describe("Count of times the hot window was reset from flashblock sequencing or parent mismatch")]
     hot_window_reset_count: counter,
     #[describe("Count of hot window resets caused by receiving a non-zero flashblock index without an active window")]
@@ -126,4 +156,28 @@ base_metrics::define_metrics! {
     bundle_state_clone_duration: histogram,
     #[describe("Size of bundle state being cloned (number of accounts)")]
     bundle_state_clone_size: histogram,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Metrics;
+
+    #[test]
+    fn flashblocks_diagnostic_metric_accessors_exist() {
+        let _ = Metrics::hot_local_seal_duration();
+        let _ = Metrics::hot_header_parts_from_post_state_duration();
+        let _ = Metrics::hot_state_root_duration();
+        let _ = Metrics::hot_storage_root_duration();
+        let _ = Metrics::hot_receipts_root_duration();
+        let _ = Metrics::hot_logs_bloom_build_duration();
+        let _ = Metrics::hot_silent_replay_duration();
+        let _ = Metrics::hot_silent_replay_flashblock_count();
+        let _ = Metrics::hot_silent_replay_expected_verified_count();
+        let _ = Metrics::hot_soft_rebase_duration();
+        let _ = Metrics::hot_soft_rebase_success_count();
+        let _ = Metrics::hot_soft_rebase_failure_count();
+        let _ = Metrics::hot_soft_rebase_no_eligible_anchor_count();
+        let _ = Metrics::hot_soft_rebase_replayed_flashblock_count();
+        let _ = Metrics::hot_canonical_catchup_reconcile_duration();
+    }
 }
