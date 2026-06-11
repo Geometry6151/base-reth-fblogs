@@ -11,6 +11,7 @@ use base_common_chains::Upgrades;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_common_evm::L1BlockInfo;
 use base_common_flashblocks::{ExecutionPayloadBaseV1, Flashblock};
+use base_common_rpc_types::BaseTransactionReceipt;
 use base_execution_evm::BaseEvmConfig;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::ConfigureEvm;
@@ -18,8 +19,9 @@ use reth_primitives::RecoveredBlock;
 use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
 use reth_storage_api::StateProviderBox;
-use revm_database::states::bundle_state::BundleRetention;
 
+use crate::hot_window::HotExecutedHeaderParts;
+use crate::state_builder::PendingHeaderBuilder;
 use crate::{
     BlockAssembler, ExecutionError, FastFlashblockLog, FastFlashblockLogsDelta,
     FastFlashblockTxMeta, FlashblockSequenceValidator, FlashblockSnapshotId, HotExecutionState,
@@ -130,20 +132,26 @@ where
         let Some(oldest_pending_block) = self.window.blocks.front() else {
             return Ok(HotApplyOutcome::Duplicate);
         };
+        let oldest_pending_block_number = oldest_pending_block.block_number;
+        let oldest_pending_parent_hash = oldest_pending_block.parent_hash;
+
         let Some(latest_pending_block) = self.window.blocks.back() else {
             return Ok(HotApplyOutcome::Duplicate);
         };
+        let latest_pending_block_number = latest_pending_block.block_number;
 
-        if block.number >= latest_pending_block.block_number {
+        if block.number >= latest_pending_block_number {
             return Ok(self.reset_for_canonical());
         }
 
-        if block.number > oldest_pending_block.block_number {
+        if block.number > oldest_pending_block_number {
             return Ok(self.reset_for_canonical());
         }
 
-        if block.number == oldest_pending_block.block_number {
-            if !Self::canonical_block_matches_pending_block(oldest_pending_block, block) {
+        if block.number == oldest_pending_block_number {
+            let pending_matches =
+                self.canonical_block_matches_oldest_pending_block(block).unwrap_or(false);
+            if !pending_matches {
                 return Ok(self.reset_for_canonical());
             }
 
@@ -157,8 +165,8 @@ where
             return Ok(self.replay_retained_flashblocks_from_canonical(retained_flashblocks));
         }
 
-        if block.number + 1 == oldest_pending_block.block_number
-            && block.header().hash_slow() != oldest_pending_block.parent_hash
+        if block.number + 1 == oldest_pending_block_number
+            && block.header().hash_slow() != oldest_pending_parent_hash
         {
             return Ok(self.reset_for_canonical());
         }
@@ -338,21 +346,17 @@ where
 
         let base = BlockAssembler::base_from_first_flashblock(flashblock)?;
         let canonical_base_parent_hash = self.window.canonical_base_parent_hash;
+        let sealed_previous_pending_block = self.seal_active_pending_block()?;
+        let expected_parent_hash = sealed_previous_pending_block.hash();
+
+        if base.parent_hash != expected_parent_hash {
+            Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
+            return Ok(self.reset_for_flashblock());
+        }
+
         let execution = self.window.execution.take().ok_or_else(|| {
             StateProcessorError::HotEngine("missing hot execution state".to_string())
         })?;
-        let expected_parent_hash = execution.last_header.hash();
-
-        if base.parent_hash != expected_parent_hash {
-            self.reset();
-            let outcome = self.start_first_flashblock(flashblock)?;
-            if matches!(outcome, HotApplyOutcome::Delta { .. }) {
-                Metrics::hot_window_reanchor_canonical_parent_count().increment(1);
-            } else {
-                Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
-            }
-            return Ok(outcome);
-        }
 
         let (execution_block, decoded_transactions) =
             Self::prepare_suffix_block(&base, flashblock)?;
@@ -373,6 +377,7 @@ where
             rpc_transactions: std::collections::HashMap::new(),
             transaction_senders: std::collections::HashMap::new(),
             flashblocks: vec![],
+            local_header_parts: None,
         };
 
         let (execution, pending_block, delta, snapshot) = self.execute_suffix(
@@ -425,6 +430,7 @@ where
             rpc_transactions: std::collections::HashMap::new(),
             transaction_senders: std::collections::HashMap::new(),
             flashblocks: vec![],
+            local_header_parts: None,
         };
 
         self.execute_suffix(
@@ -513,9 +519,6 @@ where
             }
         }
 
-        let (mut db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
-        db.merge_transitions(BundleRetention::Reverts);
-
         let delta = {
             let _delta_build_timer = base_metrics::timed!(Metrics::hot_delta_build_duration());
             let mut delta_transactions = Vec::with_capacity(executed_suffix.len());
@@ -577,7 +580,12 @@ where
         pending_block.next_log_index = next_log_index;
         pending_block.cumulative_gas_used = cumulative_gas_used;
         pending_block.flashblocks.push(flashblock.clone());
-        let latest_header = Self::assembled_pending_header(&pending_block)?;
+        pending_block.local_header_parts = None;
+        let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
+        // Exact local sealing is only needed at rollover/canonical boundaries. Keep the latest
+        // suffix header for snapshots and carry the execution DB forward so the expensive local
+        // state-root derivation happens lazily when a child block must be verified.
+        let latest_header = Self::seal_header(suffix_header);
         pending_block.latest_header = latest_header.clone();
 
         execution.db = db;
@@ -618,30 +626,56 @@ where
             .map_err(|error| ExecutionError::L1BlockInfo(error.to_string()).into())
     }
 
+    fn canonical_block_matches_oldest_pending_block(
+        &mut self,
+        block: &RecoveredBlock<BaseBlock>,
+    ) -> Result<bool> {
+        let oldest_block_number =
+            self.window.blocks.front().map(|pending_block| pending_block.block_number).ok_or_else(
+                || {
+                    StateProcessorError::HotEngine(
+                        "missing oldest pending block during canonical reconciliation".to_string(),
+                    )
+                },
+            )?;
+
+        let sealed_pending_block = if self.window.active_block_number() == Some(oldest_block_number)
+        {
+            self.seal_active_pending_block()?
+        } else {
+            let pending_block = self.window.blocks.front().ok_or_else(|| {
+                StateProcessorError::HotEngine(
+                    "missing oldest pending block during canonical reconciliation".to_string(),
+                )
+            })?;
+            Self::seal_completed_speculative_block(pending_block)?
+        };
+        let pending_block = self.window.blocks.front().ok_or_else(|| {
+            StateProcessorError::HotEngine(
+                "missing oldest pending block during canonical reconciliation".to_string(),
+            )
+        })?;
+
+        Ok(Self::canonical_block_matches_pending_block(pending_block, &sealed_pending_block, block))
+    }
+
     fn canonical_block_matches_pending_block(
         pending_block: &HotPendingBlock,
+        sealed_pending_block: &Sealed<Header>,
         block: &RecoveredBlock<BaseBlock>,
     ) -> bool {
-        let Ok(assembled_pending_block) = BlockAssembler::assemble(&pending_block.flashblocks)
-        else {
-            return false;
-        };
-        let assembled_header = &assembled_pending_block.block.header;
-
-        if block.header().parent_hash != assembled_header.parent_hash {
+        if block.header().parent_hash != sealed_pending_block.parent_hash {
             return false;
         }
 
-        if block.header().hash_slow() != assembled_header.hash_slow() {
+        if block.header().hash_slow() != sealed_pending_block.hash() {
             return false;
         }
 
-        let pending_tx_hashes = assembled_pending_block
-            .block
-            .body
+        let pending_tx_hashes = pending_block
             .transactions
             .iter()
-            .map(|transaction| transaction.tx_hash())
+            .map(|transaction| transaction.hash)
             .collect::<Vec<_>>();
         let canonical_tx_hashes =
             block.body().transactions().map(|tx| tx.tx_hash()).collect::<Vec<_>>();
@@ -654,9 +688,83 @@ where
         Sealed::new_unchecked(header, hash)
     }
 
-    fn assembled_pending_header(pending_block: &HotPendingBlock) -> Result<Sealed<Header>> {
-        let assembled = BlockAssembler::assemble(&pending_block.flashblocks)?;
-        Ok(Self::seal_header(assembled.block.header))
+    fn seal_active_pending_block(&mut self) -> Result<Sealed<Header>> {
+        let chain_spec = self.client.chain_spec();
+        let window = &mut self.window;
+        let execution = window.execution.as_mut().ok_or_else(|| {
+            StateProcessorError::HotEngine("missing hot execution state".to_string())
+        })?;
+        let pending_block = window.blocks.back_mut().ok_or_else(|| {
+            StateProcessorError::HotEngine("missing active pending block".to_string())
+        })?;
+
+        Self::ensure_locally_sealed_pending_block(&chain_spec, execution, pending_block)
+    }
+
+    fn ensure_locally_sealed_pending_block<ChainSpec>(
+        chain_spec: &ChainSpec,
+        execution: &mut HotExecutionState<HotExecutionDb>,
+        pending_block: &mut HotPendingBlock,
+    ) -> Result<Sealed<Header>>
+    where
+        ChainSpec: Upgrades,
+    {
+        if pending_block.local_header_parts.is_some() {
+            return Ok(pending_block.latest_header.clone());
+        }
+
+        let ordered_receipts = Self::ordered_receipts(pending_block)?;
+        let local_header_parts = PendingHeaderBuilder::from_post_state(
+            chain_spec,
+            pending_block.base.timestamp,
+            pending_block.cumulative_gas_used,
+            &mut execution.db,
+            &ordered_receipts,
+        )?;
+        let latest_header =
+            Self::seal_completed_speculative_block_from_parts(pending_block, &local_header_parts)?;
+        pending_block.local_header_parts = Some(local_header_parts);
+        pending_block.latest_header = latest_header.clone();
+        execution.last_header = latest_header.clone();
+
+        Ok(latest_header)
+    }
+
+    fn seal_completed_speculative_block(pending_block: &HotPendingBlock) -> Result<Sealed<Header>> {
+        pending_block.local_header_parts.as_ref().ok_or_else(|| {
+            StateProcessorError::HotEngine(
+                "missing locally derived header parts for speculative block".to_string(),
+            )
+        })?;
+
+        Ok(pending_block.latest_header.clone())
+    }
+
+    fn seal_completed_speculative_block_from_parts(
+        pending_block: &HotPendingBlock,
+        header_parts: &HotExecutedHeaderParts,
+    ) -> Result<Sealed<Header>> {
+        let header = BlockAssembler::header_from_local_execution(
+            &pending_block.base,
+            &pending_block.flashblocks,
+            header_parts,
+        )?;
+        Ok(Self::seal_header(header))
+    }
+
+    fn ordered_receipts(pending_block: &HotPendingBlock) -> Result<Vec<BaseTransactionReceipt>> {
+        pending_block
+            .transactions
+            .iter()
+            .map(|transaction| {
+                pending_block.receipts.get(&transaction.hash).cloned().ok_or_else(|| {
+                    StateProcessorError::HotEngine(format!(
+                        "missing locally executed receipt for transaction {}",
+                        transaction.hash
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
@@ -684,7 +792,7 @@ mod tests {
 
     use crate::BlockAssembler;
 
-    use super::{HotApplyOutcome, HotEngine};
+    use super::{HotApplyOutcome, HotEngine, HotPendingBlock};
 
     fn test_client() -> MockEthProvider<BasePrimitives, Arc<BaseChainSpec>> {
         let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
@@ -849,11 +957,44 @@ mod tests {
         RecoveredBlock::new_unhashed(block, senders)
     }
 
+    fn canonical_block_from_pending_block(
+        pending_block: &HotPendingBlock,
+    ) -> RecoveredBlock<BaseBlock> {
+        let header = BlockAssembler::header_from_local_execution(
+            &pending_block.base,
+            &pending_block.flashblocks,
+            pending_block
+                .local_header_parts
+                .as_ref()
+                .expect("pending block should carry local header parts"),
+        )
+        .expect("pending block should assemble a local header");
+        let transactions = pending_block
+            .flashblocks
+            .iter()
+            .flat_map(|flashblock| {
+                BlockAssembler::decode_flashblock_transactions(flashblock)
+                    .expect("pending flashblock transactions should decode")
+            })
+            .collect::<Vec<_>>();
+
+        canonical_block_with_header(header, transactions)
+    }
+
     fn insert_canonical_header(
         client: &MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>,
         block: &RecoveredBlock<BaseBlock>,
     ) {
         client.add_header(block.header().hash_slow(), block.header().clone());
+    }
+
+    fn active_pending_block_hash(
+        engine: &mut HotEngine<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>,
+    ) -> B256 {
+        engine
+            .seal_active_pending_block()
+            .expect("active block should seal from local execution")
+            .hash()
     }
 
     #[test]
@@ -944,13 +1085,7 @@ mod tests {
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
-        let carried_parent_hash = engine
-            .window
-            .execution
-            .as_ref()
-            .expect("execution state should exist")
-            .last_header
-            .hash();
+        let carried_parent_hash = active_pending_block_hash(&mut engine);
         let second_flashblock = flashblock(
             0,
             2,
@@ -990,7 +1125,156 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rolls_over_after_multiple_flashblocks_using_assembled_parent_hash() {
+    fn hot_engine_rollover_uses_locally_sealed_previous_block_parent_hash() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_deploy_tx = create_deploy_log_tx(0x91);
+        let first_block_contract =
+            first_block_deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
+        let first_block_call_tx = create_call_log_tx(first_block_contract, 0x92);
+        let second_block_deploy_tx = create_deploy_log_tx_with_gas_limit(0x93, 120_000);
+        seed_sender_balance(&client, &first_block_deploy_tx);
+        seed_sender_balance(&client, &first_block_call_tx);
+        seed_sender_balance(&client, &second_block_deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x81; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let second_flashblock = flashblock(
+            1,
+            1,
+            PayloadId::new([0x82; 8]),
+            canonical_parent_hash,
+            false,
+            vec![first_block_call_tx],
+        );
+        engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
+
+        let locally_sealed_parent = active_pending_block_hash(&mut engine);
+        let third_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0x83; 8]),
+            locally_sealed_parent,
+            true,
+            vec![decoded_l1_info_tx(), second_block_deploy_tx],
+        );
+
+        let outcome = engine.apply_flashblock(&third_flashblock).expect("rollover should apply");
+
+        assert!(matches!(outcome, HotApplyOutcome::Delta { .. }));
+        assert_eq!(engine.window.active_block_number(), Some(2));
+    }
+
+    #[test]
+    fn hot_engine_rollover_resets_when_child_parent_mismatches_locally_sealed_previous_block() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x94);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x84; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let canonical_block = canonical_block_with_header(
+            Header {
+                number: 1,
+                parent_hash: canonical_parent_hash,
+                extra_data: Bytes::from_static(b"canonical-parent"),
+                ..Default::default()
+            },
+            vec![],
+        );
+        insert_canonical_header(&client, &canonical_block);
+
+        let next_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0x85; 8]),
+            B256::with_last_byte(0x99),
+            true,
+            vec![decoded_l1_info_tx(), create_deploy_log_tx_with_gas_limit(0x95, 120_000)],
+        );
+
+        let outcome = engine
+            .apply_flashblock(&next_flashblock)
+            .expect("rollover mismatch should return reset outcome");
+
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_locally_sealed_previous_block_ignores_poisoned_wire_roots() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x96);
+        let contract_address =
+            deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
+        let call_tx = create_call_log_tx(contract_address, 0x97);
+        seed_sender_balance(&client, &deploy_tx);
+        seed_sender_balance(&client, &call_tx);
+
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x86; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx.clone()],
+        );
+        let second_flashblock = flashblock(
+            1,
+            1,
+            PayloadId::new([0x86; 8]),
+            canonical_parent_hash,
+            false,
+            vec![call_tx.clone()],
+        );
+
+        let mut clean_engine = HotEngine::new(client.clone(), 3);
+        clean_engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+        clean_engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
+
+        let mut poisoned_second_flashblock = second_flashblock.clone();
+        poisoned_second_flashblock.diff.state_root = B256::with_last_byte(0xaa);
+        poisoned_second_flashblock.diff.receipts_root = B256::with_last_byte(0xbb);
+        poisoned_second_flashblock.diff.logs_bloom = Bloom::from([0xcc; 256]);
+        poisoned_second_flashblock.diff.withdrawals_root = B256::with_last_byte(0xdd);
+        poisoned_second_flashblock.diff.blob_gas_used = Some(7_777);
+        poisoned_second_flashblock.diff.block_hash = B256::with_last_byte(0xcc);
+
+        let mut poisoned_engine = HotEngine::new(client, 3);
+        poisoned_engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+        poisoned_engine
+            .apply_flashblock(&poisoned_second_flashblock)
+            .expect("poisoned second flashblock should still apply");
+
+        let clean_hash = active_pending_block_hash(&mut clean_engine);
+        let poisoned_hash = active_pending_block_hash(&mut poisoned_engine);
+
+        assert_eq!(clean_hash, poisoned_hash);
+    }
+
+    #[test]
+    fn hot_engine_rolls_over_after_multiple_flashblocks_using_locally_sealed_parent_hash() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x33);
@@ -1023,24 +1307,19 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
 
-        let assembled_parent_hash =
-            BlockAssembler::assemble(&[first_flashblock.clone(), second_flashblock.clone()])
-                .expect("block should assemble")
-                .block
-                .header
-                .hash_slow();
+        let locally_sealed_parent_hash = active_pending_block_hash(&mut engine);
         let third_flashblock = flashblock(
             0,
             2,
             PayloadId::new([0x25; 8]),
-            assembled_parent_hash,
+            locally_sealed_parent_hash,
             true,
             vec![decoded_l1_info_tx(), second_block_deploy_tx],
         );
 
         let HotApplyOutcome::Delta { delta, .. } = engine
             .apply_flashblock(&third_flashblock)
-            .expect("next block should roll over from assembled parent hash")
+            .expect("next block should roll over from locally sealed parent hash")
         else {
             panic!("expected next-block delta outcome after multi-flashblock parent");
         };
@@ -1052,7 +1331,8 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_reanchors_rollover_to_available_canonical_parent_hash() {
+    fn hot_engine_rollover_resets_when_child_matches_canonical_but_mismatches_locally_sealed_previous_block()
+     {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x36);
@@ -1085,6 +1365,7 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
 
+        let locally_sealed_parent_hash = active_pending_block_hash(&mut engine);
         let canonical_header = Header {
             number: 1,
             parent_hash: canonical_parent_hash,
@@ -1093,16 +1374,7 @@ mod tests {
         };
         let canonical_block = canonical_block_with_header(canonical_header, vec![]);
         let canonical_hash = canonical_block.header().hash_slow();
-        assert_ne!(
-            engine
-                .window
-                .execution
-                .as_ref()
-                .expect("execution state should exist")
-                .last_header
-                .hash(),
-            canonical_hash
-        );
+        assert_ne!(locally_sealed_parent_hash, canonical_hash);
         insert_canonical_header(&client, &canonical_block);
 
         let third_flashblock = flashblock(
@@ -1114,16 +1386,13 @@ mod tests {
             vec![decoded_l1_info_tx(), second_block_deploy_tx],
         );
 
-        let HotApplyOutcome::Delta { delta, .. } = engine
+        let outcome = engine
             .apply_flashblock(&third_flashblock)
-            .expect("next block should reanchor to canonical parent")
-        else {
-            panic!("expected next-block delta outcome after canonical reanchor");
-        };
+            .expect("rollover mismatch should reset even when canonical parent is available");
 
-        assert_eq!(delta.transactions.len(), 2);
-        assert_eq!(engine.window.blocks.len(), 1);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
@@ -1228,20 +1497,10 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
-        let canonical_flashblocks = [first_flashblock.clone(), second_flashblock.clone()];
-        let canonical_block = canonical_block_from_flashblocks(&canonical_flashblocks);
-        engine.window.execution.as_mut().expect("execution state should exist").last_header =
-            HotEngine::<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>::seal_header(
-                canonical_block.header().clone(),
-            );
-
-        let carried_parent_hash = engine
-            .window
-            .execution
-            .as_ref()
-            .expect("execution state should exist")
-            .last_header
-            .hash();
+        let carried_parent_hash = active_pending_block_hash(&mut engine);
+        let first_pending_block =
+            engine.window.active_block().expect("active block should exist").clone();
+        let canonical_block = canonical_block_from_pending_block(&first_pending_block);
         let third_flashblock = flashblock(
             0,
             2,
@@ -1308,13 +1567,7 @@ mod tests {
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
-        let carried_parent_hash = engine
-            .window
-            .execution
-            .as_ref()
-            .expect("execution state should exist")
-            .last_header
-            .hash();
+        let carried_parent_hash = active_pending_block_hash(&mut engine);
         let second_flashblock = flashblock(
             0,
             2,
@@ -1325,8 +1578,9 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
-        let canonical_block =
-            canonical_block_from_flashblocks(std::slice::from_ref(&first_flashblock));
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first pending block should exist"),
+        );
         insert_canonical_header(&client, &canonical_block);
 
         let outcome = engine
@@ -1365,13 +1619,7 @@ mod tests {
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
-        let second_parent_hash = engine
-            .window
-            .execution
-            .as_ref()
-            .expect("execution state should exist")
-            .last_header
-            .hash();
+        let second_parent_hash = active_pending_block_hash(&mut engine);
         let second_flashblock = flashblock(
             0,
             2,
@@ -1382,13 +1630,7 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
-        let third_parent_hash = engine
-            .window
-            .execution
-            .as_ref()
-            .expect("execution state should exist")
-            .last_header
-            .hash();
+        let third_parent_hash = active_pending_block_hash(&mut engine);
         let third_flashblock = flashblock(
             0,
             3,

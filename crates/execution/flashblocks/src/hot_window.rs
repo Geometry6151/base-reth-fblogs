@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use alloy_consensus::{Header, Sealed};
-use alloy_primitives::{Address, B256, BlockNumber, TxHash};
+use alloy_primitives::{Address, B256, BlockNumber, Bloom, TxHash};
 use alloy_rpc_types::state::StateOverride;
 use alloy_rpc_types_engine::PayloadId;
 use base_common_evm::L1BlockInfo;
@@ -23,6 +23,25 @@ pub struct HotExecutionState<DB> {
     pub state_overrides: StateOverride,
     /// Latest L1 block info associated with the execution state.
     pub l1_block_info: L1BlockInfo,
+}
+
+/// Locally derived header material for sealing speculative blocks.
+#[derive(Clone, Debug)]
+pub struct HotExecutedHeaderParts {
+    /// Total gas used across the locally executed block suffixes.
+    pub gas_used: u64,
+    /// Logs bloom derived from locally executed receipts.
+    pub logs_bloom: Bloom,
+    /// Receipts root derived from locally executed receipts.
+    pub receipts_root: B256,
+    /// State root derived from the locally executed post-state.
+    pub state_root: B256,
+    /// Withdrawals root derived from the locally executed post-state.
+    pub withdrawals_root: B256,
+    /// Blob gas used derived from locally executed receipts.
+    pub blob_gas_used: Option<u64>,
+    /// Requests hash derived from the locally executed payload sidecar semantics.
+    pub requests_hash: Option<B256>,
 }
 
 /// Append-only data for one pending block.
@@ -58,6 +77,11 @@ pub struct HotPendingBlock {
     pub transaction_senders: HashMap<TxHash, Address>,
     /// Ordered flashblocks retained so this pending block can be silently replayed.
     pub flashblocks: Vec<Flashblock>,
+    /// Latest locally derived header material for this pending block.
+    ///
+    /// This is filled lazily only when the block must be locally sealed
+    /// (for example at rollover or canonical reconciliation).
+    pub local_header_parts: Option<HotExecutedHeaderParts>,
 }
 
 /// Small multi-block pending window for exact hot execution continuity.
@@ -123,11 +147,11 @@ impl<DB> HotPendingWindow<DB> {
 #[cfg(test)]
 mod tests {
     use alloy_consensus::{Header, Sealed};
-    use alloy_primitives::{Address, B256, Bytes, U256};
+    use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
     use alloy_rpc_types_engine::PayloadId;
     use base_common_flashblocks::ExecutionPayloadBaseV1;
 
-    use super::{HotExecutionState, HotPendingBlock, HotPendingWindow};
+    use super::{HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow};
 
     fn test_header(block_number: u64, parent_hash: B256) -> Sealed<Header> {
         Sealed::new_unchecked(
@@ -170,6 +194,7 @@ mod tests {
             rpc_transactions: std::collections::HashMap::new(),
             transaction_senders: std::collections::HashMap::new(),
             flashblocks: vec![],
+            local_header_parts: None,
         }
     }
 
@@ -208,5 +233,30 @@ mod tests {
         assert!(window.active_block_mut().is_none());
         assert!(window.active_block_number().is_none());
         assert!(window.latest_flashblock_index().is_none());
+    }
+
+    #[test]
+    fn hot_pending_block_tracks_local_header_parts() {
+        let mut pending_block = test_pending_block(7, 0);
+        let local_header_parts = HotExecutedHeaderParts {
+            gas_used: 21_000,
+            logs_bloom: Bloom::default(),
+            receipts_root: B256::with_last_byte(0x31),
+            state_root: B256::with_last_byte(0x32),
+            withdrawals_root: B256::with_last_byte(0x33),
+            blob_gas_used: Some(44),
+            requests_hash: None,
+        };
+
+        pending_block.local_header_parts = Some(local_header_parts.clone());
+
+        assert_eq!(
+            pending_block.local_header_parts.as_ref().map(|parts| parts.gas_used),
+            Some(21_000)
+        );
+        assert_eq!(
+            pending_block.local_header_parts.as_ref().map(|parts| parts.state_root),
+            Some(local_header_parts.state_root)
+        );
     }
 }

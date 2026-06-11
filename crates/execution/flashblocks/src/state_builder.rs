@@ -1,25 +1,31 @@
 use std::{sync::Arc, time::Instant};
 
+use alloy_consensus::proofs::ordered_trie_root_with_encoder;
 use alloy_consensus::{
     Block, Header, TxReceipt,
+    constants::EMPTY_WITHDRAWALS,
     transaction::{Recovered, TransactionMeta},
 };
-use alloy_eips::Encodable2718;
+use alloy_eips::{Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
 use alloy_evm::{
     Database as AlloyDatabase,
     block::{StateDB, SystemCaller},
 };
-use alloy_primitives::B256;
+use alloy_primitives::{B256, keccak256, logs_bloom};
 use alloy_rpc_types::TransactionTrait;
 use alloy_rpc_types_eth::state::StateOverride;
 use base_common_chains::Upgrades;
-use base_common_consensus::{BasePrimitives, BaseReceipt, BaseTxEnvelope, Predeploys};
+use base_common_consensus::{
+    BasePrimitives, BaseReceipt, BaseReceiptEnvelope, BaseTxEnvelope, Predeploys,
+};
 use base_common_evm::{BaseHaltReason, L1BlockInfo, ensure_create2_deployer};
 use base_common_flz::tx_estimated_size_fjord as estimate_tx_compressed_size;
 use base_common_rpc_types::{BaseTransactionReceipt, Transaction};
 use base_execution_rpc::BaseReceiptBuilder as BaseRpcReceiptBuilder;
 use reth_evm::{Evm, FromRecoveredTx};
+use reth_revm::{State, database::StateProviderDatabase};
 use reth_rpc_convert::transaction::ConvertReceiptInput;
+use reth_storage_api::StateProviderBox;
 use revm::{
     Database, DatabaseCommit,
     context::{
@@ -28,7 +34,9 @@ use revm::{
     },
     state::EvmState,
 };
+use revm_database::states::bundle_state::BundleRetention;
 
+use crate::hot_window::HotExecutedHeaderParts;
 use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
 
 /// Represents the result of executing or fetching a cached pending transaction.
@@ -421,6 +429,129 @@ where
             .into()),
         }
     }
+}
+
+/// Derives pending-block header material from a carried post-state database.
+#[derive(Debug, Default)]
+pub struct PendingHeaderBuilder;
+
+impl PendingHeaderBuilder {
+    /// Derives locally executed header material from the current post-state and ordered receipts.
+    pub fn from_post_state<ChainSpec: Upgrades>(
+        chain_spec: &ChainSpec,
+        timestamp: u64,
+        cumulative_gas_used: u64,
+        db: &mut State<StateProviderDatabase<StateProviderBox>>,
+        receipts: &[BaseTransactionReceipt],
+    ) -> Result<HotExecutedHeaderParts, StateProcessorError> {
+        db.merge_transitions(BundleRetention::Reverts);
+
+        let state_provider = db.database.as_ref();
+        let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
+        let withdrawals_storage = hashed_state
+            .storages
+            .get(&keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER))
+            .cloned()
+            .unwrap_or_default();
+        let state_root = state_provider
+            .state_root(hashed_state)
+            .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?;
+        let is_isthmus_active = chain_spec.is_isthmus_active_at_timestamp(timestamp);
+        let withdrawals_root = if is_isthmus_active {
+            state_provider
+                .storage_root(Predeploys::L2_TO_L1_MESSAGE_PASSER, withdrawals_storage)
+                .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?
+        } else if chain_spec.is_canyon_active_at_timestamp(timestamp) {
+            EMPTY_WITHDRAWALS
+        } else {
+            B256::ZERO
+        };
+
+        let receipt_envelopes =
+            receipts.iter().cloned().map(BaseReceiptEnvelope::from).collect::<Vec<_>>();
+        let receipts_root = calculate_receipts_root(&receipt_envelopes, chain_spec, timestamp);
+        let logs_bloom = logs_bloom(receipt_envelopes.iter().flat_map(|receipt| receipt.logs()));
+        let blob_gas_used = if chain_spec.is_jovian_active_at_timestamp(timestamp) {
+            Some(receipts.iter().filter_map(|receipt| receipt.inner.blob_gas_used).sum())
+        } else if chain_spec.is_ecotone_active_at_timestamp(timestamp) {
+            Some(0)
+        } else {
+            None
+        };
+
+        Ok(HotExecutedHeaderParts {
+            gas_used: cumulative_gas_used,
+            logs_bloom,
+            receipts_root,
+            state_root,
+            withdrawals_root,
+            blob_gas_used,
+            requests_hash: is_isthmus_active.then_some(EMPTY_REQUESTS_HASH),
+        })
+    }
+}
+
+impl<E, ChainSpec> PendingStateBuilder<E, ChainSpec>
+where
+    E: Evm<DB = State<StateProviderDatabase<StateProviderBox>>, HaltReason = BaseHaltReason>,
+    E::Tx: FromRecoveredTx<BaseTxEnvelope>,
+    ChainSpec: Upgrades + Clone,
+{
+    /// Consumes the builder and returns the database, state overrides, and locally derived header
+    /// material for the full pending block.
+    pub fn into_db_state_overrides_and_header_parts(
+        self,
+        receipts: &[BaseTransactionReceipt],
+    ) -> Result<
+        (State<StateProviderDatabase<StateProviderBox>>, StateOverride, HotExecutedHeaderParts),
+        StateProcessorError,
+    > {
+        let PendingStateBuilder {
+            cumulative_gas_used,
+            evm,
+            pending_block,
+            chain_spec,
+            state_overrides,
+            ..
+        } = self;
+
+        let mut db = evm.into_db();
+        let header_parts = PendingHeaderBuilder::from_post_state(
+            &chain_spec,
+            pending_block.timestamp,
+            cumulative_gas_used,
+            &mut db,
+            receipts,
+        )?;
+
+        Ok((db, state_overrides, header_parts))
+    }
+}
+
+fn calculate_receipts_root<ChainSpec: Upgrades>(
+    receipts: &[BaseReceiptEnvelope],
+    chain_spec: &ChainSpec,
+    timestamp: u64,
+) -> B256 {
+    if chain_spec.is_regolith_active_at_timestamp(timestamp)
+        && !chain_spec.is_canyon_active_at_timestamp(timestamp)
+    {
+        let receipts = receipts
+            .iter()
+            .cloned()
+            .map(|receipt| match receipt {
+                BaseReceiptEnvelope::Deposit(mut deposit_receipt) => {
+                    deposit_receipt.receipt.deposit_nonce = None;
+                    BaseReceiptEnvelope::Deposit(deposit_receipt)
+                }
+                _ => receipt,
+            })
+            .collect::<Vec<_>>();
+
+        return ordered_trie_root_with_encoder(&receipts, |receipt, buf| receipt.encode_2718(buf));
+    }
+
+    ordered_trie_root_with_encoder(receipts, |receipt, buf| receipt.encode_2718(buf))
 }
 
 #[cfg(test)]
