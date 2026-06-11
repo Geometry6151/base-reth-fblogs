@@ -37,7 +37,10 @@ mod hot_snapshot;
 pub use hot_snapshot::{HotSnapshot, HotSnapshotRing};
 
 mod hot_window;
-pub use hot_window::{HotExecutionState, HotPendingBlock, HotPendingWindow, RetainedVerifiedBlock};
+pub use hot_window::{
+    HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow,
+    RetainedVerifiedBlock,
+};
 
 mod metrics;
 pub use metrics::Metrics;
@@ -61,7 +64,7 @@ mod traits;
 pub use traits::{FlashblocksAPI, FlashblocksReceiver, PendingBlocksAPI};
 
 mod state_builder;
-pub use state_builder::{ExecutedPendingTransaction, PendingStateBuilder};
+pub use state_builder::{ExecutedPendingTransaction, PendingHeaderBuilder, PendingStateBuilder};
 
 mod receipt_builder;
 pub use receipt_builder::{ReceiptBuildError, UnifiedReceiptBuilder};
