@@ -1,7 +1,7 @@
 //! Flashblocks state processor.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -216,7 +216,7 @@ where
     async fn apply_hot_only_canonical(&self, block: RecoveredBlock<BaseBlock>) {
         let outcome = self.hot_engine().lock().await.process_canonical_block(&block);
         match outcome {
-            Ok(HotApplyOutcome::Delta { delta, snapshot }) => {
+            Ok(HotApplyOutcome::Delta { delta, snapshot, .. }) => {
                 _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(delta)));
                 if let Some(snapshot) = snapshot {
                     self.hot_snapshot_ring
@@ -262,79 +262,104 @@ where
     }
 
     async fn apply_hot_only_flashblock(&self, flashblock: Flashblock) {
-        let _flashblock_apply_timer = base_metrics::timed!(Metrics::flashblock_apply_duration());
-        let block_processing_start = Instant::now();
+        let mut replay_queue = VecDeque::from([flashblock]);
 
-        if self.cache_missing_first_hot_flashblock(&flashblock).await {
-            return;
-        }
+        while let Some(flashblock) = replay_queue.pop_front() {
+            let _flashblock_apply_timer =
+                base_metrics::timed!(Metrics::flashblock_apply_duration());
+            let block_processing_start = Instant::now();
 
-        let (outcome, missing_first_flashblock, hot_window_invalidated) = {
-            let mut hot_engine = self.hot_engine().lock().await;
-            let missing_first_flashblock = (hot_engine.window.execution.is_none()
-                || hot_engine.window.blocks.is_empty())
-                && flashblock.index > 0;
-            let outcome = hot_engine.apply_flashblock(&flashblock);
-            let hot_window_invalidated =
-                hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
-            (outcome, missing_first_flashblock, hot_window_invalidated)
-        };
-
-        match outcome {
-            Ok(HotApplyOutcome::Delta { delta, snapshot }) => {
-                _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(delta)));
-                if let Some(snapshot) = snapshot {
-                    self.hot_snapshot_ring
-                        .lock()
-                        .expect("hot snapshot ring mutex poisoned")
-                        .insert(Arc::new(snapshot));
-                }
-                Metrics::block_processing_duration().record(block_processing_start.elapsed());
+            if self.cache_missing_first_hot_flashblock(&flashblock).await {
+                continue;
             }
-            Ok(HotApplyOutcome::Duplicate) => {
-                Metrics::block_processing_duration().record(block_processing_start.elapsed());
-            }
-            Ok(HotApplyOutcome::Reset) => {
-                if hot_window_invalidated {
-                    self.clear_hot_snapshot_ring();
-                }
 
-                if missing_first_flashblock {
-                    let cached = {
-                        let mut cache = self.cache.lock().await;
-                        cache.has_flashblock(flashblock.metadata.block_number, flashblock.index - 1)
-                            && cache.insert(flashblock)
-                    };
-                    if cached {
-                        Metrics::hot_cache_insert_missing_first_count().increment(1);
-                        return;
+            let (outcome, missing_first_flashblock, hot_window_invalidated) = {
+                let mut hot_engine = self.hot_engine().lock().await;
+                let missing_first_flashblock = (hot_engine.window.execution.is_none()
+                    || hot_engine.window.blocks.is_empty())
+                    && flashblock.index > 0;
+                let outcome = hot_engine.apply_flashblock(&flashblock);
+                let hot_window_invalidated =
+                    hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
+                (outcome, missing_first_flashblock, hot_window_invalidated)
+            };
+
+            match outcome {
+                Ok(HotApplyOutcome::Delta { delta, snapshot, verified_parent_ready }) => {
+                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(delta)));
+                    if let Some(snapshot) = snapshot {
+                        self.hot_snapshot_ring
+                            .lock()
+                            .expect("hot snapshot ring mutex poisoned")
+                            .insert(Arc::new(snapshot));
+                    }
+                    Metrics::block_processing_duration().record(block_processing_start.elapsed());
+
+                    if let Some(verified_parent_ready) = verified_parent_ready {
+                        let child_block = verified_parent_ready.saturating_add(1);
+                        let cached = {
+                            let mut cache = self.cache.lock().await;
+                            cache.drain_cached(child_block)
+                        };
+                        if !cached.is_empty() {
+                            Self::record_hot_cache_drain(&cached);
+                            debug!(
+                                message = "replaying cached flashblocks after speculative parent verification",
+                                verified_parent_block = verified_parent_ready,
+                                child_block,
+                                cached_count = cached.len(),
+                            );
+                            replay_queue.extend(cached.into_iter().map(|cached| cached.flashblock));
+                        }
                     }
                 }
-
-                if hot_window_invalidated {
-                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
+                Ok(HotApplyOutcome::Duplicate) => {
+                    Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
-                Metrics::block_processing_duration().record(block_processing_start.elapsed());
-            }
-            Err(e) => {
-                if let StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
-                    ..
-                }) = e
-                {
-                    if self.cache.lock().await.insert(flashblock) {
-                        Metrics::hot_cache_insert_missing_canonical_count().increment(1);
-                        debug!(message = "cached flashblock pending canonical block", error = %e);
+                Ok(HotApplyOutcome::Reset) => {
+                    if hot_window_invalidated {
+                        self.clear_hot_snapshot_ring();
                     }
-                    return;
-                }
 
-                if hot_window_invalidated {
-                    self.clear_hot_snapshot_ring();
-                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
-                }
+                    if missing_first_flashblock {
+                        let cached = {
+                            let mut cache = self.cache.lock().await;
+                            cache.has_flashblock(
+                                flashblock.metadata.block_number,
+                                flashblock.index - 1,
+                            ) && cache.insert(flashblock)
+                        };
+                        if cached {
+                            Metrics::hot_cache_insert_missing_first_count().increment(1);
+                            continue;
+                        }
+                    }
 
-                error!(message = "could not process Flashblock", error = %e);
-                Metrics::block_processing_error().increment(1);
+                    if hot_window_invalidated {
+                        _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
+                    }
+                    Metrics::block_processing_duration().record(block_processing_start.elapsed());
+                }
+                Err(e) => {
+                    if let StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
+                        ..
+                    }) = e
+                    {
+                        if self.cache.lock().await.insert(flashblock) {
+                            Metrics::hot_cache_insert_missing_canonical_count().increment(1);
+                            debug!(message = "cached flashblock pending canonical block", error = %e);
+                        }
+                        continue;
+                    }
+
+                    if hot_window_invalidated {
+                        self.clear_hot_snapshot_ring();
+                        _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
+                    }
+
+                    error!(message = "could not process Flashblock", error = %e);
+                    Metrics::block_processing_error().increment(1);
+                }
             }
         }
     }
@@ -797,18 +822,83 @@ where
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use alloy_primitives::{Address, B256, Bloom, Bytes, U256, hex_literal::hex};
+    use alloy_rpc_types_engine::PayloadId;
     use arc_swap::ArcSwapOption;
     use base_common_consensus::BasePrimitives;
+    use base_common_flashblocks::{
+        ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata,
+    };
     use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
+    use reth_chainspec::ChainSpecProvider;
     use reth_provider::test_utils::MockEthProvider;
     use tokio::sync::{Mutex, broadcast, mpsc};
+    use tokio::time::timeout;
 
     use super::StateProcessor;
-    use crate::{FlashblocksMode, HotSnapshotRing, SnapshotCache};
+    use crate::state_builder::PendingHeaderBuilder;
+    use crate::{
+        BlockAssembler, FastFlashblockFeedEvent, FlashblocksMode, HotPendingWindow,
+        HotSnapshotRing, SnapshotCache,
+    };
+
+    const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
     fn test_client() -> MockEthProvider<BasePrimitives, Arc<BaseChainSpec>> {
         let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
         MockEthProvider::<BasePrimitives>::new().with_chain_spec(chain_spec).with_genesis_block()
+    }
+
+    fn encoded_l1_info_tx() -> Bytes {
+        Bytes::from_static(&hex!(
+            "7ef9015aa044bae9d41b8380d781187b426c6fe43df5fb2fb57bd4466ef6a701e1f01e015694deaddeaddeaddeaddeaddeaddeaddeaddead000194420000000000000000000000000000000000001580808408f0d18001b90104015d8eb900000000000000000000000000000000000000000000000000000000008057650000000000000000000000000000000000000000000000000000000063d96d10000000000000000000000000000000000000000000000000000000000009f35273d89754a1e0387b89520d989d3be9c37c1f32495a88faf1ea05c61121ab0d1900000000000000000000000000000000000000000000000000000000000000010000000000000000000000002d679b567db6187c0c8323fa982cfb88b74dbcc7000000000000000000000000000000000000000000000000000000000000083400000000000000000000000000000000000000000000000000000000000f4240"
+        ))
+    }
+
+    fn test_hot_flashblock(
+        index: u64,
+        block_number: u64,
+        payload_id: PayloadId,
+        parent_hash: B256,
+        with_base: bool,
+        transactions: Vec<Bytes>,
+    ) -> Flashblock {
+        Flashblock {
+            payload_id,
+            index,
+            base: with_base.then_some(ExecutionPayloadBaseV1 {
+                parent_beacon_block_root: B256::ZERO,
+                parent_hash,
+                fee_recipient: Address::ZERO,
+                prev_randao: B256::ZERO,
+                block_number,
+                gas_limit: 30_000_000,
+                timestamp: 1_700_000_000 + block_number,
+                extra_data: Bytes::default(),
+                base_fee_per_gas: U256::from(1_000_000_000u64),
+            }),
+            diff: ExecutionPayloadFlashblockDeltaV1 {
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::default(),
+                gas_used: 21_000,
+                block_hash: B256::ZERO,
+                transactions,
+                withdrawals: vec![],
+                withdrawals_root: B256::ZERO,
+                blob_gas_used: None,
+            },
+            metadata: Metadata { block_number },
+        }
+    }
+
+    async fn recv_fast_flashblock_event(
+        receiver: &mut broadcast::Receiver<FastFlashblockFeedEvent>,
+    ) -> FastFlashblockFeedEvent {
+        timeout(RECV_TIMEOUT, receiver.recv())
+            .await
+            .expect("fast flashblock event should arrive")
+            .expect("fast flashblock channel should stay open")
     }
 
     #[test]
@@ -850,5 +940,131 @@ mod tests {
         );
 
         assert_eq!(processor.mode(), FlashblocksMode::HotOnly);
+    }
+
+    #[tokio::test]
+    async fn hot_only_replays_cached_next_block_suffixes_after_speculative_parent_verification() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (fast_sender, mut fast_receiver) = broadcast::channel(8);
+        let (sender, _) = broadcast::channel(1);
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+
+        let processor = StateProcessor::new_with_mode(
+            client,
+            Arc::new(ArcSwapOption::new(None)),
+            5,
+            FlashblocksMode::HotOnly,
+            Arc::new(Mutex::new(rx)),
+            fast_sender,
+            sender,
+            Arc::new(std::sync::Mutex::new(SnapshotCache::new(8, Duration::from_secs(1)))),
+            Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(8))),
+        );
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                1,
+                PayloadId::new([0x81; 8]),
+                parent_hash,
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+
+        let first_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(first_delta) = first_event else {
+            panic!("expected first hot-only delta event");
+        };
+
+        let _first_snapshot = processor
+            .hot_snapshot_ring
+            .lock()
+            .expect("hot snapshot ring mutex poisoned")
+            .get(first_delta.snapshot_id)
+            .expect("first hot snapshot should be retained");
+
+        let locally_sealed_parent = {
+            let mut hot_engine = processor.hot_engine().lock().await;
+            let chain_spec = hot_engine.client.chain_spec();
+            let HotPendingWindow { execution, blocks, .. } = &mut hot_engine.window;
+            let execution = execution
+                .as_mut()
+                .expect("hot execution state should exist after first flashblock");
+            let pending_block = blocks
+                .back_mut()
+                .expect("active pending block should exist after first flashblock");
+            let ordered_receipts = pending_block
+                .transactions
+                .iter()
+                .map(|transaction| {
+                    pending_block
+                        .receipts
+                        .get(&transaction.hash)
+                        .cloned()
+                        .expect("receipt should exist for executed transaction")
+                })
+                .collect::<Vec<_>>();
+            let header_parts = PendingHeaderBuilder::from_post_state(
+                chain_spec.as_ref(),
+                pending_block.base.timestamp,
+                pending_block.cumulative_gas_used,
+                &mut execution.db,
+                &ordered_receipts,
+            )
+            .expect("pending block should derive local header parts");
+
+            BlockAssembler::header_from_local_execution(
+                &pending_block.base,
+                &pending_block.flashblocks,
+                &header_parts,
+            )
+            .expect("pending block should assemble a locally sealed header")
+            .hash_slow()
+        };
+
+        let cached_suffix = test_hot_flashblock(
+            1,
+            2,
+            PayloadId::new([0x82; 8]),
+            locally_sealed_parent,
+            false,
+            vec![],
+        );
+        assert!(processor.cache.lock().await.insert(cached_suffix));
+
+        processor
+            .apply_hot_only_flashblock(test_hot_flashblock(
+                0,
+                2,
+                PayloadId::new([0x82; 8]),
+                locally_sealed_parent,
+                true,
+                vec![encoded_l1_info_tx()],
+            ))
+            .await;
+
+        let rollover_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(rollover_delta) = rollover_event else {
+            panic!("expected rollover delta event");
+        };
+        assert_eq!(rollover_delta.block_number, 2);
+        assert_eq!(rollover_delta.flashblock_index, 0);
+
+        let replayed_event = recv_fast_flashblock_event(&mut fast_receiver).await;
+        let FastFlashblockFeedEvent::Delta(replayed_delta) = replayed_event else {
+            panic!("expected replayed cached suffix delta event");
+        };
+        assert_eq!(replayed_delta.block_number, 2);
+        assert_eq!(replayed_delta.flashblock_index, 1);
+
+        assert!(matches!(fast_receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        assert!(!processor.cache.lock().await.has_flashblock(2, 1));
+
+        let hot_engine = processor.hot_engine().lock().await;
+        let active_block = hot_engine.window.blocks.back().expect("active block should exist");
+        assert_eq!(active_block.block_number, 2);
+        assert_eq!(active_block.latest_flashblock_index, 1);
     }
 }

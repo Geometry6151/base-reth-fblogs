@@ -5,7 +5,7 @@ use alloy_consensus::{
     transaction::{Recovered, SignerRecoverable},
 };
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, BlockNumber};
 use alloy_rpc_types::state::StateOverride;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
@@ -41,6 +41,8 @@ pub enum HotApplyOutcome {
         delta: FastFlashblockLogsDelta,
         /// Optional pinned snapshot derived from the same post-apply state.
         snapshot: Option<HotSnapshot>,
+        /// Previous pending block number that was verified by this rollover child, if any.
+        verified_parent_ready: Option<BlockNumber>,
     },
     /// The flashblock was already applied.
     Duplicate,
@@ -295,7 +297,7 @@ where
         self.window.execution = Some(execution);
         self.window.push_block(pending_block);
 
-        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot) })
+        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot), verified_parent_ready: None })
     }
 
     fn append_same_block_suffix(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
@@ -338,7 +340,7 @@ where
         self.window.execution = Some(execution);
         self.window.blocks.push_back(pending_block);
 
-        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot) })
+        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot), verified_parent_ready: None })
     }
 
     fn rollover_to_next_block(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
@@ -395,7 +397,11 @@ where
         self.window.execution = Some(execution);
         self.window.push_block(pending_block);
 
-        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot) })
+        Ok(HotApplyOutcome::Delta {
+            delta,
+            snapshot: Some(snapshot),
+            verified_parent_ready: Some(sealed_previous_pending_block.number),
+        })
     }
 
     fn execute_new_block_suffix(
@@ -1029,11 +1035,15 @@ mod tests {
             vec![decoded_l1_info_tx(), deploy_tx.clone()],
         );
 
-        let HotApplyOutcome::Delta { delta: first_delta, .. } =
-            engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply")
+        let HotApplyOutcome::Delta {
+            delta: first_delta,
+            verified_parent_ready: first_verified_parent_ready,
+            ..
+        } = engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply")
         else {
             panic!("expected first flashblock delta outcome");
         };
+        assert_eq!(first_verified_parent_ready, None);
         assert_eq!(first_delta.logs.len(), 1);
         assert_eq!(first_delta.logs[0].tx_index, 1);
         assert_eq!(first_delta.logs[0].log_index_in_block, 0);
@@ -1041,11 +1051,15 @@ mod tests {
         let second_flashblock =
             flashblock(1, 1, PayloadId::new([0x11; 8]), parent_hash, false, vec![call_tx.clone()]);
 
-        let HotApplyOutcome::Delta { delta: second_delta, .. } =
-            engine.apply_flashblock(&second_flashblock).expect("same-block suffix should apply")
+        let HotApplyOutcome::Delta {
+            delta: second_delta,
+            verified_parent_ready: second_verified_parent_ready,
+            ..
+        } = engine.apply_flashblock(&second_flashblock).expect("same-block suffix should apply")
         else {
             panic!("expected same-block delta outcome");
         };
+        assert_eq!(second_verified_parent_ready, None);
 
         assert_eq!(second_delta.transactions.len(), 1);
         assert_eq!(second_delta.transactions[0].hash, decoded_tx_hash(&call_tx));
@@ -1095,11 +1109,13 @@ mod tests {
             vec![decoded_l1_info_tx(), call_tx.clone()],
         );
 
-        let HotApplyOutcome::Delta { delta, .. } =
+        let HotApplyOutcome::Delta { delta, verified_parent_ready, .. } =
             engine.apply_flashblock(&second_flashblock).expect("next block should roll over")
         else {
             panic!("expected next-block delta outcome");
         };
+
+        assert_eq!(verified_parent_ready, Some(1));
 
         assert_eq!(delta.transactions.len(), 2);
         assert_eq!(delta.transactions[1].hash, decoded_tx_hash(&call_tx));
@@ -1122,6 +1138,40 @@ mod tests {
                 .number,
             2,
         );
+    }
+
+    #[test]
+    fn hot_engine_rollover_delta_sets_verified_parent_ready() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x71; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx()],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+
+        let second_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0x72; 8]),
+            active_pending_block_hash(&mut engine),
+            true,
+            vec![decoded_l1_info_tx()],
+        );
+
+        let HotApplyOutcome::Delta { verified_parent_ready, .. } =
+            engine.apply_flashblock(&second_flashblock).expect("rollover should apply")
+        else {
+            panic!("expected rollover delta outcome");
+        };
+
+        assert_eq!(verified_parent_ready, Some(1));
     }
 
     #[test]
