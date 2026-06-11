@@ -32,10 +32,10 @@ use revm_database::states::bundle_state::BundleRetention;
 use tokio::sync::{Mutex, broadcast::Sender, mpsc::UnboundedReceiver};
 
 use crate::{
-    BlockAssembler, ExecutionError, FastFlashblockFeedEvent, FastFlashblockLogsDelta,
-    FlashblockCache, FlashblocksMode, HotApplyOutcome, HotEngine, HotSnapshotRing, PendingBlocks,
-    PendingBlocksBuilder, PendingStateBuilder, ProviderError, Result, SnapshotCache,
-    StateProcessorError,
+    BlockAssembler, CachedFlashblock, ExecutionError, FastFlashblockFeedEvent,
+    FastFlashblockLogsDelta, FlashblockCache, FlashblocksMode, HotApplyOutcome, HotEngine,
+    HotSnapshotRing, PendingBlocks, PendingBlocksBuilder, PendingStateBuilder, ProviderError,
+    Result, SnapshotCache, StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -238,24 +238,37 @@ where
 
         let mut cache = self.cache.lock().await;
         cache.update_canonical(block.number);
-        let cached = cache.drain(block.number + 1);
+        let cached = cache.drain_cached(block.number + 1);
         drop(cache);
 
         if !cached.is_empty() {
+            Self::record_hot_cache_drain(&cached);
             debug!(
                 message = "replaying cached flashblocks after canonical block",
                 canonical_block = block.number,
                 cached_count = cached.len(),
             );
             for flashblock in cached {
-                self.apply_hot_only_flashblock(flashblock).await;
+                self.apply_hot_only_flashblock(flashblock.flashblock).await;
             }
+        }
+    }
+
+    fn record_hot_cache_drain(cached: &[CachedFlashblock]) {
+        Metrics::hot_cache_drain_flashblock_count().record(cached.len() as f64);
+        for cached in cached {
+            Metrics::hot_cache_dwell_duration().record(cached.inserted_at.elapsed());
         }
     }
 
     async fn apply_hot_only_flashblock(&self, flashblock: Flashblock) {
         let _flashblock_apply_timer = base_metrics::timed!(Metrics::flashblock_apply_duration());
         let block_processing_start = Instant::now();
+
+        if self.cache_missing_first_hot_flashblock(&flashblock).await {
+            return;
+        }
+
         let (outcome, missing_first_flashblock, hot_window_invalidated) = {
             let mut hot_engine = self.hot_engine().lock().await;
             let missing_first_flashblock = (hot_engine.window.execution.is_none()
@@ -293,6 +306,7 @@ where
                             && cache.insert(flashblock)
                     };
                     if cached {
+                        Metrics::hot_cache_insert_missing_first_count().increment(1);
                         return;
                     }
                 }
@@ -308,6 +322,7 @@ where
                 }) = e
                 {
                     if self.cache.lock().await.insert(flashblock) {
+                        Metrics::hot_cache_insert_missing_canonical_count().increment(1);
                         debug!(message = "cached flashblock pending canonical block", error = %e);
                     }
                     return;
@@ -322,6 +337,36 @@ where
                 Metrics::block_processing_error().increment(1);
             }
         }
+    }
+
+    async fn cache_missing_first_hot_flashblock(&self, flashblock: &Flashblock) -> bool {
+        if flashblock.index == 0 {
+            return false;
+        }
+
+        let hot_window_invalidated = {
+            let hot_engine = self.hot_engine().lock().await;
+            hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty()
+        };
+
+        if !hot_window_invalidated {
+            return false;
+        }
+
+        let cached = {
+            let mut cache = self.cache.lock().await;
+            cache.has_flashblock(flashblock.metadata.block_number, flashblock.index - 1)
+                && cache.insert(flashblock.clone())
+        };
+
+        if !cached {
+            return false;
+        }
+
+        self.hot_engine().lock().await.reset();
+        self.clear_hot_snapshot_ring();
+        Metrics::hot_cache_insert_missing_first_count().increment(1);
+        true
     }
 
     async fn apply_flashblock(

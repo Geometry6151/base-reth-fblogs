@@ -46,6 +46,14 @@ base_metrics::define_metrics! {
     hot_snapshot_materialize_duration: histogram,
     #[describe("Count of times canonical processing forced a hot window reset")]
     hot_canonical_reset_count: counter,
+    #[describe("Count of hot-only flashblocks cached while waiting for a missing canonical parent")]
+    hot_cache_insert_missing_canonical_count: counter,
+    #[describe("Count of hot-only non-zero flashblocks cached while waiting for the first cached flashblock to replay")]
+    hot_cache_insert_missing_first_count: counter,
+    #[describe("Number of cached hot-only flashblocks drained after a canonical block")]
+    hot_cache_drain_flashblock_count: histogram,
+    #[describe("Time a hot-only flashblock spent cached before replay")]
+    hot_cache_dwell_duration: histogram,
     #[describe("Time taken to build the newFastFlashblockLogs delta from pending state")]
     fast_delta_build_duration: histogram,
     #[describe("Time taken to build the newFlashblocks block payload from pending state")]
