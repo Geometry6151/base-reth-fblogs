@@ -71,8 +71,9 @@ impl FlashblockSnapshotId {
 
 /// Internal event for the fast-log feed.
 ///
-/// Current legacy producers emit [`Self::Delta`] only. Hot-only producers may emit
-/// [`Self::Resync`] when the local pending window is invalidated.
+/// Current legacy producers emit [`Self::Delta`] only. Hot-only producers may emit [`Self::Resync`]
+/// when the local pending window is invalidated, or [`Self::InvalidateSession`] when the stream
+/// must terminate and force client reconnect.
 #[derive(Clone, Debug)]
 pub enum FastFlashblockFeedEvent {
     /// Exact log delta for one flashblock.
@@ -82,6 +83,11 @@ pub enum FastFlashblockFeedEvent {
     /// Consumers that receive this must treat the fast stream as discontinuous until a later
     /// [`Self::Delta`] arrives.
     Resync,
+    /// Terminal session invalidation signaling.
+    ///
+    /// Consumers that receive this must close the derived subscription stream and require the
+    /// client to reconnect for a new session.
+    InvalidateSession,
 }
 
 /// Returned when a [`FastFlashblockLogsDelta`] duplicates identity fields that disagree with its

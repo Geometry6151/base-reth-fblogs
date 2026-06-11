@@ -435,6 +435,7 @@ async fn pipe_flashblock_logs_batch_from_fast_delta_subscription(
                 let delta = match event {
                     FastFlashblockFeedEvent::Delta(delta) => delta,
                     FastFlashblockFeedEvent::Resync => continue,
+                    FastFlashblockFeedEvent::InvalidateSession => return,
                 };
 
                 let batch = base_metrics::time!(Metrics::logs_batch_build_duration(), {
@@ -518,6 +519,7 @@ async fn pipe_fast_flashblock_logs_subscription(
                 let delta = match event {
                     FastFlashblockFeedEvent::Delta(delta) => delta,
                     FastFlashblockFeedEvent::Resync => continue,
+                    FastFlashblockFeedEvent::InvalidateSession => return,
                 };
 
                 if let Some(filter) = filter.as_ref() {
@@ -705,6 +707,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fast_flashblock_update_invalidate_session_closes_fast_subscription() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "fast_flashblock_update_invalidate_session",
+                "fast_flashblock_update_invalidate_session",
+                "fast_flashblock_update_invalidate_session_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_fast_flashblock_logs_subscription(sink, receiver, None).await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded(
+                "fast_flashblock_update_invalidate_session",
+                EmptyServerParams::new(),
+            )
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::InvalidateSession).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        assert!(next.is_none(), "subscription should close after session invalidation");
+    }
+
+    #[tokio::test]
     async fn fast_flashblock_update_resync_keeps_logs_batch_subscription_open() {
         let (sender, _) = broadcast::channel(4);
         let mut module = RpcModule::new(());
@@ -742,6 +783,45 @@ mod tests {
         let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
         let (value, _) = next.expect("subscription should stay open after resync").unwrap();
         assert_eq!(value["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn invalidate_session_closes_logs_batch_subscription() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "logs_batch_update_invalidate_session",
+                "logs_batch_update_invalidate_session",
+                "logs_batch_update_invalidate_session_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_flashblock_logs_batch_from_fast_delta_subscription(
+                                sink, receiver, None,
+                            )
+                            .await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded("logs_batch_update_invalidate_session", EmptyServerParams::new())
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::InvalidateSession).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        assert!(next.is_none(), "subscription should close after session invalidation");
     }
 
     fn test_fast_delta() -> FastFlashblockLogsDelta {
