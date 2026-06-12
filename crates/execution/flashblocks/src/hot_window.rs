@@ -292,8 +292,6 @@ impl<DB> HotPendingWindow<DB> {
             return false;
         }
 
-        let mut expected_parent_hash = self.anchor.hash();
-
         for (block_offset, block) in self.blocks.iter().enumerate() {
             let Ok(block_offset) = u64::try_from(block_offset) else {
                 return false;
@@ -314,8 +312,8 @@ impl<DB> HotPendingWindow<DB> {
                 return false;
             }
 
-            if block.parent_hash != expected_parent_hash
-                || block.base.parent_hash != expected_parent_hash
+            if (block_offset == 0 && block.parent_hash != self.anchor.hash())
+                || block.base.parent_hash != block.parent_hash
             {
                 return false;
             }
@@ -350,8 +348,6 @@ impl<DB> HotPendingWindow<DB> {
                     return false;
                 }
             }
-
-            expected_parent_hash = block.latest_wire_header_hash;
         }
 
         true
@@ -655,8 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn hot_pending_window_make_audit_snapshot_rejects_second_block_not_building_on_previous_wire_hash()
-     {
+    fn hot_pending_window_make_audit_snapshot_allows_second_block_without_previous_wire_hash_link()
+    {
         let mut window = HotPendingWindow::<()>::new(4);
         let anchor = HotWindowAnchor::new(10, B256::with_last_byte(0xdd));
         let first_block =
@@ -673,9 +669,9 @@ mod tests {
             wrong_second_parent_hash,
         ));
 
-        assert!(window.retained_flashblocks_from_anchor(anchor.block_number()).is_none());
-        assert!(window.retained_outputs_from_anchor(anchor.block_number()).is_none());
-        assert!(window.make_audit_snapshot(7, 9, anchor.block_number(), anchor.hash()).is_none());
+        assert!(window.retained_flashblocks_from_anchor(anchor.block_number()).is_some());
+        assert!(window.retained_outputs_from_anchor(anchor.block_number()).is_some());
+        assert!(window.make_audit_snapshot(7, 9, anchor.block_number(), anchor.hash()).is_some());
     }
 
     #[test]

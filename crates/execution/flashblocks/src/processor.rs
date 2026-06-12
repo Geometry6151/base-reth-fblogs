@@ -2927,9 +2927,9 @@ mod tests {
                 0,
                 2,
                 PayloadId::new([0x92; 8]),
-                B256::with_last_byte(0xee),
-                true,
-                vec![encoded_l1_info_tx()],
+                parent_hash,
+                false,
+                vec![],
             ))
             .await;
 
@@ -2978,22 +2978,8 @@ mod tests {
         };
 
         let mut replay_queue = VecDeque::from([
-            test_hot_flashblock(
-                0,
-                2,
-                PayloadId::new([0x94; 8]),
-                B256::with_last_byte(0xee),
-                true,
-                vec![encoded_l1_info_tx()],
-            ),
-            test_hot_flashblock(
-                1,
-                2,
-                PayloadId::new([0x94; 8]),
-                B256::with_last_byte(0xee),
-                false,
-                vec![],
-            ),
+            test_hot_flashblock(0, 2, PayloadId::new([0x94; 8]), parent_hash, false, vec![]),
+            test_hot_flashblock(1, 2, PayloadId::new([0x94; 8]), parent_hash, false, vec![]),
         ]);
 
         assert!(processor.apply_hot_only_replay_queue(&mut replay_queue).await);

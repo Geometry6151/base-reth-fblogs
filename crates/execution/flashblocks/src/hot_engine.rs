@@ -69,8 +69,6 @@ pub enum HotApplyOutcome {
 /// Hard invalidation reason for a speculative hot session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotInvalidationReason {
-    /// First child of a speculative rollover disagreed with the retained wire parent commitment.
-    SpeculativeParentMismatch,
     /// A canonical block disagreed with previously retained reconciliation state.
     CanonicalConflict,
     /// Retained speculative suffixes could not be replayed soundly from canonical state.
@@ -670,18 +668,7 @@ where
             }
             Err(error) => return Err(error),
         };
-        let expected_parent_hash = self
-            .window
-            .active_block()
-            .ok_or_else(|| {
-                StateProcessorError::HotEngine("missing active pending block".to_string())
-            })?
-            .latest_wire_header_hash;
-
-        if base.parent_hash != expected_parent_hash {
-            Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
-            return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeParentMismatch));
-        }
+        let pre_execution_parent_hash = base.parent_hash;
 
         if self.speculative_depth_after_next_block(flashblock.metadata.block_number)
             > self.max_depth
@@ -732,7 +719,7 @@ where
                 decoded_transactions,
                 l1_block_info,
                 apply_pre_execution_changes: true,
-                pre_execution_parent_hash: expected_parent_hash,
+                pre_execution_parent_hash,
                 canonical_base_parent_hash,
             },
         )?;
@@ -1483,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_uses_cumulative_wire_parent_commitment_across_suffixes() {
+    fn hot_engine_rollover_accepts_cumulative_wire_parent_hash_across_suffixes() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x9a);
@@ -1530,7 +1517,7 @@ mod tests {
                 true,
                 vec![decoded_l1_info_tx(), second_block_deploy_tx],
             ))
-            .expect("rollover should use the cumulative wire parent commitment");
+            .expect("rollover should accept the cumulative wire parent hash");
 
         assert!(matches!(outcome, HotApplyOutcome::Delta { .. }));
         assert_eq!(engine.window.active_block_number(), Some(2));
@@ -1612,11 +1599,13 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_invalidate_session_when_child_parent_mismatches_wire_previous_block() {
+    fn hot_engine_rollover_accepts_child_parent_without_local_wire_validation() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
-        let deploy_tx = create_deploy_log_tx(0x94);
-        seed_sender_balance(&client, &deploy_tx);
+        let first_block_tx = create_deploy_log_tx(0x94);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0x95, 120_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
 
         let mut engine = HotEngine::new(client.clone(), 3);
         let first_flashblock = flashblock(
@@ -1625,7 +1614,7 @@ mod tests {
             PayloadId::new([0x84; 8]),
             canonical_parent_hash,
             true,
-            vec![decoded_l1_info_tx(), deploy_tx],
+            vec![decoded_l1_info_tx(), first_block_tx],
         );
         engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
 
@@ -1640,31 +1629,31 @@ mod tests {
         );
         insert_canonical_header(&client, &canonical_block);
 
-        let next_flashblock = flashblock(
-            0,
-            2,
-            PayloadId::new([0x85; 8]),
-            B256::with_last_byte(0x99),
-            true,
-            vec![decoded_l1_info_tx(), create_deploy_log_tx_with_gas_limit(0x95, 120_000)],
+        let unvalidated_parent_hash = B256::with_last_byte(0x99);
+        let HotApplyOutcome::Delta { delta, .. } = engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x85; 8]),
+                unvalidated_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), second_block_tx],
+            ))
+            .expect("rollover should accept the child parent hash without local validation")
+        else {
+            panic!("expected rollover delta outcome");
+        };
+
+        assert_eq!(delta.parent_hash, unvalidated_parent_hash);
+        assert_eq!(engine.window.active_block_number(), Some(2));
+        assert_eq!(
+            engine.window.active_block().expect("child block should exist").parent_hash,
+            unvalidated_parent_hash
         );
-
-        let outcome = engine
-            .apply_flashblock(&next_flashblock)
-            .expect("rollover mismatch should return hard invalidation outcome");
-
-        assert!(matches!(
-            outcome,
-            HotApplyOutcome::InvalidateSession {
-                reason: HotInvalidationReason::SpeculativeParentMismatch
-            }
-        ));
-        assert!(engine.window.execution.is_none());
-        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_invalidate_session_rollover_parent_mismatch_does_not_advance_child() {
+    fn hot_engine_rollover_parent_hash_mismatch_still_advances_child() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let deploy_tx = create_deploy_log_tx(0x98);
@@ -1681,30 +1670,29 @@ mod tests {
         );
         engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
 
-        let outcome = engine
+        let unvalidated_parent_hash = B256::with_last_byte(0xfe);
+        let HotApplyOutcome::Delta { delta, .. } = engine
             .apply_flashblock(&flashblock(
                 0,
                 2,
                 PayloadId::new([0x88; 8]),
-                B256::with_last_byte(0xfe),
+                unvalidated_parent_hash,
                 true,
                 vec![decoded_l1_info_tx()],
             ))
-            .expect("parent mismatch should return a hard invalidation outcome");
+            .expect("rollover should still advance the child block")
+        else {
+            panic!("expected rollover delta outcome");
+        };
 
-        assert!(matches!(
-            outcome,
-            HotApplyOutcome::InvalidateSession {
-                reason: HotInvalidationReason::SpeculativeParentMismatch
-            }
-        ));
-        assert!(engine.window.execution.is_none());
-        assert!(engine.window.blocks.is_empty());
+        assert_eq!(delta.parent_hash, unvalidated_parent_hash);
+        assert_eq!(engine.window.active_block_number(), Some(2));
+        assert_eq!(engine.window.blocks.len(), 2);
+        assert!(engine.window.execution.is_some());
     }
 
     #[test]
-    fn hot_engine_rollover_invalidate_session_when_child_mismatches_cumulative_wire_previous_block_commitment()
-     {
+    fn hot_engine_rollover_accepts_previous_suffix_block_hash_when_cumulative_wire_hash_differs() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x36);
@@ -1751,18 +1739,19 @@ mod tests {
             vec![decoded_l1_info_tx(), second_block_deploy_tx],
         );
 
-        let outcome = engine
+        let HotApplyOutcome::Delta { delta, .. } = engine
             .apply_flashblock(&third_flashblock)
-            .expect("rollover mismatch should invalidate even when canonical parent is available");
+            .expect("rollover should accept a real boundary suffix block hash regression case")
+        else {
+            panic!("expected rollover delta outcome");
+        };
 
-        assert!(matches!(
-            outcome,
-            HotApplyOutcome::InvalidateSession {
-                reason: HotInvalidationReason::SpeculativeParentMismatch
-            }
-        ));
-        assert!(engine.window.execution.is_none());
-        assert!(engine.window.blocks.is_empty());
+        assert_eq!(delta.parent_hash, suffix_block_hash);
+        assert_eq!(engine.window.active_block_number(), Some(2));
+        assert_eq!(
+            engine.window.active_block().expect("child block should exist").parent_hash,
+            suffix_block_hash
+        );
     }
 
     #[test]
