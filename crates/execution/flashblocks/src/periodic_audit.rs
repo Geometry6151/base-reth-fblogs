@@ -6,6 +6,39 @@ use base_common_flashblocks::Flashblock;
 
 use crate::{FastFlashblockLog, FastFlashblockLogsDelta, FastFlashblockTxMeta};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeriodicAuditMismatchOrigin {
+    SnapshotAnchorShape,
+    ReplayNonDeltaOutcome,
+    RebuiltOutputLength,
+    RebuiltOutputSemantic,
+    LiveFlashblockPrefix,
+    LiveOutputPrefix,
+    LiveAnchor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeriodicAuditOutputMismatchField {
+    Cursor,
+    BlockTimestamp,
+    Transactions,
+    Logs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeriodicAuditOutputMismatch {
+    pub index: usize,
+    pub field: PeriodicAuditOutputMismatchField,
+    pub expected_cursor: AuditCursor,
+    pub actual_cursor: AuditCursor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebuiltOutputMismatch {
+    Length { expected_len: usize, actual_len: usize },
+    Semantic(PeriodicAuditOutputMismatch),
+}
+
 /// Cursor identifying one retained fast output inside an audit window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AuditCursor {
@@ -60,12 +93,41 @@ impl RetainedFastOutput {
         }
     }
 
+    pub(crate) fn first_mismatch(
+        expected_outputs: &[Self],
+        actual_outputs: &[Self],
+    ) -> Option<PeriodicAuditOutputMismatch> {
+        expected_outputs.iter().zip(actual_outputs).enumerate().find_map(
+            |(index, (expected_output, actual_output))| {
+                expected_output.mismatch_field(actual_output).map(|field| {
+                    PeriodicAuditOutputMismatch {
+                        index,
+                        field,
+                        expected_cursor: expected_output.cursor,
+                        actual_cursor: actual_output.cursor,
+                    }
+                })
+            },
+        )
+    }
+
     /// Returns whether two retained outputs are semantically equivalent for audit purposes.
     pub fn semantically_matches(&self, other: &Self) -> bool {
-        self.cursor == other.cursor
-            && self.block_timestamp == other.block_timestamp
-            && self.transactions == other.transactions
-            && self.logs == other.logs
+        self.mismatch_field(other).is_none()
+    }
+
+    fn mismatch_field(&self, other: &Self) -> Option<PeriodicAuditOutputMismatchField> {
+        if self.cursor != other.cursor {
+            Some(PeriodicAuditOutputMismatchField::Cursor)
+        } else if self.block_timestamp != other.block_timestamp {
+            Some(PeriodicAuditOutputMismatchField::BlockTimestamp)
+        } else if self.transactions != other.transactions {
+            Some(PeriodicAuditOutputMismatchField::Transactions)
+        } else if self.logs != other.logs {
+            Some(PeriodicAuditOutputMismatchField::Logs)
+        } else {
+            None
+        }
     }
 }
 
@@ -137,19 +199,63 @@ impl AuditWindowSnapshot {
         &self,
         rebuilt_outputs: &[RetainedFastOutput],
     ) -> PeriodicAuditResult {
+        match self.rebuilt_output_mismatch(rebuilt_outputs) {
+            None => PeriodicAuditResult::EquivalentPrefix,
+            Some(RebuiltOutputMismatch::Length { expected_len, actual_len }) => {
+                warn!(
+                    message = "periodic audit rebuilt output mismatch",
+                    audit_origin = ?PeriodicAuditMismatchOrigin::RebuiltOutputLength,
+                    generation = self.generation,
+                    window_id = self.window_id,
+                    anchor_block_number = self.anchor_block_number,
+                    anchor_hash = %self.anchor_hash,
+                    audit_cursor = ?self.cursor,
+                    expected_len,
+                    rebuilt_len = actual_len,
+                );
+                PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch }
+            }
+            Some(RebuiltOutputMismatch::Semantic(mismatch)) => {
+                let expected_output = &self.expected_outputs[mismatch.index];
+                let rebuilt_output = &rebuilt_outputs[mismatch.index];
+
+                warn!(
+                    message = "periodic audit rebuilt output mismatch",
+                    audit_origin = ?PeriodicAuditMismatchOrigin::RebuiltOutputSemantic,
+                    generation = self.generation,
+                    window_id = self.window_id,
+                    anchor_block_number = self.anchor_block_number,
+                    anchor_hash = %self.anchor_hash,
+                    audit_cursor = ?self.cursor,
+                    output_index = mismatch.index,
+                    mismatch_field = ?mismatch.field,
+                    expected_cursor = ?mismatch.expected_cursor,
+                    rebuilt_cursor = ?mismatch.actual_cursor,
+                    expected_block_timestamp = expected_output.block_timestamp,
+                    rebuilt_block_timestamp = rebuilt_output.block_timestamp,
+                    expected_transactions = expected_output.transactions.len(),
+                    rebuilt_transactions = rebuilt_output.transactions.len(),
+                    expected_logs = expected_output.logs.len(),
+                    rebuilt_logs = rebuilt_output.logs.len(),
+                );
+                PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch }
+            }
+        }
+    }
+
+    fn rebuilt_output_mismatch(
+        &self,
+        rebuilt_outputs: &[RetainedFastOutput],
+    ) -> Option<RebuiltOutputMismatch> {
         if self.expected_outputs.len() != rebuilt_outputs.len() {
-            return PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch };
+            return Some(RebuiltOutputMismatch::Length {
+                expected_len: self.expected_outputs.len(),
+                actual_len: rebuilt_outputs.len(),
+            });
         }
 
-        if self.expected_outputs.iter().zip(rebuilt_outputs).all(
-            |(expected_output, rebuilt_output)| {
-                expected_output.semantically_matches(rebuilt_output)
-            },
-        ) {
-            PeriodicAuditResult::EquivalentPrefix
-        } else {
-            PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch }
-        }
+        RetainedFastOutput::first_mismatch(&self.expected_outputs, rebuilt_outputs)
+            .map(RebuiltOutputMismatch::Semantic)
     }
 }
 
@@ -188,7 +294,8 @@ mod tests {
     use alloy_rpc_types_engine::PayloadId;
 
     use super::{
-        AuditCursor, AuditWindowSnapshot, PeriodicAuditFailure, PeriodicAuditResult,
+        AuditCursor, AuditWindowSnapshot, PeriodicAuditFailure, PeriodicAuditOutputMismatch,
+        PeriodicAuditOutputMismatchField, PeriodicAuditResult, RebuiltOutputMismatch,
         RetainedFastOutput,
     };
     use crate::{
@@ -277,6 +384,45 @@ mod tests {
         assert_eq!(
             snapshot.compare_rebuilt_outputs(&[rebuilt]),
             PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch }
+        );
+    }
+
+    #[test]
+    fn periodic_audit_rebuilt_output_length_mismatch_is_classified() {
+        let expected = RetainedFastOutput::from_delta(&test_delta(1));
+        let snapshot = AuditWindowSnapshot::new(
+            7,
+            9,
+            10,
+            B256::with_last_byte(0x33),
+            expected.cursor,
+            vec![],
+            vec![expected],
+        );
+
+        assert_eq!(
+            snapshot.rebuilt_output_mismatch(&[]),
+            Some(RebuiltOutputMismatch::Length { expected_len: 1, actual_len: 0 })
+        );
+    }
+
+    #[test]
+    fn periodic_audit_rebuilt_output_semantic_mismatch_reports_first_field() {
+        let expected = RetainedFastOutput::from_delta(&test_delta(1));
+        let mut rebuilt = expected.clone();
+        rebuilt.block_timestamp = Some(1_700_000_099);
+
+        assert_eq!(
+            RetainedFastOutput::first_mismatch(
+                std::slice::from_ref(&expected),
+                std::slice::from_ref(&rebuilt),
+            ),
+            Some(PeriodicAuditOutputMismatch {
+                index: 0,
+                field: PeriodicAuditOutputMismatchField::BlockTimestamp,
+                expected_cursor: expected.cursor,
+                actual_cursor: expected.cursor,
+            })
         );
     }
 }

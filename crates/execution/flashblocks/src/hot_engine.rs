@@ -7,6 +7,7 @@ use alloy_consensus::{
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, BlockNumber};
 use alloy_rpc_types::state::StateOverride;
+use alloy_rpc_types_engine::PayloadId;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_common_evm::L1BlockInfo;
@@ -25,6 +26,7 @@ use crate::{
     FlashblockSnapshotId, HotExecutionState, HotPendingBlock, HotPendingWindow, HotSnapshot,
     HotWindowAnchor, Metrics, PendingStateBuilder, PeriodicAuditFailure, PeriodicAuditResult,
     ProviderError, Result, RetainedFastOutput, SequenceValidationResult, StateProcessorError,
+    periodic_audit::{PeriodicAuditMismatchOrigin, PeriodicAuditOutputMismatch},
 };
 
 /// Concrete DB state carried by the hot engine across pending flashblocks.
@@ -105,6 +107,35 @@ enum ShadowRebuildLiveRecheck {
     ReadyToSwap,
     EquivalentNoOp,
     ActiveFailed { failure: PeriodicAuditFailure },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayNonDeltaOutcome {
+    Duplicate,
+    CanonicalWindowChanged,
+    Reset,
+    InvalidateSession,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlashblockPrefixMismatch {
+    live_len: Option<usize>,
+    mismatch_index: Option<usize>,
+    expected_block_number: Option<BlockNumber>,
+    live_block_number: Option<BlockNumber>,
+    expected_flashblock_index: Option<u64>,
+    live_flashblock_index: Option<u64>,
+    expected_payload_id: Option<PayloadId>,
+    live_payload_id: Option<PayloadId>,
+    expected_parent_hash: Option<B256>,
+    live_parent_hash: Option<B256>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetainedOutputPrefixMismatch {
+    live_len: Option<usize>,
+    mismatch_index: Option<usize>,
+    mismatch: Option<PeriodicAuditOutputMismatch>,
 }
 
 /// Append-only exact-log engine.
@@ -275,6 +306,7 @@ where
         }
 
         if !snapshot.first_replayed_flashblock_matches_anchor() {
+            Self::log_snapshot_anchor_shape_mismatch(snapshot);
             return (
                 PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
                 None,
@@ -305,10 +337,49 @@ where
                 HotApplyOutcome::Delta { delta, .. } => {
                     rebuilt_outputs.push(RetainedFastOutput::from_delta(&delta));
                 }
-                HotApplyOutcome::Duplicate
-                | HotApplyOutcome::CanonicalWindowChanged
-                | HotApplyOutcome::Reset
-                | HotApplyOutcome::InvalidateSession { .. } => {
+                HotApplyOutcome::Duplicate => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::Duplicate,
+                        None,
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+                HotApplyOutcome::CanonicalWindowChanged => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::CanonicalWindowChanged,
+                        None,
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+                HotApplyOutcome::Reset => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::Reset,
+                        None,
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+                HotApplyOutcome::InvalidateSession { reason } => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::InvalidateSession,
+                        Some(reason),
+                    );
                     return (
                         PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
                         None,
@@ -383,42 +454,38 @@ where
         if self.window.anchor
             != HotWindowAnchor::new(snapshot.anchor_block_number, snapshot.anchor_hash)
         {
+            self.log_live_anchor_mismatch(snapshot);
             return ShadowRebuildLiveRecheck::ActiveFailed {
                 failure: PeriodicAuditFailure::AnchorMismatch,
             };
         }
 
-        let Some(live_flashblocks) =
-            self.window.retained_flashblocks_from_anchor(snapshot.anchor_block_number)
-        else {
-            return ShadowRebuildLiveRecheck::ActiveFailed {
-                failure: PeriodicAuditFailure::Mismatch,
-            };
-        };
-
-        if live_flashblocks.len() < snapshot.flashblocks.len()
-            || !Self::flashblock_prefix_matches(&snapshot.flashblocks, &live_flashblocks)
+        let live_flashblocks =
+            self.window.retained_flashblocks_from_anchor(snapshot.anchor_block_number);
+        if let Some(mismatch) =
+            Self::flashblock_prefix_mismatch(&snapshot.flashblocks, live_flashblocks.as_deref())
         {
+            Self::log_live_flashblock_prefix_mismatch(snapshot, &mismatch);
             return ShadowRebuildLiveRecheck::ActiveFailed {
                 failure: PeriodicAuditFailure::Mismatch,
             };
         }
 
-        let Some(live_outputs) =
-            self.window.retained_outputs_from_anchor(snapshot.anchor_block_number)
-        else {
-            return ShadowRebuildLiveRecheck::ActiveFailed {
-                failure: PeriodicAuditFailure::Mismatch,
-            };
-        };
-
-        if live_outputs.len() < snapshot.expected_outputs.len()
-            || !Self::retained_output_prefix_matches(&snapshot.expected_outputs, &live_outputs)
-        {
+        let live_outputs = self.window.retained_outputs_from_anchor(snapshot.anchor_block_number);
+        if let Some(mismatch) = Self::retained_output_prefix_mismatch(
+            &snapshot.expected_outputs,
+            live_outputs.as_deref(),
+        ) {
+            Self::log_live_output_prefix_mismatch(snapshot, mismatch);
             return ShadowRebuildLiveRecheck::ActiveFailed {
                 failure: PeriodicAuditFailure::Mismatch,
             };
         }
+
+        let live_flashblocks = live_flashblocks
+            .expect("matching live flashblocks should be available after prefix check");
+        let live_outputs =
+            live_outputs.expect("matching live outputs should be available after prefix check");
 
         if live_flashblocks.len() == snapshot.flashblocks.len()
             && live_outputs.len() == snapshot.expected_outputs.len()
@@ -516,6 +583,115 @@ where
         }
     }
 
+    fn log_snapshot_anchor_shape_mismatch(snapshot: &AuditWindowSnapshot) {
+        let first_flashblock = snapshot.flashblocks.first();
+
+        warn!(
+            message = "periodic audit snapshot anchor mismatch",
+            audit_origin = ?PeriodicAuditMismatchOrigin::SnapshotAnchorShape,
+            generation = snapshot.generation,
+            window_id = snapshot.window_id,
+            anchor_block_number = snapshot.anchor_block_number,
+            anchor_hash = %snapshot.anchor_hash,
+            audit_cursor = ?snapshot.cursor,
+            expected_first_block_number = ?snapshot.anchor_block_number.checked_add(1),
+            actual_first_block_number = ?first_flashblock.map(|flashblock| flashblock.metadata.block_number),
+            actual_first_flashblock_index = ?first_flashblock.map(|flashblock| flashblock.index),
+            actual_first_payload_id = ?first_flashblock.map(|flashblock| flashblock.payload_id),
+            actual_first_parent_hash = ?first_flashblock.and_then(Self::flashblock_parent_hash),
+            retained_flashblocks = snapshot.flashblocks.len(),
+            retained_outputs = snapshot.expected_outputs.len(),
+        );
+    }
+
+    fn log_replay_non_delta_outcome(
+        snapshot: &AuditWindowSnapshot,
+        flashblock: &Flashblock,
+        replay_outcome: ReplayNonDeltaOutcome,
+        replay_invalidation_reason: Option<HotInvalidationReason>,
+    ) {
+        warn!(
+            message = "periodic audit replay returned non-delta outcome",
+            audit_origin = ?PeriodicAuditMismatchOrigin::ReplayNonDeltaOutcome,
+            generation = snapshot.generation,
+            window_id = snapshot.window_id,
+            anchor_block_number = snapshot.anchor_block_number,
+            anchor_hash = %snapshot.anchor_hash,
+            audit_cursor = ?snapshot.cursor,
+            replay_block_number = flashblock.metadata.block_number,
+            replay_flashblock_index = flashblock.index,
+            replay_payload_id = ?flashblock.payload_id,
+            replay_parent_hash = ?Self::flashblock_parent_hash(flashblock),
+            replay_outcome = ?replay_outcome,
+            replay_invalidation_reason = ?replay_invalidation_reason,
+        );
+    }
+
+    fn log_live_anchor_mismatch(&self, snapshot: &AuditWindowSnapshot) {
+        warn!(
+            message = "periodic audit live recheck mismatch",
+            audit_origin = ?PeriodicAuditMismatchOrigin::LiveAnchor,
+            generation = snapshot.generation,
+            window_id = snapshot.window_id,
+            anchor_block_number = snapshot.anchor_block_number,
+            anchor_hash = %snapshot.anchor_hash,
+            audit_cursor = ?snapshot.cursor,
+            live_anchor_block_number = self.window.anchor.block_number(),
+            live_anchor_hash = %self.window.anchor.hash(),
+        );
+    }
+
+    fn log_live_flashblock_prefix_mismatch(
+        snapshot: &AuditWindowSnapshot,
+        mismatch: &FlashblockPrefixMismatch,
+    ) {
+        warn!(
+            message = "periodic audit live recheck mismatch",
+            audit_origin = ?PeriodicAuditMismatchOrigin::LiveFlashblockPrefix,
+            generation = snapshot.generation,
+            window_id = snapshot.window_id,
+            anchor_block_number = snapshot.anchor_block_number,
+            anchor_hash = %snapshot.anchor_hash,
+            audit_cursor = ?snapshot.cursor,
+            expected_len = snapshot.flashblocks.len(),
+            live_len = ?mismatch.live_len,
+            mismatch_index = ?mismatch.mismatch_index,
+            expected_block_number = ?mismatch.expected_block_number,
+            live_block_number = ?mismatch.live_block_number,
+            expected_flashblock_index = ?mismatch.expected_flashblock_index,
+            live_flashblock_index = ?mismatch.live_flashblock_index,
+            expected_payload_id = ?mismatch.expected_payload_id,
+            live_payload_id = ?mismatch.live_payload_id,
+            expected_parent_hash = ?mismatch.expected_parent_hash,
+            live_parent_hash = ?mismatch.live_parent_hash,
+        );
+    }
+
+    fn log_live_output_prefix_mismatch(
+        snapshot: &AuditWindowSnapshot,
+        mismatch: RetainedOutputPrefixMismatch,
+    ) {
+        warn!(
+            message = "periodic audit live recheck mismatch",
+            audit_origin = ?PeriodicAuditMismatchOrigin::LiveOutputPrefix,
+            generation = snapshot.generation,
+            window_id = snapshot.window_id,
+            anchor_block_number = snapshot.anchor_block_number,
+            anchor_hash = %snapshot.anchor_hash,
+            audit_cursor = ?snapshot.cursor,
+            expected_len = snapshot.expected_outputs.len(),
+            live_len = ?mismatch.live_len,
+            mismatch_index = ?mismatch.mismatch_index,
+            mismatch_field = ?mismatch.mismatch.map(|mismatch| mismatch.field),
+            expected_cursor = ?mismatch.mismatch.map(|mismatch| mismatch.expected_cursor),
+            live_cursor = ?mismatch.mismatch.map(|mismatch| mismatch.actual_cursor),
+        );
+    }
+
+    fn flashblock_parent_hash(flashblock: &Flashblock) -> Option<B256> {
+        flashblock.base.as_ref().map(|base| base.parent_hash)
+    }
+
     fn flashblock_wire_header_hash(flashblock: &Flashblock) -> Option<B256> {
         (flashblock.diff.block_hash != B256::ZERO).then_some(flashblock.diff.block_hash)
     }
@@ -524,21 +700,99 @@ where
         Ok(BlockAssembler::assemble(flashblocks)?.block.header.hash_slow())
     }
 
-    fn flashblock_prefix_matches(
+    fn flashblock_prefix_mismatch(
         expected_prefix: &[Flashblock],
-        actual_flashblocks: &[Flashblock],
-    ) -> bool {
-        expected_prefix.iter().zip(actual_flashblocks).all(
-            |(expected_flashblock, actual_flashblock)| expected_flashblock == actual_flashblock,
-        )
+        live_flashblocks: Option<&[Flashblock]>,
+    ) -> Option<FlashblockPrefixMismatch> {
+        let Some(live_flashblocks) = live_flashblocks else {
+            return (!expected_prefix.is_empty()).then(|| FlashblockPrefixMismatch {
+                live_len: None,
+                mismatch_index: Some(0),
+                expected_block_number: expected_prefix
+                    .first()
+                    .map(|flashblock| flashblock.metadata.block_number),
+                live_block_number: None,
+                expected_flashblock_index: expected_prefix
+                    .first()
+                    .map(|flashblock| flashblock.index),
+                live_flashblock_index: None,
+                expected_payload_id: expected_prefix
+                    .first()
+                    .map(|flashblock| flashblock.payload_id),
+                live_payload_id: None,
+                expected_parent_hash: expected_prefix
+                    .first()
+                    .and_then(Self::flashblock_parent_hash),
+                live_parent_hash: None,
+            });
+        };
+
+        if let Some(mismatch_index) = expected_prefix.iter().zip(live_flashblocks).position(
+            |(expected_flashblock, live_flashblock)| expected_flashblock != live_flashblock,
+        ) {
+            return Some(Self::flashblock_prefix_mismatch_at_index(
+                expected_prefix,
+                live_flashblocks,
+                mismatch_index,
+            ));
+        }
+
+        (live_flashblocks.len() < expected_prefix.len()).then(|| {
+            Self::flashblock_prefix_mismatch_at_index(
+                expected_prefix,
+                live_flashblocks,
+                live_flashblocks.len(),
+            )
+        })
     }
 
-    fn retained_output_prefix_matches(
+    fn flashblock_prefix_mismatch_at_index(
+        expected_prefix: &[Flashblock],
+        live_flashblocks: &[Flashblock],
+        mismatch_index: usize,
+    ) -> FlashblockPrefixMismatch {
+        let expected_flashblock = expected_prefix.get(mismatch_index);
+        let live_flashblock = live_flashblocks.get(mismatch_index);
+
+        FlashblockPrefixMismatch {
+            live_len: Some(live_flashblocks.len()),
+            mismatch_index: Some(mismatch_index),
+            expected_block_number: expected_flashblock
+                .map(|flashblock| flashblock.metadata.block_number),
+            live_block_number: live_flashblock.map(|flashblock| flashblock.metadata.block_number),
+            expected_flashblock_index: expected_flashblock.map(|flashblock| flashblock.index),
+            live_flashblock_index: live_flashblock.map(|flashblock| flashblock.index),
+            expected_payload_id: expected_flashblock.map(|flashblock| flashblock.payload_id),
+            live_payload_id: live_flashblock.map(|flashblock| flashblock.payload_id),
+            expected_parent_hash: expected_flashblock.and_then(Self::flashblock_parent_hash),
+            live_parent_hash: live_flashblock.and_then(Self::flashblock_parent_hash),
+        }
+    }
+
+    fn retained_output_prefix_mismatch(
         expected_prefix: &[RetainedFastOutput],
-        actual_outputs: &[RetainedFastOutput],
-    ) -> bool {
-        expected_prefix.iter().zip(actual_outputs).all(|(expected_output, actual_output)| {
-            expected_output.semantically_matches(actual_output)
+        live_outputs: Option<&[RetainedFastOutput]>,
+    ) -> Option<RetainedOutputPrefixMismatch> {
+        let Some(live_outputs) = live_outputs else {
+            return (!expected_prefix.is_empty()).then_some(RetainedOutputPrefixMismatch {
+                live_len: None,
+                mismatch_index: Some(0),
+                mismatch: None,
+            });
+        };
+
+        if let Some(mismatch) = RetainedFastOutput::first_mismatch(expected_prefix, live_outputs) {
+            return Some(RetainedOutputPrefixMismatch {
+                live_len: Some(live_outputs.len()),
+                mismatch_index: Some(mismatch.index),
+                mismatch: Some(mismatch),
+            });
+        }
+
+        (live_outputs.len() < expected_prefix.len()).then_some(RetainedOutputPrefixMismatch {
+            live_len: Some(live_outputs.len()),
+            mismatch_index: Some(live_outputs.len()),
+            mismatch: None,
         })
     }
 
@@ -1030,10 +1284,14 @@ mod tests {
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_storage_api::HeaderProvider;
 
-    use super::{HotApplyOutcome, HotEngine, HotInvalidationReason, HotPendingBlock};
+    use super::{
+        FlashblockPrefixMismatch, HotApplyOutcome, HotEngine, HotInvalidationReason,
+        HotPendingBlock, RetainedOutputPrefixMismatch,
+    };
     use crate::{
         BlockAssembler, HotWindowAnchor, PeriodicAuditFailure, PeriodicAuditResult,
         RetainedFastOutput, ShadowRebuildCompletion,
+        periodic_audit::{PeriodicAuditOutputMismatch, PeriodicAuditOutputMismatchField},
     };
 
     fn test_client() -> MockEthProvider<BasePrimitives, Arc<BaseChainSpec>> {
@@ -3046,6 +3304,98 @@ mod tests {
         );
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_live_flashblock_prefix_mismatch_is_classified() {
+        let canonical_parent_hash = B256::with_last_byte(0x44);
+        let expected_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0xa1; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx()],
+        );
+        let live_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0xa2; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx()],
+        );
+
+        let mismatch = HotEngine::<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>::
+            flashblock_prefix_mismatch(
+                std::slice::from_ref(&expected_flashblock),
+                Some(std::slice::from_ref(&live_flashblock)),
+            );
+
+        assert_eq!(
+            mismatch,
+            Some(FlashblockPrefixMismatch {
+                live_len: Some(1),
+                mismatch_index: Some(0),
+                expected_block_number: Some(1),
+                live_block_number: Some(1),
+                expected_flashblock_index: Some(0),
+                live_flashblock_index: Some(0),
+                expected_payload_id: Some(expected_flashblock.payload_id),
+                live_payload_id: Some(live_flashblock.payload_id),
+                expected_parent_hash: Some(canonical_parent_hash),
+                live_parent_hash: Some(canonical_parent_hash),
+            })
+        );
+    }
+
+    #[test]
+    fn hot_engine_live_output_prefix_mismatch_is_classified() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd8);
+        seed_sender_balance(&client, &first_block_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd8; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("live retained prefix should snapshot");
+        let expected_output = snapshot.expected_outputs[0].clone();
+        let mut live_output = expected_output.clone();
+        live_output.logs[0].log_index_in_block =
+            live_output.logs[0].log_index_in_block.saturating_add(1);
+
+        let mismatch = HotEngine::<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>::
+            retained_output_prefix_mismatch(
+                std::slice::from_ref(&expected_output),
+                Some(std::slice::from_ref(&live_output)),
+            );
+
+        assert_eq!(
+            mismatch,
+            Some(RetainedOutputPrefixMismatch {
+                live_len: Some(1),
+                mismatch_index: Some(0),
+                mismatch: Some(PeriodicAuditOutputMismatch {
+                    index: 0,
+                    field: PeriodicAuditOutputMismatchField::Logs,
+                    expected_cursor: expected_output.cursor,
+                    actual_cursor: live_output.cursor,
+                }),
+            })
+        );
     }
 
     #[test]
