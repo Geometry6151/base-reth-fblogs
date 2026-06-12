@@ -22,7 +22,7 @@ use tokio::sync::{
 use crate::{
     FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode,
     FlashblocksReceiver, HotSnapshot, HotSnapshotRing, PendingBlocks, SnapshotCache,
-    processor::{StateProcessor, StateUpdate},
+    processor::{StateProcessor, StateProcessorHandles, StateUpdate},
     snapshot_cache::{DEFAULT_SNAPSHOT_CACHE_CAPACITY, DEFAULT_SNAPSHOT_CACHE_TTL},
 };
 
@@ -87,7 +87,7 @@ impl FlashblocksState {
     }
 
     /// Returns the configured flashblocks runtime mode.
-    pub fn mode(&self) -> FlashblocksMode {
+    pub const fn mode(&self) -> FlashblocksMode {
         self.mode
     }
 
@@ -113,11 +113,13 @@ impl FlashblocksState {
             Arc::clone(&self.pending_blocks),
             self.max_pending_blocks_depth,
             self.mode,
-            Arc::clone(&self.rx),
-            self.fast_flashblock_sender.clone(),
-            self.flashblock_sender.clone(),
-            Arc::clone(&self.snapshot_cache),
-            Arc::clone(&self.hot_snapshot_ring),
+            StateProcessorHandles::new(
+                Arc::clone(&self.rx),
+                self.fast_flashblock_sender.clone(),
+                self.flashblock_sender.clone(),
+                Arc::clone(&self.snapshot_cache),
+                Arc::clone(&self.hot_snapshot_ring),
+            ),
         );
 
         tokio::spawn(async move {
@@ -261,7 +263,7 @@ mod tests {
                 receipts_root: B256::ZERO,
                 logs_bloom: Bloom::default(),
                 gas_used: 21_000,
-                block_hash: B256::ZERO,
+                block_hash: fixture_wire_block_hash(block_number, index),
                 transactions: vec![encoded_l1_info_tx()],
                 withdrawals: vec![],
                 withdrawals_root: B256::ZERO,
@@ -269,6 +271,14 @@ mod tests {
             },
             metadata: Metadata { block_number },
         }
+    }
+
+    fn fixture_wire_block_hash(block_number: u64, index: u64) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&block_number.to_be_bytes());
+        bytes[8..16].copy_from_slice(&index.to_be_bytes());
+        bytes[31] = 1;
+        B256::from(bytes)
     }
 
     async fn recv_fast_flashblock_event(
@@ -451,7 +461,7 @@ mod tests {
         };
 
         let mut malformed_flashblock =
-            test_flashblock(1, 1, PayloadId::new([0x52; 8]), parent_hash);
+            test_flashblock(1, 1, PayloadId::new([0x51; 8]), parent_hash);
         malformed_flashblock.diff.transactions = vec![Bytes::from_static(&[0x01])];
         state.on_flashblock_received(malformed_flashblock);
 
@@ -482,7 +492,7 @@ mod tests {
             .expect("initial hot snapshot should be retained");
 
         let mut malformed_flashblock =
-            test_flashblock(1, 1, PayloadId::new([0x62; 8]), parent_hash);
+            test_flashblock(1, 1, PayloadId::new([0x61; 8]), parent_hash);
         malformed_flashblock.diff.transactions = vec![Bytes::from_static(&[0x01])];
         state.on_flashblock_received(malformed_flashblock);
 
@@ -506,7 +516,7 @@ mod tests {
         state.on_flashblock_received(test_flashblock(
             1,
             2,
-            PayloadId::new([0x64; 8]),
+            PayloadId::new([0x63; 8]),
             B256::with_last_byte(0x11),
         ));
 
@@ -534,7 +544,7 @@ mod tests {
             .expect("initial hot snapshot should be retained");
 
         let mut malformed_flashblock =
-            test_flashblock(1, 1, PayloadId::new([0x72; 8]), parent_hash);
+            test_flashblock(1, 1, PayloadId::new([0x71; 8]), parent_hash);
         malformed_flashblock.diff.transactions = vec![Bytes::from_static(&[0x01])];
         state.on_flashblock_received(malformed_flashblock);
 

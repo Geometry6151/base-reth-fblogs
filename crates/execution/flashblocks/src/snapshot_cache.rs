@@ -114,13 +114,12 @@ impl SnapshotCache {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "metrics")]
+    use std::{collections::HashMap, sync::Mutex};
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
-
-    #[cfg(feature = "metrics")]
-    use std::{collections::HashMap, sync::Mutex};
 
     use alloy_consensus::{Header, Sealed};
     use alloy_primitives::B256;

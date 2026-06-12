@@ -1,9 +1,9 @@
 use std::{sync::Arc, time::Instant};
 
-use alloy_consensus::proofs::ordered_trie_root_with_encoder;
 use alloy_consensus::{
     Block, Header, TxReceipt,
     constants::EMPTY_WITHDRAWALS,
+    proofs::ordered_trie_root_with_encoder,
     transaction::{Recovered, TransactionMeta},
 };
 use alloy_eips::{Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
@@ -36,8 +36,10 @@ use revm::{
 };
 use revm_database::states::bundle_state::BundleRetention;
 
-use crate::hot_window::HotExecutedHeaderParts;
-use crate::{ExecutionError, Metrics, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
+use crate::{
+    ExecutionError, Metrics, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder,
+    hot_window::HotExecutedHeaderParts,
+};
 
 /// Represents the result of executing or fetching a cached pending transaction.
 #[derive(Debug, Clone)]
@@ -101,8 +103,7 @@ where
             prev_pending_blocks,
             l1_block_info,
             state_overrides,
-            0,
-            0,
+            (0, 0),
         )
     }
 
@@ -114,9 +115,10 @@ where
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         l1_block_info: L1BlockInfo,
         state_overrides: StateOverride,
-        cumulative_gas_used: u64,
-        next_log_index: usize,
+        cursors: (u64, usize),
     ) -> Self {
+        let (cumulative_gas_used, next_log_index) = cursors;
+
         Self {
             pending_block,
             evm,
@@ -523,14 +525,8 @@ where
         (State<StateProviderDatabase<StateProviderBox>>, StateOverride, HotExecutedHeaderParts),
         StateProcessorError,
     > {
-        let PendingStateBuilder {
-            cumulative_gas_used,
-            evm,
-            pending_block,
-            chain_spec,
-            state_overrides,
-            ..
-        } = self;
+        let Self { cumulative_gas_used, evm, pending_block, chain_spec, state_overrides, .. } =
+            self;
 
         let mut db = evm.into_db();
         let header_parts = PendingHeaderBuilder::from_post_state(
@@ -850,8 +846,7 @@ mod tests {
             None,
             L1BlockInfo::default(),
             StateOverride::default(),
-            42,
-            7,
+            (42, 7),
         );
 
         assert_eq!(builder.cumulative_gas_used, 42);

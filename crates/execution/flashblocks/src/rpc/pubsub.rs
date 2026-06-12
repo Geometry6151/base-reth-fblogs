@@ -439,11 +439,10 @@ async fn pipe_flashblock_logs_batch_from_fast_delta_subscription(
                 };
 
                 let batch = base_metrics::time!(Metrics::logs_batch_build_duration(), {
-                    if let Some(filter) = filter.as_ref() {
-                        FlashblockLogsBatch::from_fast_delta(&delta.filtered(filter))
-                    } else {
-                        FlashblockLogsBatch::from_fast_delta(delta.as_ref())
-                    }
+                    filter.as_ref().map_or_else(
+                        || FlashblockLogsBatch::from_fast_delta(delta.as_ref()),
+                        |filter| FlashblockLogsBatch::from_fast_delta(&delta.filtered(filter)),
+                    )
                 });
 
                 if !send_subscription_item(&sink, &batch, Some(PubSubMetric::LogsBatch)).await {
@@ -665,9 +664,8 @@ mod tests {
     use serde_json::Value;
     use tokio::{sync::broadcast, time::timeout};
 
-    use crate::{FastFlashblockLogsDelta, FlashblockSnapshotId};
-
     use super::*;
+    use crate::{FastFlashblockLogsDelta, FlashblockSnapshotId};
 
     #[tokio::test]
     async fn fast_flashblock_update_resync_keeps_fast_subscription_open() {

@@ -109,12 +109,12 @@ pub(super) fn unsupported_in_hot_only(
     method: &'static str,
     replacement: Option<&'static str>,
 ) -> ErrorObjectOwned {
-    let message = match replacement {
-        Some(replacement) => {
+    let message = replacement.map_or_else(
+        || format!("{method} is unsupported in flashblocks hot-only mode"),
+        |replacement| {
             format!("{method} is unsupported in flashblocks hot-only mode; use {replacement}")
-        }
-        None => format!("{method} is unsupported in flashblocks hot-only mode"),
-    };
+        },
+    );
 
     ErrorObjectOwned::owned(INVALID_PARAMS_CODE, message, None::<()>)
 }

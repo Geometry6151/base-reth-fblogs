@@ -1,7 +1,5 @@
 //! Suffix-only hot engine for speed-first flashblock logs.
 
-use std::collections::HashMap;
-
 use alloy_consensus::{
     Header, Sealed, TxReceipt,
     transaction::{Recovered, SignerRecoverable},
@@ -13,7 +11,6 @@ use base_common_chains::Upgrades;
 use base_common_consensus::{BaseBlock, BaseTxEnvelope};
 use base_common_evm::L1BlockInfo;
 use base_common_flashblocks::{ExecutionPayloadBaseV1, Flashblock};
-use base_common_rpc_types::BaseTransactionReceipt;
 use base_execution_evm::BaseEvmConfig;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::ConfigureEvm;
@@ -22,17 +19,27 @@ use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_revm::{State, database::StateProviderDatabase};
 use reth_storage_api::StateProviderBox;
 
-use crate::hot_window::HotExecutedHeaderParts;
-use crate::state_builder::PendingHeaderBuilder;
 use crate::{
-    BlockAssembler, ExecutionError, FastFlashblockLog, FastFlashblockLogsDelta,
-    FastFlashblockTxMeta, FlashblockSequenceValidator, FlashblockSnapshotId, HotExecutionState,
-    HotPendingBlock, HotPendingWindow, HotSnapshot, Metrics, PendingStateBuilder, ProviderError,
-    Result, RetainedVerifiedBlock, SequenceValidationResult, StateProcessorError,
+    AuditWindowSnapshot, BlockAssembler, ExecutionError, FastFlashblockLog,
+    FastFlashblockLogsDelta, FastFlashblockTxMeta, FlashblockSequenceValidator,
+    FlashblockSnapshotId, HotExecutionState, HotPendingBlock, HotPendingWindow, HotSnapshot,
+    HotWindowAnchor, Metrics, PendingStateBuilder, PeriodicAuditFailure, PeriodicAuditResult,
+    ProviderError, Result, RetainedFastOutput, SequenceValidationResult, StateProcessorError,
 };
 
 /// Concrete DB state carried by the hot engine across pending flashblocks.
 pub type HotExecutionDb = State<StateProviderDatabase<StateProviderBox>>;
+
+struct SuffixExecutionInput<'a> {
+    flashblock: &'a Flashblock,
+    wire_header_hash: B256,
+    execution_block: BaseBlock,
+    decoded_transactions: Vec<BaseTxEnvelope>,
+    l1_block_info: L1BlockInfo,
+    apply_pre_execution_changes: bool,
+    pre_execution_parent_hash: B256,
+    canonical_base_parent_hash: B256,
+}
 
 /// Result of applying one flashblock to the hot engine.
 #[derive(Debug)]
@@ -40,14 +47,16 @@ pub enum HotApplyOutcome {
     /// A new delta and optional pinned snapshot were produced.
     Delta {
         /// Delta emitted for the applied flashblock.
-        delta: FastFlashblockLogsDelta,
+        delta: Box<FastFlashblockLogsDelta>,
         /// Optional pinned snapshot derived from the same post-apply state.
-        snapshot: Option<HotSnapshot>,
-        /// Previous pending block number that was verified by this rollover child, if any.
-        verified_parent_ready: Option<BlockNumber>,
+        snapshot: Option<Box<HotSnapshot>>,
+        /// Block number whose cached suffixes can now be drained, if any.
+        ready_cached_block: Option<BlockNumber>,
     },
     /// The flashblock was already applied.
     Duplicate,
+    /// Canonical reconciliation internally pruned the hot window without pubsub output.
+    CanonicalWindowChanged,
     /// The hot engine requires a downstream reset/resync.
     Reset,
     /// The hot engine encountered an unrecoverable speculative inconsistency.
@@ -60,14 +69,44 @@ pub enum HotApplyOutcome {
 /// Hard invalidation reason for a speculative hot session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotInvalidationReason {
-    /// First child of a speculative rollover disagreed with the locally sealed parent hash.
+    /// First child of a speculative rollover disagreed with the retained wire parent commitment.
     SpeculativeParentMismatch,
-    /// A canonical block disagreed with a previously retained verified speculative proof.
+    /// A canonical block disagreed with previously retained reconciliation state.
     CanonicalConflict,
     /// Retained speculative suffixes could not be replayed soundly from canonical state.
     UnrecoverableReplayFailure,
-    /// The speculative chain exceeded the anchor-relative depth limit without a sound soft rebase.
+    /// The speculative chain exceeded the anchor-relative depth limit and must fail closed.
     SpeculativeDepthExceeded,
+    /// The live flashblock stream changed shape within an active speculative session.
+    ContinuityViolation,
+    /// Periodic shadow rebuild failed for the active retained prefix.
+    PeriodicAuditFailed {
+        /// Audit failure category reported by the shadow rebuild.
+        failure: PeriodicAuditFailure,
+    },
+}
+
+/// Outcome of completing one shadow rebuild against the live hot engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShadowRebuildCompletion {
+    /// The rebuild remained equivalent and replaced the live retained window.
+    EquivalentSwapped,
+    /// The rebuild remained equivalent, but the live window advanced so no swap occurred.
+    EquivalentNoOp,
+    /// The result belonged to an older generation or window and was ignored.
+    StaleIgnored,
+    /// The active retained window diverged or failed and should be closed.
+    ActiveFailed {
+        /// Failure category reported by the active completion path.
+        failure: PeriodicAuditFailure,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowRebuildLiveRecheck {
+    ReadyToSwap,
+    EquivalentNoOp,
+    ActiveFailed { failure: PeriodicAuditFailure },
 }
 
 /// Append-only exact-log engine.
@@ -130,14 +169,16 @@ where
         ) {
             SequenceValidationResult::NextInSequence => self.append_same_block_suffix(flashblock),
             SequenceValidationResult::FirstOfNextBlock => self.rollover_to_next_block(flashblock),
-            SequenceValidationResult::Duplicate => Ok(HotApplyOutcome::Duplicate),
+            SequenceValidationResult::Duplicate => {
+                Ok(self.same_block_duplicate_outcome(flashblock))
+            }
             SequenceValidationResult::NonSequentialGap { .. } => {
                 Metrics::hot_window_reset_sequence_gap_count().increment(1);
-                Ok(self.reset_for_flashblock())
+                Ok(self.invalidate_session(HotInvalidationReason::ContinuityViolation))
             }
             SequenceValidationResult::InvalidNewBlockIndex { .. } => {
                 Metrics::hot_window_reset_invalid_new_block_index_count().increment(1);
-                Ok(self.reset_for_flashblock())
+                Ok(self.invalidate_session(HotInvalidationReason::ContinuityViolation))
             }
         }
     }
@@ -151,103 +192,244 @@ where
             return Ok(HotApplyOutcome::Duplicate);
         }
 
-        let Some(latest_pending_block) = self.window.blocks.back() else {
+        let anchor = self.window.anchor;
+        let canonical_hash = block.header().hash_slow();
+
+        if block.number < anchor.block_number() {
             return Ok(HotApplyOutcome::Duplicate);
-        };
-        let latest_pending_block_number = latest_pending_block.block_number;
-
-        if block.number >= latest_pending_block_number {
-            if !self.canonical_catchup_matches_retained_verified_blocks(block)? {
-                return Ok(self.invalidate_session(HotInvalidationReason::CanonicalConflict));
-            }
-
-            return Ok(self.reset_for_canonical());
         }
 
-        if let Some(retained_verified_block) = self
-            .window
-            .verified_blocks
-            .iter()
-            .find(|retained_verified_block| retained_verified_block.block_number == block.number)
-            .cloned()
-        {
-            if !Self::canonical_block_matches_verified_block(&retained_verified_block, block) {
-                return Ok(self.invalidate_session(HotInvalidationReason::CanonicalConflict));
-            }
-
-            let retained_flashblocks = Self::retained_flashblocks(
-                self.window
-                    .blocks
-                    .iter()
-                    .filter(|pending_block| pending_block.block_number > block.number),
-            );
-            let expected_verified_blocks = self.retained_verified_blocks_above(block.number);
-
-            return Ok(self.replay_retained_flashblocks_from_canonical(
-                retained_flashblocks,
-                expected_verified_blocks,
-                Some(HotInvalidationReason::UnrecoverableReplayFailure),
-            ));
+        if block.number == anchor.block_number() {
+            return Ok(if canonical_hash == anchor.hash() {
+                HotApplyOutcome::Duplicate
+            } else {
+                self.reset_for_canonical()
+            });
         }
 
         let Some(oldest_pending_block) = self.window.blocks.front() else {
             return Ok(HotApplyOutcome::Duplicate);
         };
         let oldest_pending_block_number = oldest_pending_block.block_number;
-        let oldest_pending_parent_hash = oldest_pending_block.parent_hash;
+        let latest_pending_block_number = self
+            .window
+            .blocks
+            .back()
+            .map(|pending_block| pending_block.block_number)
+            .unwrap_or(oldest_pending_block_number);
 
-        if block.number > oldest_pending_block_number {
+        if block.number < oldest_pending_block_number || block.number > latest_pending_block_number
+        {
             return Ok(self.reset_for_canonical());
         }
 
-        if block.number == oldest_pending_block_number {
-            let pending_matches =
-                self.canonical_block_matches_oldest_pending_block(block).unwrap_or(false);
-            if !pending_matches {
-                return Ok(self.reset_for_canonical());
+        if block.number != oldest_pending_block_number
+            || !Self::canonical_block_matches_pending_block(oldest_pending_block, block)
+        {
+            return Ok(self.reset_for_canonical());
+        }
+
+        let Some(next_pending_block) = self.window.blocks.get(1) else {
+            return Ok(self.reset_for_canonical());
+        };
+
+        if next_pending_block.parent_hash != canonical_hash {
+            return Ok(self.reset_for_canonical());
+        }
+
+        self.window.prune_canonicalized_prefix_through(block.number, canonical_hash);
+        Ok(HotApplyOutcome::CanonicalWindowChanged)
+    }
+
+    /// Rebuilds a fresh shadow hot engine from one immutable audit snapshot.
+    pub fn rebuild_shadow_from_snapshot(
+        client: Client,
+        max_depth: u64,
+        snapshot: &AuditWindowSnapshot,
+    ) -> (PeriodicAuditResult, Option<Self>) {
+        Self::rebuild_shadow_from_snapshot_with_cancellation(client, max_depth, snapshot, || false)
+    }
+
+    /// Rebuilds a shadow hot engine while cooperatively honoring cancellation checks.
+    pub fn rebuild_shadow_from_snapshot_with_cancellation<F>(
+        client: Client,
+        max_depth: u64,
+        snapshot: &AuditWindowSnapshot,
+        mut is_cancelled: F,
+    ) -> (PeriodicAuditResult, Option<Self>)
+    where
+        F: FnMut() -> bool,
+    {
+        match Self::canonical_anchor_matches_snapshot(&client, snapshot) {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::AnchorMismatch },
+                    None,
+                );
+            }
+            Err(_error) => {
+                return (
+                    PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::WorkerError },
+                    None,
+                );
+            }
+        }
+
+        if !snapshot.first_replayed_flashblock_matches_anchor() {
+            return (
+                PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                None,
+            );
+        }
+
+        let mut shadow_engine = Self::new(client, max_depth);
+        let mut rebuilt_outputs = Vec::with_capacity(snapshot.flashblocks.len());
+
+        for flashblock in &snapshot.flashblocks {
+            if is_cancelled() {
+                return (PeriodicAuditResult::StaleIgnored, None);
             }
 
-            let retained_flashblocks = Self::retained_flashblocks(
-                self.window
-                    .blocks
-                    .iter()
-                    .filter(|pending_block| pending_block.block_number > block.number),
-            );
-            let expected_verified_blocks = self.retained_verified_blocks_above(block.number);
-            let failure_reason = (!expected_verified_blocks.is_empty())
-                .then_some(HotInvalidationReason::UnrecoverableReplayFailure);
+            let outcome = match shadow_engine.apply_flashblock(flashblock) {
+                Ok(outcome) => outcome,
+                Err(_error) => {
+                    return (
+                        PeriodicAuditResult::Diverged {
+                            failure: PeriodicAuditFailure::WorkerError,
+                        },
+                        None,
+                    );
+                }
+            };
 
-            return Ok(self.replay_retained_flashblocks_from_canonical(
-                retained_flashblocks,
-                expected_verified_blocks,
-                failure_reason,
-            ));
+            match outcome {
+                HotApplyOutcome::Delta { delta, .. } => {
+                    rebuilt_outputs.push(RetainedFastOutput::from_delta(&delta));
+                }
+                HotApplyOutcome::Duplicate
+                | HotApplyOutcome::CanonicalWindowChanged
+                | HotApplyOutcome::Reset
+                | HotApplyOutcome::InvalidateSession { .. } => {
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+            }
         }
 
-        if block.number + 1 == oldest_pending_block_number
-            && block.header().hash_slow() != oldest_pending_parent_hash
+        if is_cancelled() {
+            return (PeriodicAuditResult::StaleIgnored, None);
+        }
+
+        let audit_result = snapshot.compare_rebuilt_outputs(&rebuilt_outputs);
+
+        if audit_result == PeriodicAuditResult::EquivalentPrefix {
+            (audit_result, Some(shadow_engine))
+        } else {
+            (audit_result, None)
+        }
+    }
+
+    /// Completes one shadow rebuild against the current live hot engine.
+    pub fn complete_shadow_rebuild(
+        &mut self,
+        active_generation: u64,
+        active_window_id: u64,
+        snapshot: &AuditWindowSnapshot,
+        audit_result: PeriodicAuditResult,
+        rebuilt_engine: Option<Self>,
+    ) -> ShadowRebuildCompletion {
+        if snapshot.generation != active_generation || snapshot.window_id != active_window_id {
+            return ShadowRebuildCompletion::StaleIgnored;
+        }
+
+        match audit_result {
+            PeriodicAuditResult::EquivalentPrefix => match self
+                .recheck_live_window_against_snapshot(snapshot)
+            {
+                ShadowRebuildLiveRecheck::ReadyToSwap => {
+                    let Some(mut rebuilt_engine) = rebuilt_engine else {
+                        self.reset();
+                        return ShadowRebuildCompletion::ActiveFailed {
+                            failure: PeriodicAuditFailure::WorkerError,
+                        };
+                    };
+
+                    let next_snapshot_nonce = self.next_snapshot_nonce;
+                    rebuilt_engine.next_snapshot_nonce = next_snapshot_nonce;
+                    self.window = rebuilt_engine.window;
+                    self.next_snapshot_nonce = next_snapshot_nonce;
+
+                    ShadowRebuildCompletion::EquivalentSwapped
+                }
+                ShadowRebuildLiveRecheck::EquivalentNoOp => ShadowRebuildCompletion::EquivalentNoOp,
+                ShadowRebuildLiveRecheck::ActiveFailed { failure } => {
+                    self.reset();
+                    ShadowRebuildCompletion::ActiveFailed { failure }
+                }
+            },
+            PeriodicAuditResult::Diverged { failure } => {
+                self.reset();
+                ShadowRebuildCompletion::ActiveFailed { failure }
+            }
+            PeriodicAuditResult::StaleIgnored => ShadowRebuildCompletion::StaleIgnored,
+        }
+    }
+
+    fn recheck_live_window_against_snapshot(
+        &self,
+        snapshot: &AuditWindowSnapshot,
+    ) -> ShadowRebuildLiveRecheck {
+        if self.window.anchor
+            != HotWindowAnchor::new(snapshot.anchor_block_number, snapshot.anchor_hash)
         {
-            let has_retained_verified_proofs =
-                self.window.verified_blocks.iter().any(|retained_verified_block| {
-                    retained_verified_block.block_number > block.number
-                });
-
-            return Ok(if has_retained_verified_proofs {
-                self.invalidate_session(HotInvalidationReason::CanonicalConflict)
-            } else {
-                self.reset_for_canonical()
-            });
+            return ShadowRebuildLiveRecheck::ActiveFailed {
+                failure: PeriodicAuditFailure::AnchorMismatch,
+            };
         }
 
-        let retained_flashblocks = Self::retained_flashblocks(self.window.blocks.iter());
-        let expected_verified_blocks = self.retained_verified_blocks_above(block.number);
-        let failure_reason = (!expected_verified_blocks.is_empty())
-            .then_some(HotInvalidationReason::UnrecoverableReplayFailure);
-        Ok(self.replay_retained_flashblocks_from_canonical(
-            retained_flashblocks,
-            expected_verified_blocks,
-            failure_reason,
-        ))
+        let Some(live_flashblocks) =
+            self.window.retained_flashblocks_from_anchor(snapshot.anchor_block_number)
+        else {
+            return ShadowRebuildLiveRecheck::ActiveFailed {
+                failure: PeriodicAuditFailure::Mismatch,
+            };
+        };
+
+        if live_flashblocks.len() < snapshot.flashblocks.len()
+            || !Self::flashblock_prefix_matches(&snapshot.flashblocks, &live_flashblocks)
+        {
+            return ShadowRebuildLiveRecheck::ActiveFailed {
+                failure: PeriodicAuditFailure::Mismatch,
+            };
+        }
+
+        let Some(live_outputs) =
+            self.window.retained_outputs_from_anchor(snapshot.anchor_block_number)
+        else {
+            return ShadowRebuildLiveRecheck::ActiveFailed {
+                failure: PeriodicAuditFailure::Mismatch,
+            };
+        };
+
+        if live_outputs.len() < snapshot.expected_outputs.len()
+            || !Self::retained_output_prefix_matches(&snapshot.expected_outputs, &live_outputs)
+        {
+            return ShadowRebuildLiveRecheck::ActiveFailed {
+                failure: PeriodicAuditFailure::Mismatch,
+            };
+        }
+
+        if live_flashblocks.len() == snapshot.flashblocks.len()
+            && live_outputs.len() == snapshot.expected_outputs.len()
+            && self.window.latest_audit_cursor() == Some(snapshot.cursor)
+        {
+            ShadowRebuildLiveRecheck::ReadyToSwap
+        } else {
+            ShadowRebuildLiveRecheck::EquivalentNoOp
+        }
     }
 
     /// Resets the current pending hot window.
@@ -260,7 +442,7 @@ where
         HotApplyOutcome::InvalidateSession { reason }
     }
 
-    fn next_snapshot_nonce(&mut self) -> u64 {
+    const fn next_snapshot_nonce(&mut self) -> u64 {
         self.next_snapshot_nonce = self.next_snapshot_nonce.saturating_add(1);
         self.next_snapshot_nonce
     }
@@ -277,236 +459,98 @@ where
         HotApplyOutcome::Reset
     }
 
-    fn replay_retained_flashblocks_from_canonical(
+    fn canonical_anchor_matches_snapshot(
+        client: &Client,
+        snapshot: &AuditWindowSnapshot,
+    ) -> Result<bool> {
+        let Some(anchor_header) = client
+            .header_by_number(snapshot.anchor_block_number)
+            .map_err(|error| ProviderError::StateProvider(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+
+        Ok(anchor_header.hash_slow() == snapshot.anchor_hash)
+    }
+
+    fn same_block_continuity_outcome(
         &mut self,
-        flashblocks: Vec<Flashblock>,
-        expected_verified_blocks: Vec<RetainedVerifiedBlock>,
-        failure_reason: Option<HotInvalidationReason>,
-    ) -> HotApplyOutcome {
-        if flashblocks.is_empty() {
-            self.reset();
-            return HotApplyOutcome::Duplicate;
+        flashblock: &Flashblock,
+    ) -> Option<HotApplyOutcome> {
+        let Some(active_block) = self.window.active_block() else {
+            Metrics::hot_window_reset_missing_active_block_count().increment(1);
+            return Some(self.reset_for_flashblock());
+        };
+
+        let payload_id_mismatch = flashblock.payload_id != active_block.payload_id;
+        let base_mismatch = flashblock.base.as_ref().is_some_and(|base| base != &active_block.base);
+
+        if payload_id_mismatch {
+            return Some(self.invalidate_session(HotInvalidationReason::ContinuityViolation));
         }
 
-        if self.silently_replay_flashblocks(flashblocks, &expected_verified_blocks) {
-            HotApplyOutcome::Duplicate
-        } else if let Some(reason) = failure_reason {
-            self.invalidate_session(reason)
-        } else {
-            self.reset_for_canonical()
+        if base_mismatch {
+            Metrics::hot_window_reset_same_block_parent_mismatch_count().increment(1);
+            return Some(self.invalidate_session(HotInvalidationReason::ContinuityViolation));
         }
+
+        None
     }
 
-    fn silently_replay_flashblocks(
-        &mut self,
-        flashblocks: Vec<Flashblock>,
-        expected_verified_blocks: &[RetainedVerifiedBlock],
-    ) -> bool {
-        let _silent_replay_timer = base_metrics::timed!(Metrics::hot_silent_replay_duration());
-        Metrics::hot_silent_replay_flashblock_count().record(flashblocks.len() as f64);
-        Metrics::hot_silent_replay_expected_verified_count()
-            .record(expected_verified_blocks.len() as f64);
-
-        let expected_verified_blocks = expected_verified_blocks
-            .iter()
-            .map(|retained_verified_block| {
-                (retained_verified_block.block_number, retained_verified_block.clone())
-            })
-            .collect::<HashMap<_, _>>();
-        let mut verified_matches = 0usize;
-        let snapshot_nonce = self.next_snapshot_nonce;
-        self.window.reset();
-
-        for flashblock in flashblocks {
-            let outcome = match self.apply_flashblock(&flashblock) {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    self.next_snapshot_nonce = snapshot_nonce;
-                    self.window.reset();
-                    return false;
-                }
-            };
-
-            match outcome {
-                HotApplyOutcome::Delta { verified_parent_ready, .. } => {
-                    if let Some(verified_parent_ready) = verified_parent_ready {
-                        let Some(expected_verified_block) =
-                            expected_verified_blocks.get(&verified_parent_ready)
-                        else {
-                            self.next_snapshot_nonce = snapshot_nonce;
-                            self.window.reset();
-                            return false;
-                        };
-                        let Some(actual_verified_block) = self.window.verified_blocks.back() else {
-                            self.next_snapshot_nonce = snapshot_nonce;
-                            self.window.reset();
-                            return false;
-                        };
-
-                        if !Self::retained_verified_block_matches(
-                            actual_verified_block,
-                            expected_verified_block,
-                        ) {
-                            self.next_snapshot_nonce = snapshot_nonce;
-                            self.window.reset();
-                            return false;
-                        }
-
-                        verified_matches = verified_matches.saturating_add(1);
-                    }
-                }
-                HotApplyOutcome::Duplicate => {}
-                HotApplyOutcome::Reset | HotApplyOutcome::InvalidateSession { .. } => {
-                    self.next_snapshot_nonce = snapshot_nonce;
-                    self.window.reset();
-                    return false;
-                }
-            }
+    fn same_block_duplicate_outcome(&mut self, flashblock: &Flashblock) -> HotApplyOutcome {
+        if let Some(outcome) = self.same_block_continuity_outcome(flashblock) {
+            return outcome;
         }
 
-        if verified_matches != expected_verified_blocks.len() {
-            self.next_snapshot_nonce = snapshot_nonce;
-            self.window.reset();
-            return false;
-        }
+        let Some(active_block) = self.window.active_block() else {
+            Metrics::hot_window_reset_missing_active_block_count().increment(1);
+            return self.reset_for_flashblock();
+        };
 
-        self.next_snapshot_nonce = snapshot_nonce;
-        true
-    }
-
-    fn retained_flashblocks<'a>(
-        blocks: impl Iterator<Item = &'a HotPendingBlock>,
-    ) -> Vec<Flashblock> {
-        blocks.flat_map(|block| block.flashblocks.iter().cloned()).collect()
-    }
-
-    fn retained_verified_blocks_above(
-        &self,
-        block_number: BlockNumber,
-    ) -> Vec<RetainedVerifiedBlock> {
-        self.window
-            .verified_blocks
-            .iter()
-            .filter(|retained_verified_block| retained_verified_block.block_number > block_number)
-            .cloned()
-            .collect()
-    }
-
-    fn with_verified_parent_ready(
-        outcome: HotApplyOutcome,
-        verified_parent_ready: Option<BlockNumber>,
-    ) -> HotApplyOutcome {
-        match outcome {
-            HotApplyOutcome::Delta { delta, snapshot, .. } => {
-                HotApplyOutcome::Delta { delta, snapshot, verified_parent_ready }
-            }
-            outcome => outcome,
-        }
-    }
-
-    fn speculative_depth_after_next_block(&self, next_block_number: BlockNumber) -> BlockNumber {
-        next_block_number.saturating_sub(self.window.speculative_anchor_block)
-    }
-
-    fn soft_rebase_for_depth(
-        &mut self,
-        eligible_anchor: &RetainedVerifiedBlock,
-        retained_previous_pending_block: &RetainedVerifiedBlock,
-    ) -> Result<Option<bool>> {
-        let _soft_rebase_timer = base_metrics::timed!(Metrics::hot_soft_rebase_duration());
-
-        if eligible_anchor.block_number == retained_previous_pending_block.block_number {
-            Metrics::hot_soft_rebase_replayed_flashblock_count().record(0.0);
-            Metrics::hot_soft_rebase_success_count().increment(1);
-            self.reset();
-            return Ok(Some(true));
-        }
-
-        let retained_flashblocks = Self::retained_flashblocks(
-            self.window
-                .blocks
-                .iter()
-                .filter(|pending_block| pending_block.block_number > eligible_anchor.block_number),
-        );
-        let expected_verified_blocks = self
-            .window
-            .verified_blocks
-            .iter()
-            .filter(|retained_verified_block| {
-                retained_verified_block.block_number > eligible_anchor.block_number
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        Metrics::hot_soft_rebase_replayed_flashblock_count()
-            .record(retained_flashblocks.len() as f64);
-
-        if !self.silently_replay_flashblocks(retained_flashblocks, &expected_verified_blocks) {
-            Metrics::hot_soft_rebase_failure_count().increment(1);
-            return Ok(None);
-        }
-
-        let replayed_tip_header = self.seal_active_pending_block()?;
-        let replayed_tip = self.retained_verified_active_pending_block(replayed_tip_header)?;
-        if !Self::retained_verified_block_matches(&replayed_tip, retained_previous_pending_block) {
-            Metrics::hot_soft_rebase_failure_count().increment(1);
-            return Ok(None);
-        }
-
-        Metrics::hot_soft_rebase_success_count().increment(1);
-        Ok(Some(false))
-    }
-
-    fn freshest_eligible_canonical_anchor(
-        &self,
-        retained_previous_pending_block: Option<&RetainedVerifiedBlock>,
-    ) -> Result<Option<RetainedVerifiedBlock>> {
-        for retained_verified_block in self
-            .window
-            .verified_blocks
-            .iter()
-            .chain(retained_previous_pending_block.into_iter())
-            .rev()
+        match usize::try_from(flashblock.index)
+            .ok()
+            .and_then(|index| active_block.flashblocks.get(index))
         {
-            let Some(canonical_header) = self
-                .client
-                .header_by_number(retained_verified_block.block_number)
-                .map_err(|error| ProviderError::StateProvider(error.to_string()))?
-            else {
-                continue;
-            };
-
-            if canonical_header.hash_slow() == retained_verified_block.sealed_header.hash() {
-                return Ok(Some(retained_verified_block.clone()));
+            Some(previous_flashblock) if previous_flashblock == flashblock => {
+                HotApplyOutcome::Duplicate
             }
+            _ => self.invalidate_session(HotInvalidationReason::ContinuityViolation),
         }
-
-        Ok(None)
     }
 
-    fn retained_verified_active_pending_block(
-        &self,
-        sealed_header: Sealed<Header>,
-    ) -> Result<RetainedVerifiedBlock> {
-        let pending_block = self.window.active_block().ok_or_else(|| {
-            StateProcessorError::HotEngine(
-                "missing active pending block while retaining speculative proof".to_string(),
-            )
-        })?;
+    fn flashblock_wire_header_hash(flashblock: &Flashblock) -> Option<B256> {
+        (flashblock.diff.block_hash != B256::ZERO).then_some(flashblock.diff.block_hash)
+    }
 
-        Ok(RetainedVerifiedBlock {
-            block_number: pending_block.block_number,
-            parent_hash: pending_block.parent_hash,
-            sealed_header,
-            transaction_hashes: pending_block
-                .transactions
-                .iter()
-                .map(|transaction| transaction.hash)
-                .collect(),
+    fn flashblock_prefix_matches(
+        expected_prefix: &[Flashblock],
+        actual_flashblocks: &[Flashblock],
+    ) -> bool {
+        expected_prefix.iter().zip(actual_flashblocks).all(
+            |(expected_flashblock, actual_flashblock)| expected_flashblock == actual_flashblock,
+        )
+    }
+
+    fn retained_output_prefix_matches(
+        expected_prefix: &[RetainedFastOutput],
+        actual_outputs: &[RetainedFastOutput],
+    ) -> bool {
+        expected_prefix.iter().zip(actual_outputs).all(|(expected_output, actual_output)| {
+            expected_output.semantically_matches(actual_output)
         })
     }
 
+    const fn speculative_depth_after_next_block(
+        &self,
+        next_block_number: BlockNumber,
+    ) -> BlockNumber {
+        next_block_number.saturating_sub(self.window.anchor.block_number())
+    }
+
     fn start_first_flashblock(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
+        let Some(wire_header_hash) = Self::flashblock_wire_header_hash(flashblock) else {
+            return Ok(self.reset_for_flashblock());
+        };
         let base = BlockAssembler::base_from_first_flashblock(flashblock)?;
         let canonical_block_number =
             flashblock.metadata.block_number.checked_sub(1).ok_or_else(|| {
@@ -540,7 +584,7 @@ where
                 .with_database(StateProviderDatabase::new(state_provider))
                 .with_bundle_update()
                 .build(),
-            last_header: Self::seal_header(canonical_header),
+            last_header: Self::hash_existing_header(canonical_header),
             state_overrides: StateOverride::default(),
             l1_block_info: L1BlockInfo::default(),
         };
@@ -549,31 +593,32 @@ where
             flashblock,
             execution,
             base,
+            wire_header_hash,
             canonical_parent_hash,
             base_parent_hash,
         )?;
 
-        self.window.speculative_anchor_block = canonical_block_number;
-        self.window.canonical_base_parent_hash = base_parent_hash;
+        self.window.anchor = HotWindowAnchor::new(canonical_block_number, base_parent_hash);
         self.window.execution = Some(execution);
         self.window.push_block(pending_block);
 
-        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot), verified_parent_ready: None })
+        Ok(HotApplyOutcome::Delta {
+            delta: Box::new(delta),
+            snapshot: Some(Box::new(snapshot)),
+            ready_cached_block: Some(flashblock.metadata.block_number),
+        })
     }
 
     fn append_same_block_suffix(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
-        let Some(active_block) = self.window.active_block() else {
-            Metrics::hot_window_reset_missing_active_block_count().increment(1);
-            return Ok(self.reset_for_flashblock());
-        };
-
-        if flashblock.base.as_ref().is_some_and(|base| base.parent_hash != active_block.parent_hash)
-        {
-            Metrics::hot_window_reset_same_block_parent_mismatch_count().increment(1);
-            return Ok(self.reset_for_flashblock());
+        if let Some(outcome) = self.same_block_continuity_outcome(flashblock) {
+            return Ok(outcome);
         }
 
-        let canonical_base_parent_hash = self.window.canonical_base_parent_hash;
+        let Some(wire_header_hash) = Self::flashblock_wire_header_hash(flashblock) else {
+            return Ok(self.invalidate_session(HotInvalidationReason::ContinuityViolation));
+        };
+
+        let canonical_base_parent_hash = self.window.anchor.hash();
         let execution = self.window.execution.take().ok_or_else(|| {
             StateProcessorError::HotEngine("missing hot execution state".to_string())
         })?;
@@ -587,69 +632,64 @@ where
             Self::prepare_suffix_block(&base, flashblock)?;
 
         let (execution, pending_block, delta, snapshot) = self.execute_suffix(
-            flashblock,
             execution,
             pending_block,
-            execution_block,
-            decoded_transactions,
-            carried_l1_block_info,
-            false,
-            B256::ZERO,
-            canonical_base_parent_hash,
+            SuffixExecutionInput {
+                flashblock,
+                wire_header_hash,
+                execution_block,
+                decoded_transactions,
+                l1_block_info: carried_l1_block_info,
+                apply_pre_execution_changes: false,
+                pre_execution_parent_hash: B256::ZERO,
+                canonical_base_parent_hash,
+            },
         )?;
 
         self.window.execution = Some(execution);
         self.window.blocks.push_back(pending_block);
 
-        Ok(HotApplyOutcome::Delta { delta, snapshot: Some(snapshot), verified_parent_ready: None })
+        Ok(HotApplyOutcome::Delta {
+            delta: Box::new(delta),
+            snapshot: Some(Box::new(snapshot)),
+            ready_cached_block: None,
+        })
     }
 
     fn rollover_to_next_block(&mut self, flashblock: &Flashblock) -> Result<HotApplyOutcome> {
         let _rollover_timer = base_metrics::timed!(Metrics::hot_window_rollover_duration());
 
-        let base = BlockAssembler::base_from_first_flashblock(flashblock)?;
-        let sealed_previous_pending_block = self.seal_active_pending_block()?;
-        let expected_parent_hash = sealed_previous_pending_block.hash();
+        let base = match BlockAssembler::base_from_first_flashblock(flashblock) {
+            Ok(base) => base,
+            Err(StateProcessorError::Protocol(_)) => {
+                return Ok(self.invalidate_session(HotInvalidationReason::ContinuityViolation));
+            }
+            Err(error) => return Err(error),
+        };
+        let expected_parent_hash = self
+            .window
+            .active_block()
+            .ok_or_else(|| {
+                StateProcessorError::HotEngine("missing active pending block".to_string())
+            })?
+            .latest_wire_header_hash;
 
         if base.parent_hash != expected_parent_hash {
             Metrics::hot_window_reset_rollover_parent_mismatch_count().increment(1);
             return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeParentMismatch));
         }
 
-        let retained_previous_pending_block =
-            self.retained_verified_active_pending_block(sealed_previous_pending_block.clone())?;
-        let mut rebased_to_tip = false;
-
         if self.speculative_depth_after_next_block(flashblock.metadata.block_number)
             > self.max_depth
         {
-            let Some(eligible_anchor) =
-                self.freshest_eligible_canonical_anchor(Some(&retained_previous_pending_block))?
-            else {
-                Metrics::hot_soft_rebase_no_eligible_anchor_count().increment(1);
-                return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeDepthExceeded));
-            };
-
-            rebased_to_tip = match self
-                .soft_rebase_for_depth(&eligible_anchor, &retained_previous_pending_block)?
-            {
-                Some(rebased_to_tip) => rebased_to_tip,
-                None => {
-                    return Ok(
-                        self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure)
-                    );
-                }
-            };
+            return Ok(self.invalidate_session(HotInvalidationReason::SpeculativeDepthExceeded));
         }
 
-        if rebased_to_tip {
-            return Ok(Self::with_verified_parent_ready(
-                self.start_first_flashblock(flashblock)?,
-                Some(sealed_previous_pending_block.number),
-            ));
-        }
+        let Some(wire_header_hash) = Self::flashblock_wire_header_hash(flashblock) else {
+            return Ok(self.invalidate_session(HotInvalidationReason::ContinuityViolation));
+        };
 
-        let canonical_base_parent_hash = self.window.canonical_base_parent_hash;
+        let canonical_base_parent_hash = self.window.anchor.hash();
         let execution = self.window.execution.take().ok_or_else(|| {
             StateProcessorError::HotEngine("missing hot execution state".to_string())
         })?;
@@ -663,7 +703,8 @@ where
             base: base.clone(),
             parent_hash: base.parent_hash,
             latest_flashblock_index: 0,
-            latest_header: Self::seal_header(execution_block.header.clone()),
+            latest_wire_header_hash: wire_header_hash,
+            latest_header: Self::hash_existing_header(execution_block.header.clone()),
             next_tx_index: 0,
             next_log_index: 0,
             cumulative_gas_used: 0,
@@ -673,29 +714,32 @@ where
             rpc_transactions: std::collections::HashMap::new(),
             transaction_senders: std::collections::HashMap::new(),
             flashblocks: vec![],
+            published_outputs: vec![],
             local_header_parts: None,
         };
 
         let (execution, pending_block, delta, snapshot) = self.execute_suffix(
-            flashblock,
             execution,
             pending_block,
-            execution_block,
-            decoded_transactions,
-            l1_block_info,
-            true,
-            expected_parent_hash,
-            canonical_base_parent_hash,
+            SuffixExecutionInput {
+                flashblock,
+                wire_header_hash,
+                execution_block,
+                decoded_transactions,
+                l1_block_info,
+                apply_pre_execution_changes: true,
+                pre_execution_parent_hash: expected_parent_hash,
+                canonical_base_parent_hash,
+            },
         )?;
 
         self.window.execution = Some(execution);
-        self.window.verified_blocks.push_back(retained_previous_pending_block);
         self.window.push_block(pending_block);
 
         Ok(HotApplyOutcome::Delta {
-            delta,
-            snapshot: Some(snapshot),
-            verified_parent_ready: Some(sealed_previous_pending_block.number),
+            delta: Box::new(delta),
+            snapshot: Some(Box::new(snapshot)),
+            ready_cached_block: Some(flashblock.metadata.block_number),
         })
     }
 
@@ -704,6 +748,7 @@ where
         flashblock: &Flashblock,
         execution: HotExecutionState<HotExecutionDb>,
         base: ExecutionPayloadBaseV1,
+        wire_header_hash: B256,
         pre_execution_parent_hash: B256,
         canonical_base_parent_hash: B256,
     ) -> Result<(
@@ -721,7 +766,8 @@ where
             base: base.clone(),
             parent_hash: base.parent_hash,
             latest_flashblock_index: 0,
-            latest_header: Self::seal_header(execution_block.header.clone()),
+            latest_wire_header_hash: wire_header_hash,
+            latest_header: Self::hash_existing_header(execution_block.header.clone()),
             next_tx_index: 0,
             next_log_index: 0,
             cumulative_gas_used: 0,
@@ -731,39 +777,47 @@ where
             rpc_transactions: std::collections::HashMap::new(),
             transaction_senders: std::collections::HashMap::new(),
             flashblocks: vec![],
+            published_outputs: vec![],
             local_header_parts: None,
         };
 
         self.execute_suffix(
-            flashblock,
             execution,
             pending_block,
-            execution_block,
-            decoded_transactions,
-            l1_block_info,
-            true,
-            pre_execution_parent_hash,
-            canonical_base_parent_hash,
+            SuffixExecutionInput {
+                flashblock,
+                wire_header_hash,
+                execution_block,
+                decoded_transactions,
+                l1_block_info,
+                apply_pre_execution_changes: true,
+                pre_execution_parent_hash,
+                canonical_base_parent_hash,
+            },
         )
     }
 
     fn execute_suffix(
         &mut self,
-        flashblock: &Flashblock,
         mut execution: HotExecutionState<HotExecutionDb>,
         mut pending_block: HotPendingBlock,
-        execution_block: BaseBlock,
-        decoded_transactions: Vec<BaseTxEnvelope>,
-        l1_block_info: L1BlockInfo,
-        apply_pre_execution_changes: bool,
-        pre_execution_parent_hash: B256,
-        canonical_base_parent_hash: B256,
+        input: SuffixExecutionInput<'_>,
     ) -> Result<(
         HotExecutionState<HotExecutionDb>,
         HotPendingBlock,
         FastFlashblockLogsDelta,
         HotSnapshot,
     )> {
+        let SuffixExecutionInput {
+            flashblock,
+            wire_header_hash,
+            execution_block,
+            decoded_transactions,
+            l1_block_info,
+            apply_pre_execution_changes,
+            pre_execution_parent_hash,
+            canonical_base_parent_hash,
+        } = input;
         let evm_config = BaseEvmConfig::base(self.client.chain_spec());
         let suffix_header = execution_block.header.clone();
         let block_timestamp = Some(suffix_header.timestamp);
@@ -784,8 +838,7 @@ where
             None,
             l1_block_info.clone(),
             execution.state_overrides,
-            cumulative_gas_used,
-            next_log_index_usize,
+            (cumulative_gas_used, next_log_index_usize),
         );
 
         if apply_pre_execution_changes {
@@ -881,12 +934,14 @@ where
         pending_block.next_log_index = next_log_index;
         pending_block.cumulative_gas_used = cumulative_gas_used;
         pending_block.flashblocks.push(flashblock.clone());
+        pending_block.published_outputs.push(RetainedFastOutput::from_delta(&delta));
         pending_block.local_header_parts = None;
         let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         // Exact local sealing is only needed at rollover/canonical boundaries. Keep the latest
-        // suffix header for snapshots and carry the execution DB forward so the expensive local
-        // state-root derivation happens lazily when a child block must be verified.
-        let latest_header = Self::seal_header(suffix_header);
+        // suffix header for snapshots by hashing the already-built header only, and retain the
+        // cumulative wire commitment carried by the incoming flashblock for child rollovers.
+        let latest_header = Self::hash_existing_header(suffix_header);
+        pending_block.latest_wire_header_hash = wire_header_hash;
         pending_block.latest_header = latest_header.clone();
 
         execution.db = db;
@@ -927,49 +982,15 @@ where
             .map_err(|error| ExecutionError::L1BlockInfo(error.to_string()).into())
     }
 
-    fn canonical_block_matches_oldest_pending_block(
-        &mut self,
-        block: &RecoveredBlock<BaseBlock>,
-    ) -> Result<bool> {
-        let oldest_block_number =
-            self.window.blocks.front().map(|pending_block| pending_block.block_number).ok_or_else(
-                || {
-                    StateProcessorError::HotEngine(
-                        "missing oldest pending block during canonical reconciliation".to_string(),
-                    )
-                },
-            )?;
-
-        let sealed_pending_block = if self.window.active_block_number() == Some(oldest_block_number)
-        {
-            self.seal_active_pending_block()?
-        } else {
-            let pending_block = self.window.blocks.front().ok_or_else(|| {
-                StateProcessorError::HotEngine(
-                    "missing oldest pending block during canonical reconciliation".to_string(),
-                )
-            })?;
-            Self::seal_completed_speculative_block(pending_block)?
-        };
-        let pending_block = self.window.blocks.front().ok_or_else(|| {
-            StateProcessorError::HotEngine(
-                "missing oldest pending block during canonical reconciliation".to_string(),
-            )
-        })?;
-
-        Ok(Self::canonical_block_matches_pending_block(pending_block, &sealed_pending_block, block))
-    }
-
     fn canonical_block_matches_pending_block(
         pending_block: &HotPendingBlock,
-        sealed_pending_block: &Sealed<Header>,
         block: &RecoveredBlock<BaseBlock>,
     ) -> bool {
-        if block.header().parent_hash != sealed_pending_block.parent_hash {
+        if block.number != pending_block.block_number {
             return false;
         }
 
-        if block.header().hash_slow() != sealed_pending_block.hash() {
+        if block.header().parent_hash != pending_block.parent_hash {
             return false;
         }
 
@@ -984,180 +1005,12 @@ where
         pending_tx_hashes == canonical_tx_hashes
     }
 
-    fn canonical_block_matches_verified_block(
-        retained_verified_block: &RetainedVerifiedBlock,
-        block: &RecoveredBlock<BaseBlock>,
-    ) -> bool {
-        if block.header().parent_hash != retained_verified_block.parent_hash {
-            return false;
-        }
-
-        if block.header().hash_slow() != retained_verified_block.sealed_header.hash() {
-            return false;
-        }
-
-        let canonical_tx_hashes =
-            block.body().transactions().map(|tx| tx.tx_hash()).collect::<Vec<_>>();
-        retained_verified_block.transaction_hashes == canonical_tx_hashes
-    }
-
-    fn canonical_catchup_matches_retained_verified_blocks(
-        &self,
-        block: &RecoveredBlock<BaseBlock>,
-    ) -> Result<bool> {
-        let _canonical_catchup_timer =
-            base_metrics::timed!(Metrics::hot_canonical_catchup_reconcile_duration());
-        let mut expected_child_parent_hash = block.header().parent_hash;
-        let mut expected_block_number = block.number.saturating_sub(1);
-
-        for retained_verified_block in self.window.verified_blocks.iter().rev() {
-            while expected_block_number > retained_verified_block.block_number {
-                let Some(canonical_header) = self
-                    .client
-                    .header_by_number(expected_block_number)
-                    .map_err(|error| ProviderError::StateProvider(error.to_string()))?
-                else {
-                    return Ok(false);
-                };
-
-                if canonical_header.hash_slow() != expected_child_parent_hash {
-                    return Ok(false);
-                }
-
-                expected_child_parent_hash = canonical_header.parent_hash;
-                expected_block_number = expected_block_number.saturating_sub(1);
-            }
-
-            if expected_block_number != retained_verified_block.block_number
-                || retained_verified_block.parent_hash
-                    != retained_verified_block.sealed_header.parent_hash
-                || retained_verified_block.sealed_header.hash() != expected_child_parent_hash
-            {
-                return Ok(false);
-            }
-
-            if let Some(canonical_header) = self
-                .client
-                .header_by_number(retained_verified_block.block_number)
-                .map_err(|error| ProviderError::StateProvider(error.to_string()))?
-            {
-                if !Self::canonical_header_matches_verified_block(
-                    retained_verified_block,
-                    &canonical_header,
-                ) {
-                    return Ok(false);
-                }
-            }
-
-            expected_child_parent_hash = retained_verified_block.parent_hash;
-            expected_block_number = expected_block_number.saturating_sub(1);
-        }
-
-        Ok(true)
-    }
-
-    fn canonical_header_matches_verified_block(
-        retained_verified_block: &RetainedVerifiedBlock,
-        header: &Header,
-    ) -> bool {
-        header.parent_hash == retained_verified_block.parent_hash
-            && header.hash_slow() == retained_verified_block.sealed_header.hash()
-    }
-
-    fn retained_verified_block_matches(
-        actual: &RetainedVerifiedBlock,
-        expected: &RetainedVerifiedBlock,
-    ) -> bool {
-        actual.block_number == expected.block_number
-            && actual.parent_hash == expected.parent_hash
-            && actual.sealed_header.hash() == expected.sealed_header.hash()
-            && actual.transaction_hashes == expected.transaction_hashes
-    }
-
-    fn seal_header(header: Header) -> Sealed<Header> {
+    /// Wraps an existing header with `hash_slow()` only.
+    ///
+    /// This does not derive `state_root` or any other header parts.
+    fn hash_existing_header(header: Header) -> Sealed<Header> {
         let hash = header.hash_slow();
         Sealed::new_unchecked(header, hash)
-    }
-
-    fn seal_active_pending_block(&mut self) -> Result<Sealed<Header>> {
-        let chain_spec = self.client.chain_spec();
-        let window = &mut self.window;
-        let execution = window.execution.as_mut().ok_or_else(|| {
-            StateProcessorError::HotEngine("missing hot execution state".to_string())
-        })?;
-        let pending_block = window.blocks.back_mut().ok_or_else(|| {
-            StateProcessorError::HotEngine("missing active pending block".to_string())
-        })?;
-
-        Self::ensure_locally_sealed_pending_block(&chain_spec, execution, pending_block)
-    }
-
-    fn ensure_locally_sealed_pending_block<ChainSpec>(
-        chain_spec: &ChainSpec,
-        execution: &mut HotExecutionState<HotExecutionDb>,
-        pending_block: &mut HotPendingBlock,
-    ) -> Result<Sealed<Header>>
-    where
-        ChainSpec: Upgrades,
-    {
-        if pending_block.local_header_parts.is_some() {
-            return Ok(pending_block.latest_header.clone());
-        }
-
-        let _local_seal_timer = base_metrics::timed!(Metrics::hot_local_seal_duration());
-
-        let ordered_receipts = Self::ordered_receipts(pending_block)?;
-        let local_header_parts = PendingHeaderBuilder::from_post_state(
-            chain_spec,
-            pending_block.base.timestamp,
-            pending_block.cumulative_gas_used,
-            &mut execution.db,
-            &ordered_receipts,
-        )?;
-        let latest_header =
-            Self::seal_completed_speculative_block_from_parts(pending_block, &local_header_parts)?;
-        pending_block.local_header_parts = Some(local_header_parts);
-        pending_block.latest_header = latest_header.clone();
-        execution.last_header = latest_header.clone();
-
-        Ok(latest_header)
-    }
-
-    fn seal_completed_speculative_block(pending_block: &HotPendingBlock) -> Result<Sealed<Header>> {
-        pending_block.local_header_parts.as_ref().ok_or_else(|| {
-            StateProcessorError::HotEngine(
-                "missing locally derived header parts for speculative block".to_string(),
-            )
-        })?;
-
-        Ok(pending_block.latest_header.clone())
-    }
-
-    fn seal_completed_speculative_block_from_parts(
-        pending_block: &HotPendingBlock,
-        header_parts: &HotExecutedHeaderParts,
-    ) -> Result<Sealed<Header>> {
-        let header = BlockAssembler::header_from_local_execution(
-            &pending_block.base,
-            &pending_block.flashblocks,
-            header_parts,
-        )?;
-        Ok(Self::seal_header(header))
-    }
-
-    fn ordered_receipts(pending_block: &HotPendingBlock) -> Result<Vec<BaseTransactionReceipt>> {
-        pending_block
-            .transactions
-            .iter()
-            .map(|transaction| {
-                pending_block.receipts.get(&transaction.hash).cloned().ok_or_else(|| {
-                    StateProcessorError::HotEngine(format!(
-                        "missing locally executed receipt for transaction {}",
-                        transaction.hash
-                    ))
-                })
-            })
-            .collect()
     }
 
     fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
@@ -1182,10 +1035,13 @@ mod tests {
     use reth_chainspec::ChainSpecProvider;
     use reth_primitives::RecoveredBlock;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-
-    use crate::BlockAssembler;
+    use reth_storage_api::HeaderProvider;
 
     use super::{HotApplyOutcome, HotEngine, HotInvalidationReason, HotPendingBlock};
+    use crate::{
+        BlockAssembler, HotWindowAnchor, PeriodicAuditFailure, PeriodicAuditResult,
+        RetainedFastOutput, ShadowRebuildCompletion,
+    };
 
     fn test_client() -> MockEthProvider<BasePrimitives, Arc<BaseChainSpec>> {
         let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
@@ -1252,11 +1108,6 @@ mod tests {
             .tx_hash()
     }
 
-    fn decoded_transaction(transaction: &BaseTxEnvelope) -> BaseTxEnvelope {
-        BaseTxEnvelope::decode_2718_exact(transaction.encoded_2718().as_ref())
-            .expect("test transaction should decode")
-    }
-
     fn seed_sender_balance(
         client: &MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>,
         transaction: &BaseTxEnvelope,
@@ -1294,8 +1145,8 @@ mod tests {
                 state_root: B256::ZERO,
                 receipts_root: B256::ZERO,
                 logs_bloom: Bloom::default(),
-                gas_used: 100_000u64.saturating_mul((index + 1) as u64),
-                block_hash: B256::ZERO,
+                gas_used: 100_000u64.saturating_mul(index + 1),
+                block_hash: fixture_wire_block_hash(block_number, index),
                 transactions: transactions
                     .into_iter()
                     .map(|transaction| transaction.encoded_2718().into())
@@ -1306,6 +1157,14 @@ mod tests {
             },
             metadata: Metadata { block_number },
         }
+    }
+
+    fn fixture_wire_block_hash(block_number: u64, index: u64) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&block_number.to_be_bytes());
+        bytes[8..16].copy_from_slice(&index.to_be_bytes());
+        bytes[31] = 1;
+        B256::from(bytes)
     }
 
     fn canonical_block(
@@ -1335,33 +1194,10 @@ mod tests {
         )
     }
 
-    fn canonical_block_from_flashblocks(flashblocks: &[Flashblock]) -> RecoveredBlock<BaseBlock> {
-        let block =
-            BlockAssembler::assemble(flashblocks).expect("test flashblocks should assemble").block;
-        let senders = block
-            .body
-            .transactions
-            .iter()
-            .map(|transaction| {
-                transaction.recover_signer().expect("canonical signer should recover")
-            })
-            .collect();
-
-        RecoveredBlock::new_unhashed(block, senders)
-    }
-
     fn canonical_block_from_pending_block(
         pending_block: &HotPendingBlock,
     ) -> RecoveredBlock<BaseBlock> {
-        let header = BlockAssembler::header_from_local_execution(
-            &pending_block.base,
-            &pending_block.flashblocks,
-            pending_block
-                .local_header_parts
-                .as_ref()
-                .expect("pending block should carry local header parts"),
-        )
-        .expect("pending block should assemble a local header");
+        let header = pending_block.latest_header.inner().clone();
         let transactions = pending_block
             .flashblocks
             .iter()
@@ -1381,13 +1217,20 @@ mod tests {
         client.add_header(block.header().hash_slow(), block.header().clone());
     }
 
-    fn active_pending_block_hash(
-        engine: &mut HotEngine<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>,
+    fn active_pending_block_wire_hash(
+        engine: &HotEngine<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>,
     ) -> B256 {
-        engine
-            .seal_active_pending_block()
-            .expect("active block should seal from local execution")
-            .hash()
+        engine.window.active_block().expect("active block should exist").latest_wire_header_hash
+    }
+
+    fn suffix_wire_hash(base: &ExecutionPayloadBaseV1, flashblock: &Flashblock) -> B256 {
+        let transactions = BlockAssembler::decode_flashblock_transactions(flashblock)
+            .expect("test flashblock transactions should decode");
+
+        BlockAssembler::execution_block_from_base_and_suffix(base, flashblock, transactions)
+            .expect("test suffix block should assemble")
+            .header
+            .hash_slow()
     }
 
     #[test]
@@ -1419,18 +1262,18 @@ mod tests {
             PayloadId::new([0x11; 8]),
             parent_hash,
             true,
-            vec![decoded_l1_info_tx(), deploy_tx.clone()],
+            vec![decoded_l1_info_tx(), deploy_tx],
         );
 
         let HotApplyOutcome::Delta {
             delta: first_delta,
-            verified_parent_ready: first_verified_parent_ready,
+            ready_cached_block: first_ready_cached_block,
             ..
         } = engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply")
         else {
             panic!("expected first flashblock delta outcome");
         };
-        assert_eq!(first_verified_parent_ready, None);
+        assert_eq!(first_ready_cached_block, Some(1));
         assert_eq!(first_delta.logs.len(), 1);
         assert_eq!(first_delta.logs[0].tx_index, 1);
         assert_eq!(first_delta.logs[0].log_index_in_block, 0);
@@ -1440,13 +1283,13 @@ mod tests {
 
         let HotApplyOutcome::Delta {
             delta: second_delta,
-            verified_parent_ready: second_verified_parent_ready,
+            ready_cached_block: second_ready_cached_block,
             ..
         } = engine.apply_flashblock(&second_flashblock).expect("same-block suffix should apply")
         else {
             panic!("expected same-block delta outcome");
         };
-        assert_eq!(second_verified_parent_ready, None);
+        assert_eq!(second_ready_cached_block, None);
 
         assert_eq!(second_delta.transactions.len(), 1);
         assert_eq!(second_delta.transactions[0].hash, decoded_tx_hash(&call_tx));
@@ -1460,6 +1303,12 @@ mod tests {
         assert_eq!(active_block.latest_flashblock_index, 1);
         assert_eq!(active_block.transactions.len(), 3);
         assert_eq!(active_block.logs.len(), 2);
+        assert_eq!(active_block.published_outputs.len(), 2);
+        assert_eq!(active_block.published_outputs[0], RetainedFastOutput::from_delta(&first_delta));
+        assert_eq!(
+            active_block.published_outputs[1],
+            RetainedFastOutput::from_delta(&second_delta)
+        );
         assert_eq!(active_block.next_tx_index, 3);
         assert_eq!(active_block.next_log_index, 2);
     }
@@ -1482,11 +1331,11 @@ mod tests {
             PayloadId::new([0x21; 8]),
             canonical_parent_hash,
             true,
-            vec![decoded_l1_info_tx(), deploy_tx.clone()],
+            vec![decoded_l1_info_tx(), deploy_tx],
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
-        let carried_parent_hash = active_pending_block_hash(&mut engine);
+        let carried_parent_hash = active_pending_block_wire_hash(&engine);
         let second_flashblock = flashblock(
             0,
             2,
@@ -1496,13 +1345,13 @@ mod tests {
             vec![decoded_l1_info_tx(), call_tx.clone()],
         );
 
-        let HotApplyOutcome::Delta { delta, verified_parent_ready, .. } =
+        let HotApplyOutcome::Delta { delta, ready_cached_block, .. } =
             engine.apply_flashblock(&second_flashblock).expect("next block should roll over")
         else {
             panic!("expected next-block delta outcome");
         };
 
-        assert_eq!(verified_parent_ready, Some(1));
+        assert_eq!(ready_cached_block, Some(2));
 
         assert_eq!(delta.transactions.len(), 2);
         assert_eq!(delta.transactions[1].hash, decoded_tx_hash(&call_tx));
@@ -1528,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_delta_sets_verified_parent_ready() {
+    fn hot_engine_rollover_marks_accepted_block_ready_for_cached_suffixes() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
 
@@ -1547,22 +1396,22 @@ mod tests {
             0,
             2,
             PayloadId::new([0x72; 8]),
-            active_pending_block_hash(&mut engine),
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx()],
         );
 
-        let HotApplyOutcome::Delta { verified_parent_ready, .. } =
+        let HotApplyOutcome::Delta { ready_cached_block, .. } =
             engine.apply_flashblock(&second_flashblock).expect("rollover should apply")
         else {
             panic!("expected rollover delta outcome");
         };
 
-        assert_eq!(verified_parent_ready, Some(1));
+        assert_eq!(ready_cached_block, Some(2));
     }
 
     #[test]
-    fn hot_engine_rollover_uses_locally_sealed_previous_block_parent_hash() {
+    fn hot_engine_rollover_accepts_wire_parent_commitment_without_local_state_root() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x91);
@@ -1588,19 +1437,23 @@ mod tests {
         let second_flashblock = flashblock(
             1,
             1,
-            PayloadId::new([0x82; 8]),
+            PayloadId::new([0x81; 8]),
             canonical_parent_hash,
             false,
             vec![first_block_call_tx],
         );
         engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
 
-        let locally_sealed_parent = active_pending_block_hash(&mut engine);
+        let wire_parent_hash = {
+            let active_block = engine.window.active_block().expect("active block should exist");
+            assert!(active_block.local_header_parts.is_none());
+            active_block.latest_wire_header_hash
+        };
         let third_flashblock = flashblock(
             0,
             2,
             PayloadId::new([0x83; 8]),
-            locally_sealed_parent,
+            wire_parent_hash,
             true,
             vec![decoded_l1_info_tx(), second_block_deploy_tx],
         );
@@ -1609,11 +1462,151 @@ mod tests {
 
         assert!(matches!(outcome, HotApplyOutcome::Delta { .. }));
         assert_eq!(engine.window.active_block_number(), Some(2));
+        assert!(
+            engine
+                .window
+                .blocks
+                .front()
+                .expect("previous block should remain in window")
+                .local_header_parts
+                .is_none()
+        );
     }
 
     #[test]
-    fn hot_engine_rollover_invalidate_session_when_child_parent_mismatches_locally_sealed_previous_block()
-     {
+    fn hot_engine_rollover_uses_cumulative_wire_parent_commitment_across_suffixes() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_deploy_tx = create_deploy_log_tx(0x9a);
+        let first_block_contract =
+            first_block_deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
+        let first_block_call_tx = create_call_log_tx(first_block_contract, 0x9b);
+        let second_block_deploy_tx = create_deploy_log_tx_with_gas_limit(0x9c, 120_000);
+        seed_sender_balance(&client, &first_block_deploy_tx);
+        seed_sender_balance(&client, &first_block_call_tx);
+        seed_sender_balance(&client, &second_block_deploy_tx);
+
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x8a; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_deploy_tx],
+        );
+        let second_flashblock = flashblock(
+            1,
+            1,
+            PayloadId::new([0x8a; 8]),
+            canonical_parent_hash,
+            false,
+            vec![first_block_call_tx],
+        );
+        let expected_wire_parent_hash = second_flashblock.diff.block_hash;
+        let suffix_only_wire_parent_hash = suffix_wire_hash(
+            first_flashblock.base.as_ref().expect("first flashblock should carry base"),
+            &second_flashblock,
+        );
+        assert_ne!(expected_wire_parent_hash, suffix_only_wire_parent_hash);
+
+        let mut engine = HotEngine::new(client, 3);
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+        engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
+
+        assert_eq!(active_pending_block_wire_hash(&engine), expected_wire_parent_hash);
+
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x8b; 8]),
+                expected_wire_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), second_block_deploy_tx],
+            ))
+            .expect("rollover should use the cumulative wire parent commitment");
+
+        assert!(matches!(outcome, HotApplyOutcome::Delta { .. }));
+        assert_eq!(engine.window.active_block_number(), Some(2));
+    }
+
+    #[test]
+    fn hot_engine_same_block_zero_wire_commitment_invalidates_session() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x90);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x80; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let mut malformed_suffix =
+            flashblock(1, 1, PayloadId::new([0x80; 8]), canonical_parent_hash, false, vec![]);
+        malformed_suffix.diff.block_hash = B256::ZERO;
+
+        let outcome = engine
+            .apply_flashblock(&malformed_suffix)
+            .expect("malformed same-block suffix should invalidate the active session");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_rollover_missing_base_invalidates_active_session() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x93);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x83; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x84; 8]),
+                canonical_parent_hash,
+                false,
+                vec![],
+            ))
+            .expect("missing rollover base should invalidate the active session");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_rollover_invalidate_session_when_child_parent_mismatches_wire_previous_block() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let deploy_tx = create_deploy_log_tx(0x94);
@@ -1662,7 +1655,6 @@ mod tests {
         ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
@@ -1702,120 +1694,10 @@ mod tests {
         ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_locally_sealed_previous_block_ignores_poisoned_wire_roots() {
-        let client = test_client();
-        let canonical_parent_hash = client.chain_spec().genesis_hash();
-        let deploy_tx = create_deploy_log_tx(0x96);
-        let contract_address =
-            deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
-        let call_tx = create_call_log_tx(contract_address, 0x97);
-        seed_sender_balance(&client, &deploy_tx);
-        seed_sender_balance(&client, &call_tx);
-
-        let first_flashblock = flashblock(
-            0,
-            1,
-            PayloadId::new([0x86; 8]),
-            canonical_parent_hash,
-            true,
-            vec![decoded_l1_info_tx(), deploy_tx.clone()],
-        );
-        let second_flashblock = flashblock(
-            1,
-            1,
-            PayloadId::new([0x86; 8]),
-            canonical_parent_hash,
-            false,
-            vec![call_tx.clone()],
-        );
-
-        let mut clean_engine = HotEngine::new(client.clone(), 3);
-        clean_engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
-        clean_engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
-
-        let mut poisoned_second_flashblock = second_flashblock.clone();
-        poisoned_second_flashblock.diff.state_root = B256::with_last_byte(0xaa);
-        poisoned_second_flashblock.diff.receipts_root = B256::with_last_byte(0xbb);
-        poisoned_second_flashblock.diff.logs_bloom = Bloom::from([0xcc; 256]);
-        poisoned_second_flashblock.diff.withdrawals_root = B256::with_last_byte(0xdd);
-        poisoned_second_flashblock.diff.blob_gas_used = Some(7_777);
-        poisoned_second_flashblock.diff.block_hash = B256::with_last_byte(0xcc);
-
-        let mut poisoned_engine = HotEngine::new(client, 3);
-        poisoned_engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
-        poisoned_engine
-            .apply_flashblock(&poisoned_second_flashblock)
-            .expect("poisoned second flashblock should still apply");
-
-        let clean_hash = active_pending_block_hash(&mut clean_engine);
-        let poisoned_hash = active_pending_block_hash(&mut poisoned_engine);
-
-        assert_eq!(clean_hash, poisoned_hash);
-    }
-
-    #[test]
-    fn hot_engine_rolls_over_after_multiple_flashblocks_using_locally_sealed_parent_hash() {
-        let client = test_client();
-        let canonical_parent_hash = client.chain_spec().genesis_hash();
-        let first_block_deploy_tx = create_deploy_log_tx(0x33);
-        let first_block_contract =
-            first_block_deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
-        let first_block_call_tx = create_call_log_tx(first_block_contract, 0x34);
-        let second_block_deploy_tx = create_deploy_log_tx_with_gas_limit(0x35, 120_000);
-        seed_sender_balance(&client, &first_block_deploy_tx);
-        seed_sender_balance(&client, &first_block_call_tx);
-        seed_sender_balance(&client, &second_block_deploy_tx);
-
-        let mut engine = HotEngine::new(client, 3);
-        let first_flashblock = flashblock(
-            0,
-            1,
-            PayloadId::new([0x23; 8]),
-            canonical_parent_hash,
-            true,
-            vec![decoded_l1_info_tx(), first_block_deploy_tx.clone()],
-        );
-        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
-
-        let second_flashblock = flashblock(
-            1,
-            1,
-            PayloadId::new([0x24; 8]),
-            canonical_parent_hash,
-            false,
-            vec![first_block_call_tx],
-        );
-        engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
-
-        let locally_sealed_parent_hash = active_pending_block_hash(&mut engine);
-        let third_flashblock = flashblock(
-            0,
-            2,
-            PayloadId::new([0x25; 8]),
-            locally_sealed_parent_hash,
-            true,
-            vec![decoded_l1_info_tx(), second_block_deploy_tx],
-        );
-
-        let HotApplyOutcome::Delta { delta, .. } = engine
-            .apply_flashblock(&third_flashblock)
-            .expect("next block should roll over from locally sealed parent hash")
-        else {
-            panic!("expected next-block delta outcome after multi-flashblock parent");
-        };
-
-        assert_eq!(delta.transactions.len(), 2);
-        assert_eq!(engine.window.blocks.len(), 2);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(1));
-        assert_eq!(engine.window.blocks.back().map(|block| block.block_number), Some(2));
-    }
-
-    #[test]
-    fn hot_engine_rollover_invalidate_session_when_child_matches_canonical_but_mismatches_locally_sealed_previous_block()
+    fn hot_engine_rollover_invalidate_session_when_child_matches_canonical_but_mismatches_wire_previous_block_commitment()
      {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
@@ -1842,14 +1724,18 @@ mod tests {
         let second_flashblock = flashblock(
             1,
             1,
-            PayloadId::new([0x27; 8]),
+            PayloadId::new([0x26; 8]),
             canonical_parent_hash,
             false,
             vec![first_block_call_tx],
         );
         engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
 
-        let locally_sealed_parent_hash = active_pending_block_hash(&mut engine);
+        let wire_parent_hash = {
+            let active_block = engine.window.active_block().expect("active block should exist");
+            assert!(active_block.local_header_parts.is_none());
+            active_block.latest_wire_header_hash
+        };
         let canonical_header = Header {
             number: 1,
             parent_hash: canonical_parent_hash,
@@ -1858,7 +1744,7 @@ mod tests {
         };
         let canonical_block = canonical_block_with_header(canonical_header, vec![]);
         let canonical_hash = canonical_block.header().hash_slow();
-        assert_ne!(locally_sealed_parent_hash, canonical_hash);
+        assert_ne!(wire_parent_hash, canonical_hash);
         insert_canonical_header(&client, &canonical_block);
 
         let third_flashblock = flashblock(
@@ -1882,11 +1768,171 @@ mod tests {
         ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_resets_on_non_sequential_gap() {
+    fn hot_engine_same_block_payload_id_change_invalidates_session() {
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x41);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x31; 8]),
+            parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let outcome = engine
+            .apply_flashblock(&flashblock(
+                1,
+                1,
+                PayloadId::new([0x32; 8]),
+                parent_hash,
+                false,
+                vec![create_deploy_log_tx(0x42)],
+            ))
+            .expect("payload change should invalidate the active session");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_same_block_base_field_change_invalidates_session() {
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x43);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x33; 8]),
+            parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let mut changed_base_flashblock = flashblock(
+            1,
+            1,
+            PayloadId::new([0x33; 8]),
+            parent_hash,
+            true,
+            vec![create_deploy_log_tx(0x44)],
+        );
+        changed_base_flashblock
+            .base
+            .as_mut()
+            .expect("same-block test flashblock should carry base")
+            .extra_data = Bytes::from_static(b"changed-base");
+
+        let outcome = engine
+            .apply_flashblock(&changed_base_flashblock)
+            .expect("base field change should invalidate the active session");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_duplicate_same_block_diff_change_invalidates_session() {
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x45);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x35; 8]),
+            parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let mut changed_duplicate = first_flashblock.clone();
+        changed_duplicate.diff.gas_used = changed_duplicate.diff.gas_used.saturating_add(1);
+
+        let outcome = engine
+            .apply_flashblock(&changed_duplicate)
+            .expect("duplicate diff change should invalidate the active session");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_duplicate_same_block_transaction_change_invalidates_session() {
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x46);
+        seed_sender_balance(&client, &deploy_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        let first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x36; 8]),
+            parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), deploy_tx],
+        );
+        engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
+
+        let changed_duplicate = flashblock(
+            0,
+            1,
+            PayloadId::new([0x36; 8]),
+            parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), create_deploy_log_tx_with_gas_limit(0x47, 120_000)],
+        );
+
+        let outcome = engine
+            .apply_flashblock(&changed_duplicate)
+            .expect("duplicate transaction change should invalidate the active session");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_gap_invalidates_active_session() {
         let client = test_client();
         let parent_hash = client.chain_spec().genesis_hash();
         let deploy_tx = create_deploy_log_tx(0x41);
@@ -1913,9 +1959,14 @@ mod tests {
         );
 
         let outcome =
-            engine.apply_flashblock(&gap_flashblock).expect("gap flashblock should return reset");
+            engine.apply_flashblock(&gap_flashblock).expect("gap flashblock should invalidate");
 
-        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::ContinuityViolation
+            }
+        ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
     }
@@ -1948,7 +1999,149 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_canonical_catchup_matching_retained_proofs_resets() {
+    fn hot_engine_anchor_canonical_update_is_duplicate_without_legacy_replay() {
+        let client = test_client();
+        let parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0x5b);
+        let call_tx = create_call_log_tx(
+            deploy_tx.recover_signer().expect("deploy signer should recover").create(0),
+            0x5c,
+        );
+        seed_sender_balance(&client, &deploy_tx);
+        seed_sender_balance(&client, &call_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0x5b; 8]),
+                parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), deploy_tx],
+            ))
+            .expect("first flashblock should apply");
+        engine
+            .apply_flashblock(&flashblock(
+                1,
+                1,
+                PayloadId::new([0x5b; 8]),
+                parent_hash,
+                false,
+                vec![call_tx],
+            ))
+            .expect("same-block suffix should apply");
+
+        let genesis_header = client
+            .header_by_number(0)
+            .expect("genesis header lookup should succeed")
+            .expect("genesis header should exist");
+        let genesis_block = canonical_block_with_header(genesis_header, vec![]);
+
+        let outcome = engine
+            .process_canonical_block(&genesis_block)
+            .expect("matching canonical anchor should be ignored without replay");
+
+        assert!(matches!(outcome, HotApplyOutcome::Duplicate));
+        assert_eq!(engine.window.anchor.block_number(), 0);
+        assert_eq!(engine.window.anchor.hash(), parent_hash);
+        assert!(engine.window.execution.is_some());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(1));
+        assert_eq!(
+            engine.window.latest_audit_cursor().map(|cursor| cursor.flashblock_index),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn hot_engine_canonical_match_prunes_oldest_block_when_child_parent_matches_canonical_hash() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0x5d);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0x5e, 120_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let canonical_block = canonical_block_with_header(
+            Header {
+                number: 1,
+                parent_hash: canonical_parent_hash,
+                extra_data: Bytes::from_static(b"canonical-prune"),
+                ..Default::default()
+            },
+            vec![
+                decoded_l1_info_tx(),
+                BaseTxEnvelope::decode_2718_exact(first_block_tx.encoded_2718().as_ref())
+                    .expect("first canonical transaction should decode"),
+            ],
+        );
+        let canonical_hash = canonical_block.header().hash_slow();
+
+        let mut first_flashblock = flashblock(
+            0,
+            1,
+            PayloadId::new([0x5d; 8]),
+            canonical_parent_hash,
+            true,
+            vec![decoded_l1_info_tx(), first_block_tx],
+        );
+        first_flashblock.diff.block_hash = canonical_hash;
+
+        let second_flashblock = flashblock(
+            0,
+            2,
+            PayloadId::new([0x5e; 8]),
+            canonical_hash,
+            true,
+            vec![decoded_l1_info_tx(), second_block_tx],
+        );
+
+        let mut engine = HotEngine::new(client, 3);
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+        engine.apply_flashblock(&second_flashblock).expect("second block should apply");
+        assert_eq!(
+            engine.window.blocks.front().expect("first retained block should exist").parent_hash,
+            canonical_parent_hash
+        );
+        assert_eq!(
+            engine
+                .window
+                .blocks
+                .front()
+                .expect("first retained block should exist")
+                .transactions
+                .iter()
+                .map(|transaction| transaction.hash)
+                .collect::<Vec<_>>(),
+            canonical_block.body().transactions().map(|tx| tx.tx_hash()).collect::<Vec<_>>()
+        );
+        assert_eq!(engine.window.blocks.len(), 2);
+        assert_eq!(
+            engine.window.blocks.get(1).expect("second retained block should exist").parent_hash,
+            canonical_hash
+        );
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block)
+            .expect("matching canonical block should prune the oldest retained block");
+
+        assert!(
+            matches!(outcome, HotApplyOutcome::CanonicalWindowChanged),
+            "unexpected canonical outcome: {outcome:?}"
+        );
+        assert_eq!(engine.window.anchor, HotWindowAnchor::new(1, canonical_hash));
+        assert!(engine.window.execution.is_some());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert_eq!(
+            engine.window.active_block().expect("second block should remain active").parent_hash,
+            canonical_hash
+        );
+    }
+
+    #[test]
+    fn hot_engine_canonical_catchup_without_retained_audit_window_resets() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0x52);
@@ -1969,7 +2162,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), first_block_tx],
             ))
             .expect("first block should apply");
-        let second_parent_hash = active_pending_block_hash(&mut engine);
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -1980,7 +2173,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), second_block_tx],
             ))
             .expect("second block should apply");
-        let third_parent_hash = active_pending_block_hash(&mut engine);
+        let third_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -1991,15 +2184,12 @@ mod tests {
                 vec![decoded_l1_info_tx(), third_block_tx],
             ))
             .expect("third block should apply");
-        assert_eq!(engine.window.verified_blocks.len(), 2);
-
         let first_canonical_block = canonical_block_from_pending_block(
             engine.window.blocks.front().expect("first retained block should exist"),
         );
         let second_canonical_block = canonical_block_from_pending_block(
             engine.window.blocks.get(1).expect("second retained block should exist"),
         );
-        let _ = active_pending_block_hash(&mut engine);
         let canonical_catchup_block = canonical_block_from_pending_block(
             engine.window.active_block().expect("canonical catch-up block should exist"),
         );
@@ -2007,18 +2197,18 @@ mod tests {
         insert_canonical_header(&client, &second_canonical_block);
         insert_canonical_header(&client, &canonical_catchup_block);
 
-        let outcome = engine
-            .process_canonical_block(&canonical_catchup_block)
-            .expect("matching retained proofs should allow a catch-up reset");
+        let outcome = engine.process_canonical_block(&canonical_catchup_block).expect(
+            "matching canonical catch-up should reset when no retained audit window exists",
+        );
 
         assert!(matches!(outcome, HotApplyOutcome::Reset));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_canonical_catchup_canonical_conflict_invalidates_session_on_retained_proof() {
+    fn hot_engine_canonical_catchup_without_retained_audit_window_resets_even_with_intermediate_conflicts()
+     {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0x55);
@@ -2039,7 +2229,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), first_block_tx],
             ))
             .expect("first block should apply");
-        let second_parent_hash = active_pending_block_hash(&mut engine);
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2050,7 +2240,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), second_block_tx],
             ))
             .expect("second block should apply");
-        let third_parent_hash = active_pending_block_hash(&mut engine);
+        let third_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2061,7 +2251,6 @@ mod tests {
                 vec![decoded_l1_info_tx(), third_block_tx],
             ))
             .expect("third block should apply");
-        assert_eq!(engine.window.verified_blocks.len(), 2);
 
         let first_canonical_block = canonical_block_from_pending_block(
             engine.window.blocks.front().expect("first retained block should exist"),
@@ -2070,7 +2259,7 @@ mod tests {
             Header {
                 number: 2,
                 parent_hash: first_canonical_block.header().hash_slow(),
-                extra_data: Bytes::from_static(b"catchup-proof-conflict"),
+                extra_data: Bytes::from_static(b"catchup-canonical-conflict"),
                 ..Default::default()
             },
             vec![],
@@ -2090,19 +2279,15 @@ mod tests {
 
         let outcome = engine
             .process_canonical_block(&canonical_catchup_block)
-            .expect("catch-up conflict over retained proof should hard invalidate");
+            .expect("catch-up without retained audit window should reset even across conflicts");
 
-        assert!(matches!(
-            outcome,
-            HotApplyOutcome::InvalidateSession { reason: HotInvalidationReason::CanonicalConflict }
-        ));
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_canonical_same_number_multiflashblock_replays_newer_pending_block_state() {
+    fn hot_engine_canonical_same_number_multiflashblock_resets_when_child_keeps_wire_parent() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x61);
@@ -2110,15 +2295,9 @@ mod tests {
             first_block_deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
         let first_block_call_tx = create_call_log_tx(first_block_contract, 0x62);
         let second_block_deploy_tx = create_deploy_log_tx_with_gas_limit(0x63, 120_000);
-        let second_block_contract = second_block_deploy_tx
-            .recover_signer()
-            .expect("deploy signer should recover")
-            .create(0);
-        let second_block_call_tx = create_call_log_tx(second_block_contract, 0x64);
         seed_sender_balance(&client, &first_block_deploy_tx);
         seed_sender_balance(&client, &first_block_call_tx);
         seed_sender_balance(&client, &second_block_deploy_tx);
-        seed_sender_balance(&client, &second_block_call_tx);
 
         let mut engine = HotEngine::new(client.clone(), 3);
         let first_flashblock = flashblock(
@@ -2127,72 +2306,47 @@ mod tests {
             PayloadId::new([0x51; 8]),
             canonical_parent_hash,
             true,
-            vec![decoded_l1_info_tx(), first_block_deploy_tx.clone()],
+            vec![decoded_l1_info_tx(), first_block_deploy_tx],
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
         let second_flashblock = flashblock(
             1,
             1,
-            PayloadId::new([0x52; 8]),
+            PayloadId::new([0x51; 8]),
             canonical_parent_hash,
             false,
-            vec![first_block_call_tx.clone()],
+            vec![first_block_call_tx],
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
-        let carried_parent_hash = active_pending_block_hash(&mut engine);
-        let first_pending_block =
-            engine.window.active_block().expect("active block should exist").clone();
-        let canonical_block = canonical_block_from_pending_block(&first_pending_block);
+        let carried_parent_hash = active_pending_block_wire_hash(&engine);
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.active_block().expect("active block should exist"),
+        );
         let third_flashblock = flashblock(
             0,
             2,
             PayloadId::new([0x53; 8]),
             carried_parent_hash,
             true,
-            vec![decoded_l1_info_tx(), second_block_deploy_tx.clone()],
+            vec![decoded_l1_info_tx(), second_block_deploy_tx],
         );
         engine.apply_flashblock(&third_flashblock).expect("third block should apply");
 
         insert_canonical_header(&client, &canonical_block);
 
-        let outcome = engine
-            .process_canonical_block(&canonical_block)
-            .expect("multi-flashblock canonical block should be silently replayed");
-
-        assert!(matches!(outcome, HotApplyOutcome::Duplicate));
-        assert_eq!(engine.window.blocks.len(), 1);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
-        assert_eq!(engine.window.active_block().map(|block| block.flashblocks.len()), Some(1));
-
-        let fourth_flashblock = flashblock(
-            1,
-            2,
-            PayloadId::new([0x53; 8]),
-            carried_parent_hash,
-            false,
-            vec![second_block_call_tx.clone()],
+        let outcome = engine.process_canonical_block(&canonical_block).expect(
+            "canonical block should reset when the retained child still points at the wire parent",
         );
 
-        let HotApplyOutcome::Delta { delta, .. } = engine
-            .apply_flashblock(&fourth_flashblock)
-            .expect("replayed pending block should accept later same-block suffix")
-        else {
-            panic!("expected same-block delta outcome after canonical replay");
-        };
-
-        assert_eq!(delta.transactions.len(), 1);
-        assert_eq!(delta.transactions[0].hash, decoded_tx_hash(&second_block_call_tx));
-        assert_eq!(delta.transactions[0].index, 2);
-        assert_eq!(delta.logs.len(), 1);
-        assert_eq!(delta.logs[0].tx_hash, decoded_tx_hash(&second_block_call_tx));
-        assert_eq!(delta.logs[0].tx_index, 2);
-        assert_eq!(delta.logs[0].log_index_in_block, 1);
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_canonical_same_number_keeps_newer_state_for_exact_match() {
+    fn hot_engine_canonical_same_number_resets_when_child_keeps_wire_parent() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let deploy_tx = create_deploy_log_tx(0x71);
@@ -2207,11 +2361,11 @@ mod tests {
             PayloadId::new([0x61; 8]),
             canonical_parent_hash,
             true,
-            vec![decoded_l1_info_tx(), deploy_tx.clone()],
+            vec![decoded_l1_info_tx(), deploy_tx],
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
-        let carried_parent_hash = active_pending_block_hash(&mut engine);
+        let carried_parent_hash = active_pending_block_wire_hash(&engine);
         let second_flashblock = flashblock(
             0,
             2,
@@ -2229,20 +2383,15 @@ mod tests {
 
         let outcome = engine
             .process_canonical_block(&canonical_block)
-            .expect("matching canonical block should be accepted");
+            .expect("matching canonical block should reset when the retained child still points at the wire parent");
 
-        assert!(matches!(outcome, HotApplyOutcome::Duplicate));
-        assert_eq!(engine.window.blocks.len(), 1);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
-        assert_eq!(
-            engine.window.execution.as_ref().map(|execution| execution.last_header.number),
-            Some(2)
-        );
-        assert_eq!(engine.window.active_block().map(|block| block.flashblocks.len()), Some(1));
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_matching_canonical_block_prunes_retained_verified_proofs() {
+    fn hot_engine_matching_canonical_block_resets_when_child_keeps_wire_parent() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xa1);
@@ -2265,30 +2414,28 @@ mod tests {
             0,
             2,
             PayloadId::new([0xa2; 8]),
-            active_pending_block_hash(&mut engine),
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx(), second_block_tx],
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
         let canonical_block = canonical_block_from_pending_block(
-            engine.window.blocks.front().expect("first verified block should exist"),
+            engine.window.blocks.front().expect("first retained block should exist"),
         );
         insert_canonical_header(&client, &canonical_block);
 
         let outcome = engine
             .process_canonical_block(&canonical_block)
-            .expect("matching canonical block should keep the session open");
+            .expect("matching canonical block should reset when the retained child still points at the wire parent");
 
-        assert!(matches!(outcome, HotApplyOutcome::Duplicate));
-        assert_eq!(engine.window.speculative_anchor_block, 1);
-        assert!(engine.window.verified_blocks.is_empty());
-        assert_eq!(engine.window.blocks.len(), 1);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_canonical_conflict_invalidate_session_on_retained_verified_proof() {
+    fn hot_engine_canonical_conflict_resets_without_retained_audit_window() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xb1);
@@ -2311,7 +2458,7 @@ mod tests {
             0,
             2,
             PayloadId::new([0xb2; 8]),
-            active_pending_block_hash(&mut engine),
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx(), second_block_tx],
         );
@@ -2327,19 +2474,16 @@ mod tests {
                 },
                 vec![],
             ))
-            .expect("canonical conflict should return a hard invalidation");
+            .expect("canonical conflict should reset when no retained audit window exists");
 
-        assert!(matches!(
-            outcome,
-            HotApplyOutcome::InvalidateSession { reason: HotInvalidationReason::CanonicalConflict }
-        ));
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_canonical_parent_conflict_below_retained_verified_proofs_invalidates_session() {
+    fn hot_engine_canonical_parent_conflict_below_pending_window_resets_without_retained_audit_window()
+     {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xb3);
@@ -2358,7 +2502,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), first_block_tx],
             ))
             .expect("first block should apply");
-        let second_parent_hash = active_pending_block_hash(&mut engine);
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2379,20 +2523,17 @@ mod tests {
                 },
                 vec![],
             ))
-            .expect("canonical parent conflict below retained proofs should hard invalidate");
+            .expect(
+                "canonical parent conflict below pending window should reset without a retained audit window",
+            );
 
-        assert!(matches!(
-            outcome,
-            HotApplyOutcome::InvalidateSession { reason: HotInvalidationReason::CanonicalConflict }
-        ));
+        assert!(matches!(outcome, HotApplyOutcome::Reset));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_speculative_depth_invalidate_session_without_eligible_anchor_keeps_proofs_until_close()
-     {
+    fn hot_engine_speculative_depth_invalidate_session_fail_closed_without_retained_audit_window() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xc1);
@@ -2417,14 +2558,13 @@ mod tests {
             0,
             2,
             PayloadId::new([0xc2; 8]),
-            active_pending_block_hash(&mut engine),
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx(), second_block_tx],
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
-        assert_eq!(engine.window.verified_blocks.len(), 1);
 
-        let third_parent_hash = active_pending_block_hash(&mut engine);
+        let third_parent_hash = active_pending_block_wire_hash(&engine);
         let outcome = engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2444,11 +2584,10 @@ mod tests {
         ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_speculative_depth_soft_rebase_prunes_prefix_and_preserves_replayed_proofs() {
+    fn hot_engine_speculative_depth_fail_closed_even_with_canonical_anchor() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xd1);
@@ -2475,7 +2614,7 @@ mod tests {
             0,
             2,
             PayloadId::new([0xd2; 8]),
-            active_pending_block_hash(&mut engine),
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx(), second_block_tx],
         );
@@ -2485,25 +2624,17 @@ mod tests {
             0,
             3,
             PayloadId::new([0xd3; 8]),
-            active_pending_block_hash(&mut engine),
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx(), third_block_tx],
         );
         engine.apply_flashblock(&third_flashblock).expect("third block should apply");
 
         let canonical_block = canonical_block_from_pending_block(
-            engine.window.blocks.front().expect("first verified block should exist"),
+            engine.window.blocks.front().expect("first retained block should exist"),
         );
         insert_canonical_header(&client, &canonical_block);
-        let prior_second_block_proof = engine
-            .window
-            .verified_blocks
-            .back()
-            .expect("second speculative block should be retained as verified")
-            .sealed_header
-            .clone();
-
-        let fourth_parent_hash = active_pending_block_hash(&mut engine);
+        let fourth_parent_hash = active_pending_block_wire_hash(&engine);
         let outcome = engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2513,25 +2644,20 @@ mod tests {
                 true,
                 vec![decoded_l1_info_tx(), fourth_block_tx],
             ))
-            .expect("depth breach should soft rebase when a matching canonical anchor exists");
+            .expect("depth breach should fail closed in Task 1");
 
-        let HotApplyOutcome::Delta { verified_parent_ready, .. } = outcome else {
-            panic!("soft rebase should keep the session open and publish the child delta");
-        };
-        assert_eq!(verified_parent_ready, Some(3));
-        assert_eq!(engine.window.speculative_anchor_block, 1);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
-        assert_eq!(engine.window.active_block_number(), Some(4));
-        assert_eq!(engine.window.verified_blocks.len(), 2);
-        assert_eq!(engine.window.verified_blocks.front().map(|block| block.block_number), Some(2));
-        assert_eq!(
-            engine.window.verified_blocks.front().map(|block| block.sealed_header.hash()),
-            Some(prior_second_block_proof.hash())
-        );
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::SpeculativeDepthExceeded
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_speculative_depth_soft_rebase_replay_proof_mismatch_invalidates_session() {
+    fn hot_engine_speculative_depth_fail_closed_before_periodic_audit_shadow_rebuild() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xd5);
@@ -2554,7 +2680,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), first_block_tx],
             ))
             .expect("first block should apply");
-        let second_parent_hash = active_pending_block_hash(&mut engine);
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2565,7 +2691,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), second_block_tx],
             ))
             .expect("second block should apply");
-        let third_parent_hash = active_pending_block_hash(&mut engine);
+        let third_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2578,18 +2704,11 @@ mod tests {
             .expect("third block should apply");
 
         let canonical_block = canonical_block_from_pending_block(
-            engine.window.blocks.front().expect("first verified block should exist"),
+            engine.window.blocks.front().expect("first retained block should exist"),
         );
         insert_canonical_header(&client, &canonical_block);
-        engine
-            .window
-            .verified_blocks
-            .back_mut()
-            .expect("second speculative block should be retained as verified")
-            .transaction_hashes
-            .push(B256::with_last_byte(0xff));
 
-        let fourth_parent_hash = active_pending_block_hash(&mut engine);
+        let fourth_parent_hash = active_pending_block_wire_hash(&engine);
         let outcome = engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2599,21 +2718,20 @@ mod tests {
                 true,
                 vec![decoded_l1_info_tx(), fourth_block_tx],
             ))
-            .expect("soft rebase proof mismatch should hard invalidate");
+            .expect("depth breach should fail closed before periodic audit or shadow rebuild");
 
         assert!(matches!(
             outcome,
             HotApplyOutcome::InvalidateSession {
-                reason: HotInvalidationReason::UnrecoverableReplayFailure
+                reason: HotInvalidationReason::SpeculativeDepthExceeded
             }
         ));
         assert!(engine.window.execution.is_none());
         assert!(engine.window.blocks.is_empty());
-        assert!(engine.window.verified_blocks.is_empty());
     }
 
     #[test]
-    fn hot_engine_speculative_depth_soft_rebase_anchor_canonical_update_keeps_window_open() {
+    fn hot_engine_speculative_depth_fail_closed_before_anchor_canonical_update() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xe1);
@@ -2636,7 +2754,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), first_block_tx],
             ))
             .expect("first block should apply");
-        let second_parent_hash = active_pending_block_hash(&mut engine);
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2647,7 +2765,7 @@ mod tests {
                 vec![decoded_l1_info_tx(), second_block_tx],
             ))
             .expect("second block should apply");
-        let third_parent_hash = active_pending_block_hash(&mut engine);
+        let third_parent_hash = active_pending_block_wire_hash(&engine);
         engine
             .apply_flashblock(&flashblock(
                 0,
@@ -2660,12 +2778,12 @@ mod tests {
             .expect("third block should apply");
 
         let canonical_anchor_block = canonical_block_from_pending_block(
-            engine.window.blocks.front().expect("soft rebase anchor should exist"),
+            engine.window.blocks.front().expect("first retained block should exist"),
         );
         insert_canonical_header(&client, &canonical_anchor_block);
 
-        let fourth_parent_hash = active_pending_block_hash(&mut engine);
-        engine
+        let fourth_parent_hash = active_pending_block_wire_hash(&engine);
+        let rollover_outcome = engine
             .apply_flashblock(&flashblock(
                 0,
                 4,
@@ -2674,38 +2792,318 @@ mod tests {
                 true,
                 vec![decoded_l1_info_tx(), fourth_block_tx],
             ))
-            .expect("depth breach should soft rebase when the anchor is canonical");
+            .expect("depth breach should fail closed before any periodic audit or shadow rebuild fallback");
 
-        let retained_verified_hashes = engine
-            .window
-            .verified_blocks
-            .iter()
-            .map(|block| (block.block_number, block.sealed_header.hash()))
-            .collect::<Vec<_>>();
+        assert!(matches!(
+            rollover_outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::SpeculativeDepthExceeded
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
 
         let outcome = engine
             .process_canonical_block(&canonical_anchor_block)
-            .expect("canonical update for the rebased anchor should keep the window open");
+            .expect("canonical update after fail-closed depth breach should be ignored");
 
         assert!(matches!(outcome, HotApplyOutcome::Duplicate));
-        assert_eq!(engine.window.speculative_anchor_block, 1);
-        assert_eq!(engine.window.blocks.len(), 3);
-        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
-        assert_eq!(engine.window.active_block_number(), Some(4));
-        assert!(engine.window.execution.is_some());
-        assert_eq!(
+    }
+
+    #[test]
+    fn hot_engine_shadow_rebuild_completion_reports_swapped_when_live_window_matches_snapshot() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd1);
+        seed_sender_balance(&client, &first_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd1; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("live retained prefix should snapshot");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+
+        engine.next_snapshot_nonce = 99;
+        if let Some(active_block) = engine.window.active_block_mut() {
+            active_block.transactions.clear();
+            active_block.logs.clear();
+        }
+
+        let completion =
+            engine.complete_shadow_rebuild(7, 9, &snapshot, audit_result, rebuilt_engine);
+
+        assert_eq!(completion, ShadowRebuildCompletion::EquivalentSwapped);
+        assert_eq!(engine.next_snapshot_nonce, 99);
+        assert_eq!(engine.window.latest_audit_cursor(), Some(snapshot.cursor));
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert!(
             engine
                 .window
-                .verified_blocks
-                .iter()
-                .map(|block| (block.block_number, block.sealed_header.hash()))
-                .collect::<Vec<_>>(),
-            retained_verified_hashes
+                .active_block()
+                .expect("rebuilt live block should exist")
+                .transactions
+                .len()
+                >= 2
         );
     }
 
     #[test]
-    fn hot_engine_reset_clears_retained_speculative_state() {
+    fn hot_engine_shadow_rebuild_completion_reports_no_op_when_live_advanced_to_later_block() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd2);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0xd3, 120_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd2; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("first retained block should snapshot");
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
+
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0xd3; 8]),
+                second_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), second_block_tx],
+            ))
+            .expect("second block should advance live window");
+
+        let live_cursor_before_completion =
+            engine.window.latest_audit_cursor().expect("live cursor should exist");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+        let completion =
+            engine.complete_shadow_rebuild(7, 9, &snapshot, audit_result, rebuilt_engine);
+
+        assert_eq!(completion, ShadowRebuildCompletion::EquivalentNoOp);
+        assert_eq!(engine.window.anchor.block_number(), 0);
+        assert_eq!(engine.window.anchor.hash(), canonical_parent_hash);
+        assert_eq!(engine.window.blocks.len(), 2);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(1));
+        assert_eq!(engine.window.blocks.back().map(|block| block.block_number), Some(2));
+        assert_eq!(engine.window.latest_audit_cursor(), Some(live_cursor_before_completion));
+    }
+
+    #[test]
+    fn hot_engine_shadow_rebuild_equivalent_prefix_is_no_op_when_live_advanced_within_same_block() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let deploy_tx = create_deploy_log_tx(0xd4);
+        let contract_address =
+            deploy_tx.recover_signer().expect("deploy signer should recover").create(0);
+        let call_tx = create_call_log_tx(contract_address, 0xd5);
+        seed_sender_balance(&client, &deploy_tx);
+        seed_sender_balance(&client, &call_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd4; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), deploy_tx],
+            ))
+            .expect("first flashblock should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("partial retained block should snapshot");
+
+        engine
+            .apply_flashblock(&flashblock(
+                1,
+                1,
+                PayloadId::new([0xd4; 8]),
+                canonical_parent_hash,
+                false,
+                vec![call_tx],
+            ))
+            .expect("same-block suffix should advance live window");
+
+        let live_cursor_before_completion =
+            engine.window.latest_audit_cursor().expect("live cursor should exist");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+        let completion =
+            engine.complete_shadow_rebuild(7, 9, &snapshot, audit_result, rebuilt_engine);
+
+        assert_eq!(completion, ShadowRebuildCompletion::EquivalentNoOp);
+        assert_eq!(engine.window.anchor.block_number(), 0);
+        assert_eq!(engine.window.anchor.hash(), canonical_parent_hash);
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.latest_audit_cursor(), Some(live_cursor_before_completion));
+        assert_eq!(
+            engine
+                .window
+                .active_block()
+                .expect("live block should remain advanced")
+                .latest_flashblock_index,
+            1
+        );
+        assert_eq!(
+            engine
+                .window
+                .active_block()
+                .expect("live block should remain advanced")
+                .published_outputs
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn hot_engine_shadow_rebuild_anchor_mismatch_fails_instead_of_swapping() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd6);
+        seed_sender_balance(&client, &first_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd6; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("live retained prefix should snapshot");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+
+        engine.window.anchor = HotWindowAnchor::new(0, B256::with_last_byte(0xee));
+
+        let completion =
+            engine.complete_shadow_rebuild(7, 9, &snapshot, audit_result, rebuilt_engine);
+
+        assert_eq!(
+            completion,
+            ShadowRebuildCompletion::ActiveFailed { failure: PeriodicAuditFailure::AnchorMismatch }
+        );
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_shadow_rebuild_same_cursor_with_different_prefix_fails_instead_of_swapping() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd6);
+        seed_sender_balance(&client, &first_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd4; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("live retained prefix should snapshot");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+
+        engine.window.active_block_mut().expect("active block should exist").published_outputs[0]
+            .block_timestamp = Some(1_234_567_890);
+
+        let completion =
+            engine.complete_shadow_rebuild(7, 9, &snapshot, audit_result, rebuilt_engine);
+
+        assert_eq!(
+            completion,
+            ShadowRebuildCompletion::ActiveFailed { failure: PeriodicAuditFailure::Mismatch }
+        );
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
+    }
+
+    #[test]
+    fn hot_engine_shadow_rebuild_stale_window_id_is_ignored() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0xd7);
+        seed_sender_balance(&client, &first_block_tx);
+
+        let mut engine = HotEngine::new(client, 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0xd7; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+
+        let snapshot = engine
+            .window
+            .make_audit_snapshot(7, 9, 0, canonical_parent_hash)
+            .expect("live retained prefix should snapshot");
+        let live_cursor = engine.window.latest_audit_cursor();
+
+        let completion = engine.complete_shadow_rebuild(
+            7,
+            10,
+            &snapshot,
+            PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+            None,
+        );
+
+        assert_eq!(completion, ShadowRebuildCompletion::StaleIgnored);
+        assert!(engine.window.execution.is_some());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.latest_audit_cursor(), live_cursor);
+    }
+
+    #[test]
+    fn hot_engine_reset_clears_speculative_state_without_retained_audit_window() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0x81);
@@ -2720,11 +3118,11 @@ mod tests {
             PayloadId::new([0x71; 8]),
             canonical_parent_hash,
             true,
-            vec![decoded_l1_info_tx(), first_block_tx.clone()],
+            vec![decoded_l1_info_tx(), first_block_tx],
         );
         engine.apply_flashblock(&first_flashblock).expect("first block should apply");
 
-        let second_parent_hash = active_pending_block_hash(&mut engine);
+        let second_parent_hash = active_pending_block_wire_hash(&engine);
         let second_flashblock = flashblock(
             0,
             2,
@@ -2735,15 +3133,13 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
 
-        assert_eq!(engine.window.speculative_anchor_block, 0);
-        assert_eq!(engine.window.verified_blocks.len(), 1);
+        assert_eq!(engine.window.anchor.block_number(), 0);
         assert_eq!(engine.window.blocks.len(), 2);
 
         engine.reset();
 
-        assert_eq!(engine.window.speculative_anchor_block, 0);
+        assert_eq!(engine.window.anchor.block_number(), 0);
         assert!(engine.window.execution.is_none());
-        assert!(engine.window.verified_blocks.is_empty());
         assert!(engine.window.blocks.is_empty());
     }
 }

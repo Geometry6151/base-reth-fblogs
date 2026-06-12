@@ -571,7 +571,7 @@ where
                 EthCall::estimate_gas_at(
                     &self.eth_api,
                     transaction,
-                    snapshot.canonical_base_block.clone(),
+                    snapshot.canonical_base_block,
                     Some(final_overrides),
                 )
                 .await
@@ -634,7 +634,7 @@ where
                 EthCall::call(
                     &self.eth_api,
                     transaction,
-                    Some(snapshot.canonical_base_block.clone()),
+                    Some(snapshot.canonical_base_block),
                     EvmOverrides::new(Some(final_state_overrides), final_block_overrides),
                 )
                 .await

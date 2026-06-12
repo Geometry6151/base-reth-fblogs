@@ -28,7 +28,9 @@ pub use fast_logs::{
 };
 
 mod hot_engine;
-pub use hot_engine::{HotApplyOutcome, HotEngine, HotExecutionDb, HotInvalidationReason};
+pub use hot_engine::{
+    HotApplyOutcome, HotEngine, HotExecutionDb, HotInvalidationReason, ShadowRebuildCompletion,
+};
 
 mod hot_mode;
 pub use hot_mode::FlashblocksMode;
@@ -38,8 +40,12 @@ pub use hot_snapshot::{HotSnapshot, HotSnapshotRing};
 
 mod hot_window;
 pub use hot_window::{
-    HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow,
-    RetainedVerifiedBlock,
+    HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow, HotWindowAnchor,
+};
+
+mod periodic_audit;
+pub use periodic_audit::{
+    AuditCursor, AuditWindowSnapshot, PeriodicAuditFailure, PeriodicAuditResult, RetainedFastOutput,
 };
 
 mod metrics;
@@ -52,7 +58,7 @@ mod snapshot_cache;
 pub use snapshot_cache::SnapshotCache;
 
 mod processor;
-pub use processor::{StateProcessor, StateUpdate};
+pub use processor::{StateProcessor, StateProcessorHandles, StateUpdate};
 
 mod state;
 pub use state::FlashblocksState;

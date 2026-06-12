@@ -69,7 +69,7 @@ impl BlockAssembler {
 
     /// Returns the base payload from the first flashblock in a sequence.
     pub fn base_from_first_flashblock(flashblock: &Flashblock) -> Result<ExecutionPayloadBaseV1> {
-        flashblock.base.clone().ok_or(ProtocolError::MissingBase.into())
+        flashblock.base.clone().ok_or_else(|| ProtocolError::MissingBase.into())
     }
 
     /// Decodes only the transactions present in the provided flashblock suffix.
@@ -246,23 +246,29 @@ impl BlockAssembler {
         diff: &ExecutionPayloadFlashblockDeltaV1,
         requests_hash: Option<B256>,
     ) -> Result<ExecutionPayloadFork> {
-        match (requests_hash, diff.blob_gas_used, diff.withdrawals_root) {
-            (Some(_), Some(_), _) => Ok(ExecutionPayloadFork::V4),
-            (Some(_), None, _) => Err(ExecutionError::BlockConversion(
-                "unsupported flashblock fork combination: requests_hash requires blob_gas_used"
-                    .to_string(),
-            )
-            .into()),
-            (None, None, B256::ZERO) => Ok(ExecutionPayloadFork::V1),
-            (None, None, EMPTY_WITHDRAWALS) => Ok(ExecutionPayloadFork::V2),
-            (None, Some(_), EMPTY_WITHDRAWALS) => Ok(ExecutionPayloadFork::V3),
-            (None, Some(_), B256::ZERO) => Err(ExecutionError::BlockConversion(
+        if requests_hash.is_some() {
+            return if diff.blob_gas_used.is_some() {
+                Ok(ExecutionPayloadFork::V4)
+            } else {
+                Err(ExecutionError::BlockConversion(
+                    "unsupported flashblock fork combination: requests_hash requires blob_gas_used"
+                        .to_string(),
+                )
+                .into())
+            };
+        }
+
+        match (diff.blob_gas_used, diff.withdrawals_root) {
+            (None, B256::ZERO) => Ok(ExecutionPayloadFork::V1),
+            (None, EMPTY_WITHDRAWALS) => Ok(ExecutionPayloadFork::V2),
+            (Some(_), EMPTY_WITHDRAWALS) => Ok(ExecutionPayloadFork::V3),
+            (Some(_), B256::ZERO) => Err(ExecutionError::BlockConversion(
                 "unsupported flashblock fork combination: blob_gas_used requires a non-zero withdrawals_root"
                     .to_string(),
             )
             .into()),
-            (None, Some(_), _) => Ok(ExecutionPayloadFork::V4),
-            (None, None, _) => Err(ExecutionError::BlockConversion(
+            (Some(_), _) => Ok(ExecutionPayloadFork::V4),
+            (None, _) => Err(ExecutionError::BlockConversion(
                 "unsupported flashblock fork combination: non-empty withdrawals_root without blob_gas_used"
                     .to_string(),
             )
@@ -442,7 +448,7 @@ mod tests {
         let assembled =
             BlockAssembler::assemble(&flashblocks).expect("post-jovian block should assemble");
         let header_parts = local_header_parts_from_header(&assembled.block.header);
-        let mut poisoned_flashblocks = flashblocks.clone();
+        let mut poisoned_flashblocks = flashblocks;
         let poisoned_suffix = poisoned_flashblocks
             .last_mut()
             .expect("post-jovian test flashblocks should have a latest suffix");
