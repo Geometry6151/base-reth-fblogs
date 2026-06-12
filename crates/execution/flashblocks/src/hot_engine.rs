@@ -522,6 +522,10 @@ where
         (flashblock.diff.block_hash != B256::ZERO).then_some(flashblock.diff.block_hash)
     }
 
+    fn cumulative_wire_header_hash(flashblocks: &[Flashblock]) -> Result<B256> {
+        Ok(BlockAssembler::assemble(flashblocks)?.block.header.hash_slow())
+    }
+
     fn flashblock_prefix_matches(
         expected_prefix: &[Flashblock],
         actual_flashblocks: &[Flashblock],
@@ -810,7 +814,7 @@ where
     )> {
         let SuffixExecutionInput {
             flashblock,
-            wire_header_hash,
+            wire_header_hash: _wire_header_hash,
             execution_block,
             decoded_transactions,
             l1_block_info,
@@ -936,12 +940,14 @@ where
         pending_block.flashblocks.push(flashblock.clone());
         pending_block.published_outputs.push(RetainedFastOutput::from_delta(&delta));
         pending_block.local_header_parts = None;
+        let latest_wire_header_hash =
+            Self::cumulative_wire_header_hash(&pending_block.flashblocks)?;
         let (db, state_overrides) = pending_state_builder.into_db_and_state_overrides();
         // Exact local sealing is only needed at rollover/canonical boundaries. Keep the latest
-        // suffix header for snapshots by hashing the already-built header only, and retain the
-        // cumulative wire commitment carried by the incoming flashblock for child rollovers.
+        // suffix header for snapshots by hashing the already-built header only, and derive the
+        // cumulative wire commitment from the retained flashblocks for child rollovers.
         let latest_header = Self::hash_existing_header(suffix_header);
-        pending_block.latest_wire_header_hash = wire_header_hash;
+        pending_block.latest_wire_header_hash = latest_wire_header_hash;
         pending_block.latest_header = latest_header.clone();
 
         execution.db = db;
@@ -1223,12 +1229,10 @@ mod tests {
         engine.window.active_block().expect("active block should exist").latest_wire_header_hash
     }
 
-    fn suffix_wire_hash(base: &ExecutionPayloadBaseV1, flashblock: &Flashblock) -> B256 {
-        let transactions = BlockAssembler::decode_flashblock_transactions(flashblock)
-            .expect("test flashblock transactions should decode");
-
-        BlockAssembler::execution_block_from_base_and_suffix(base, flashblock, transactions)
-            .expect("test suffix block should assemble")
+    fn cumulative_wire_hash(flashblocks: &[Flashblock]) -> B256 {
+        BlockAssembler::assemble(flashblocks)
+            .expect("test flashblocks should assemble")
+            .block
             .header
             .hash_slow()
     }
@@ -1411,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_accepts_wire_parent_commitment_without_local_state_root() {
+    fn hot_engine_rollover_accepts_cumulative_wire_parent_commitment_without_local_state_root() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_deploy_tx = create_deploy_log_tx(0x91);
@@ -1444,9 +1448,14 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
 
+        let cumulative_wire_parent_hash =
+            cumulative_wire_hash(&[first_flashblock.clone(), second_flashblock.clone()]);
+        assert_ne!(cumulative_wire_parent_hash, second_flashblock.diff.block_hash);
+
         let wire_parent_hash = {
             let active_block = engine.window.active_block().expect("active block should exist");
             assert!(active_block.local_header_parts.is_none());
+            assert_eq!(active_block.latest_wire_header_hash, cumulative_wire_parent_hash);
             active_block.latest_wire_header_hash
         };
         let third_flashblock = flashblock(
@@ -1502,12 +1511,9 @@ mod tests {
             false,
             vec![first_block_call_tx],
         );
-        let expected_wire_parent_hash = second_flashblock.diff.block_hash;
-        let suffix_only_wire_parent_hash = suffix_wire_hash(
-            first_flashblock.base.as_ref().expect("first flashblock should carry base"),
-            &second_flashblock,
-        );
-        assert_ne!(expected_wire_parent_hash, suffix_only_wire_parent_hash);
+        let expected_wire_parent_hash =
+            cumulative_wire_hash(&[first_flashblock.clone(), second_flashblock.clone()]);
+        assert_ne!(expected_wire_parent_hash, second_flashblock.diff.block_hash);
 
         let mut engine = HotEngine::new(client, 3);
         engine.apply_flashblock(&first_flashblock).expect("first flashblock should apply");
@@ -1697,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_rollover_invalidate_session_when_child_matches_canonical_but_mismatches_wire_previous_block_commitment()
+    fn hot_engine_rollover_invalidate_session_when_child_mismatches_cumulative_wire_previous_block_commitment()
      {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
@@ -1710,7 +1716,7 @@ mod tests {
         seed_sender_balance(&client, &first_block_call_tx);
         seed_sender_balance(&client, &second_block_deploy_tx);
 
-        let mut engine = HotEngine::new(client.clone(), 3);
+        let mut engine = HotEngine::new(client, 3);
         let first_flashblock = flashblock(
             0,
             1,
@@ -1731,27 +1737,16 @@ mod tests {
         );
         engine.apply_flashblock(&second_flashblock).expect("second flashblock should apply");
 
-        let wire_parent_hash = {
-            let active_block = engine.window.active_block().expect("active block should exist");
-            assert!(active_block.local_header_parts.is_none());
-            active_block.latest_wire_header_hash
-        };
-        let canonical_header = Header {
-            number: 1,
-            parent_hash: canonical_parent_hash,
-            extra_data: Bytes::from_static(b"canonical-parent"),
-            ..Default::default()
-        };
-        let canonical_block = canonical_block_with_header(canonical_header, vec![]);
-        let canonical_hash = canonical_block.header().hash_slow();
-        assert_ne!(wire_parent_hash, canonical_hash);
-        insert_canonical_header(&client, &canonical_block);
+        let cumulative_wire_parent_hash =
+            cumulative_wire_hash(&[first_flashblock.clone(), second_flashblock.clone()]);
+        let suffix_block_hash = second_flashblock.diff.block_hash;
+        assert_ne!(cumulative_wire_parent_hash, suffix_block_hash);
 
         let third_flashblock = flashblock(
             0,
             2,
             PayloadId::new([0x28; 8]),
-            canonical_hash,
+            suffix_block_hash,
             true,
             vec![decoded_l1_info_tx(), second_block_deploy_tx],
         );
@@ -2063,22 +2058,7 @@ mod tests {
         seed_sender_balance(&client, &first_block_tx);
         seed_sender_balance(&client, &second_block_tx);
 
-        let canonical_block = canonical_block_with_header(
-            Header {
-                number: 1,
-                parent_hash: canonical_parent_hash,
-                extra_data: Bytes::from_static(b"canonical-prune"),
-                ..Default::default()
-            },
-            vec![
-                decoded_l1_info_tx(),
-                BaseTxEnvelope::decode_2718_exact(first_block_tx.encoded_2718().as_ref())
-                    .expect("first canonical transaction should decode"),
-            ],
-        );
-        let canonical_hash = canonical_block.header().hash_slow();
-
-        let mut first_flashblock = flashblock(
+        let first_flashblock = flashblock(
             0,
             1,
             PayloadId::new([0x5d; 8]),
@@ -2086,19 +2066,23 @@ mod tests {
             true,
             vec![decoded_l1_info_tx(), first_block_tx],
         );
-        first_flashblock.diff.block_hash = canonical_hash;
+
+        let mut engine = HotEngine::new(client, 3);
+        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.active_block().expect("first retained block should exist"),
+        );
+        let canonical_hash = canonical_block.header().hash_slow();
 
         let second_flashblock = flashblock(
             0,
             2,
             PayloadId::new([0x5e; 8]),
-            canonical_hash,
+            active_pending_block_wire_hash(&engine),
             true,
             vec![decoded_l1_info_tx(), second_block_tx],
         );
 
-        let mut engine = HotEngine::new(client, 3);
-        engine.apply_flashblock(&first_flashblock).expect("first block should apply");
         engine.apply_flashblock(&second_flashblock).expect("second block should apply");
         assert_eq!(
             engine.window.blocks.front().expect("first retained block should exist").parent_hash,
@@ -2121,6 +2105,8 @@ mod tests {
             engine.window.blocks.get(1).expect("second retained block should exist").parent_hash,
             canonical_hash
         );
+
+        insert_canonical_header(&engine.client, &canonical_block);
 
         let outcome = engine
             .process_canonical_block(&canonical_block)
@@ -2346,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_canonical_same_number_resets_when_child_keeps_wire_parent() {
+    fn hot_engine_canonical_same_number_prunes_when_child_keeps_cumulative_wire_parent() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let deploy_tx = create_deploy_log_tx(0x71);
@@ -2383,15 +2369,20 @@ mod tests {
 
         let outcome = engine
             .process_canonical_block(&canonical_block)
-            .expect("matching canonical block should reset when the retained child still points at the wire parent");
+            .expect("matching canonical block should prune when the retained child points at the cumulative wire parent");
 
-        assert!(matches!(outcome, HotApplyOutcome::Reset));
-        assert!(engine.window.execution.is_none());
-        assert!(engine.window.blocks.is_empty());
+        assert!(matches!(outcome, HotApplyOutcome::CanonicalWindowChanged));
+        assert_eq!(
+            engine.window.anchor,
+            HotWindowAnchor::new(1, canonical_block.header().hash_slow())
+        );
+        assert!(engine.window.execution.is_some());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.active_block_number(), Some(2));
     }
 
     #[test]
-    fn hot_engine_matching_canonical_block_resets_when_child_keeps_wire_parent() {
+    fn hot_engine_matching_canonical_block_prunes_when_child_keeps_cumulative_wire_parent() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
         let first_block_tx = create_deploy_log_tx(0xa1);
@@ -2427,11 +2418,16 @@ mod tests {
 
         let outcome = engine
             .process_canonical_block(&canonical_block)
-            .expect("matching canonical block should reset when the retained child still points at the wire parent");
+            .expect("matching canonical block should prune when the retained child points at the cumulative wire parent");
 
-        assert!(matches!(outcome, HotApplyOutcome::Reset));
-        assert!(engine.window.execution.is_none());
-        assert!(engine.window.blocks.is_empty());
+        assert!(matches!(outcome, HotApplyOutcome::CanonicalWindowChanged));
+        assert_eq!(
+            engine.window.anchor,
+            HotWindowAnchor::new(1, canonical_block.header().hash_slow())
+        );
+        assert!(engine.window.execution.is_some());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.active_block_number(), Some(2));
     }
 
     #[test]
