@@ -266,8 +266,7 @@ where
             return Ok(self.reset_for_canonical());
         }
 
-        self.window.prune_canonicalized_prefix_through(block.number, canonical_hash);
-        Ok(HotApplyOutcome::CanonicalWindowChanged)
+        self.rebase_retained_suffix_from_canonical_anchor(block, canonical_hash)
     }
 
     /// Rebuilds a fresh shadow hot engine from one immutable audit snapshot.
@@ -522,6 +521,94 @@ where
         Metrics::hot_canonical_reset_count().increment(1);
         self.reset();
         HotApplyOutcome::Reset
+    }
+
+    fn rebase_retained_suffix_from_canonical_anchor(
+        &mut self,
+        canonical_block: &RecoveredBlock<BaseBlock>,
+        canonical_hash: B256,
+    ) -> Result<HotApplyOutcome> {
+        let Some(snapshot) = self.retained_suffix_snapshot_after_canonical_anchor(
+            canonical_block.number,
+            canonical_hash,
+        ) else {
+            warn!(
+                message = "canonical suffix rebase snapshot missing",
+                canonical_block_number = canonical_block.number,
+                canonical_hash = %canonical_hash,
+            );
+            return Ok(self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure));
+        };
+
+        let (audit_result, rebuilt_engine) =
+            Self::rebuild_shadow_from_snapshot(self.client.clone(), self.max_depth, &snapshot);
+
+        match audit_result {
+            PeriodicAuditResult::EquivalentPrefix => {
+                let Some(rebuilt_engine) = rebuilt_engine else {
+                    warn!(
+                        message = "canonical suffix rebase missing rebuilt engine",
+                        canonical_block_number = canonical_block.number,
+                        canonical_hash = %canonical_hash,
+                    );
+                    return Ok(
+                        self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure)
+                    );
+                };
+
+                self.window = rebuilt_engine.window;
+                Ok(HotApplyOutcome::CanonicalWindowChanged)
+            }
+            PeriodicAuditResult::Diverged { failure } => {
+                warn!(
+                    message = "canonical suffix rebase diverged",
+                    canonical_block_number = canonical_block.number,
+                    canonical_hash = %canonical_hash,
+                    failure = ?failure,
+                );
+                Ok(self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure))
+            }
+            PeriodicAuditResult::StaleIgnored => {
+                warn!(
+                    message = "canonical suffix rebase returned stale result",
+                    canonical_block_number = canonical_block.number,
+                    canonical_hash = %canonical_hash,
+                );
+                Ok(self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure))
+            }
+        }
+    }
+
+    fn retained_suffix_snapshot_after_canonical_anchor(
+        &self,
+        canonical_block_number: BlockNumber,
+        canonical_hash: B256,
+    ) -> Option<AuditWindowSnapshot> {
+        let flashblocks = self
+            .window
+            .blocks
+            .iter()
+            .skip(1)
+            .flat_map(|block| block.flashblocks.iter().cloned())
+            .collect::<Vec<_>>();
+        let expected_outputs = self
+            .window
+            .blocks
+            .iter()
+            .skip(1)
+            .flat_map(|block| block.published_outputs.iter().cloned())
+            .collect::<Vec<_>>();
+        let cursor = expected_outputs.last().map(|output| output.cursor)?;
+
+        Some(AuditWindowSnapshot::new(
+            0,
+            0,
+            canonical_block_number,
+            canonical_hash,
+            cursor,
+            flashblocks,
+            expected_outputs,
+        ))
     }
 
     fn canonical_anchor_matches_snapshot(
@@ -2371,6 +2458,230 @@ mod tests {
             engine.window.active_block().expect("second block should remain active").parent_hash,
             canonical_hash
         );
+    }
+
+    #[test]
+    fn hot_engine_canonical_rebase_replaces_live_execution_with_rebuilt_suffix_state() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+        let first_block_tx = create_deploy_log_tx(0x5f);
+        let second_block_tx = create_deploy_log_tx_with_gas_limit(0x60, 120_000);
+        seed_sender_balance(&client, &first_block_tx);
+        seed_sender_balance(&client, &second_block_tx);
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0x5f; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx(), first_block_tx],
+            ))
+            .expect("first block should apply");
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x60; 8]),
+                active_pending_block_wire_hash(&engine),
+                true,
+                vec![decoded_l1_info_tx(), second_block_tx],
+            ))
+            .expect("second block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first retained block should exist"),
+        );
+        let canonical_hash = canonical_block.header().hash_slow();
+        insert_canonical_header(&client, &canonical_block);
+
+        let snapshot = engine
+            .retained_suffix_snapshot_after_canonical_anchor(canonical_block.number, canonical_hash)
+            .expect("retained suffix should snapshot");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+        assert_eq!(audit_result, PeriodicAuditResult::EquivalentPrefix);
+        let rebuilt_engine = rebuilt_engine.expect("matching rebase should rebuild suffix state");
+
+        let stale_execution =
+            HotEngine::<MockEthProvider<BasePrimitives, Arc<BaseChainSpec>>>::hash_existing_header(
+                Header {
+                    number: 99,
+                    parent_hash: B256::with_last_byte(0xfe),
+                    ..Default::default()
+                },
+            );
+        let stale_execution_hash = stale_execution.hash();
+        engine.window.execution.as_mut().expect("live execution should exist").last_header =
+            stale_execution;
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block)
+            .expect("matching canonical block should rebase the retained suffix");
+
+        assert!(matches!(outcome, HotApplyOutcome::CanonicalWindowChanged));
+        assert_eq!(engine.window.anchor, HotWindowAnchor::new(1, canonical_hash));
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert_ne!(
+            engine
+                .window
+                .execution
+                .as_ref()
+                .expect("rebased execution should exist")
+                .last_header
+                .hash(),
+            stale_execution_hash
+        );
+        assert_eq!(
+            engine
+                .window
+                .execution
+                .as_ref()
+                .expect("rebased execution should exist")
+                .last_header
+                .hash(),
+            rebuilt_engine
+                .window
+                .execution
+                .as_ref()
+                .expect("rebuilt execution should exist")
+                .last_header
+                .hash()
+        );
+    }
+
+    #[test]
+    fn hot_engine_canonical_rebase_preserves_continuity_for_next_suffix() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0x61; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("first block should apply");
+        let second_payload_id = PayloadId::new([0x62; 8]);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                second_payload_id,
+                active_pending_block_wire_hash(&engine),
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("second block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first retained block should exist"),
+        );
+        let canonical_hash = canonical_block.header().hash_slow();
+        insert_canonical_header(&client, &canonical_block);
+
+        let snapshot = engine
+            .retained_suffix_snapshot_after_canonical_anchor(canonical_block.number, canonical_hash)
+            .expect("retained suffix should snapshot");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+        assert_eq!(audit_result, PeriodicAuditResult::EquivalentPrefix);
+        let mut rebuilt_engine = rebuilt_engine.expect("matching rebase should rebuild suffix");
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block)
+            .expect("matching canonical block should preserve continuity");
+        assert!(matches!(outcome, HotApplyOutcome::CanonicalWindowChanged));
+
+        let next_suffix = flashblock(1, 2, second_payload_id, canonical_hash, false, vec![]);
+        let HotApplyOutcome::Delta { delta: expected_delta, .. } = rebuilt_engine
+            .apply_flashblock(&next_suffix)
+            .expect("rebuilt suffix should accept the next same-block flashblock")
+        else {
+            panic!("expected rebuilt suffix delta outcome");
+        };
+        let HotApplyOutcome::Delta { delta: live_delta, .. } = engine
+            .apply_flashblock(&next_suffix)
+            .expect("rebased live suffix should accept the next same-block flashblock")
+        else {
+            panic!("expected live suffix delta outcome");
+        };
+
+        assert_eq!(
+            RetainedFastOutput::from_delta(&live_delta),
+            RetainedFastOutput::from_delta(&expected_delta)
+        );
+        assert_eq!(engine.window.anchor, HotWindowAnchor::new(1, canonical_hash));
+        assert_eq!(engine.window.active_block_number(), Some(2));
+        assert_eq!(
+            engine
+                .window
+                .active_block()
+                .expect("rebased active block should exist")
+                .latest_flashblock_index,
+            1
+        );
+    }
+
+    #[test]
+    fn hot_engine_canonical_rebase_mismatch_invalidates_session() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0x63; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("first block should apply");
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x64; 8]),
+                active_pending_block_wire_hash(&engine),
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("second block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first retained block should exist"),
+        );
+        insert_canonical_header(&client, &canonical_block);
+
+        engine
+            .window
+            .blocks
+            .get_mut(1)
+            .expect("second retained block should exist")
+            .published_outputs[0]
+            .block_timestamp = Some(1_234_567_890);
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block)
+            .expect("rebase mismatch should fail closed");
+
+        assert!(matches!(
+            outcome,
+            HotApplyOutcome::InvalidateSession {
+                reason: HotInvalidationReason::UnrecoverableReplayFailure
+            }
+        ));
+        assert!(engine.window.execution.is_none());
+        assert!(engine.window.blocks.is_empty());
     }
 
     #[test]
