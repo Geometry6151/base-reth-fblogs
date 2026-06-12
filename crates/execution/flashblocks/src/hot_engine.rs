@@ -400,6 +400,106 @@ where
         }
     }
 
+    fn replay_shadow_from_snapshot_for_canonical_rebase(
+        client: Client,
+        max_depth: u64,
+        snapshot: &AuditWindowSnapshot,
+    ) -> (PeriodicAuditResult, Option<Self>) {
+        match Self::canonical_anchor_matches_snapshot(&client, snapshot) {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::AnchorMismatch },
+                    None,
+                );
+            }
+            Err(_error) => {
+                return (
+                    PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::WorkerError },
+                    None,
+                );
+            }
+        }
+
+        if !snapshot.first_replayed_flashblock_matches_anchor() {
+            Self::log_snapshot_anchor_shape_mismatch(snapshot);
+            return (
+                PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                None,
+            );
+        }
+
+        let mut shadow_engine = Self::new(client, max_depth);
+
+        for flashblock in &snapshot.flashblocks {
+            let outcome = match shadow_engine.apply_flashblock(flashblock) {
+                Ok(outcome) => outcome,
+                Err(_error) => {
+                    return (
+                        PeriodicAuditResult::Diverged {
+                            failure: PeriodicAuditFailure::WorkerError,
+                        },
+                        None,
+                    );
+                }
+            };
+
+            match outcome {
+                HotApplyOutcome::Delta { .. } => {}
+                HotApplyOutcome::Duplicate => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::Duplicate,
+                        None,
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+                HotApplyOutcome::CanonicalWindowChanged => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::CanonicalWindowChanged,
+                        None,
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+                HotApplyOutcome::Reset => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::Reset,
+                        None,
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+                HotApplyOutcome::InvalidateSession { reason } => {
+                    Self::log_replay_non_delta_outcome(
+                        snapshot,
+                        flashblock,
+                        ReplayNonDeltaOutcome::InvalidateSession,
+                        Some(reason),
+                    );
+                    return (
+                        PeriodicAuditResult::Diverged { failure: PeriodicAuditFailure::Mismatch },
+                        None,
+                    );
+                }
+            }
+        }
+
+        (PeriodicAuditResult::EquivalentPrefix, Some(shadow_engine))
+    }
+
     /// Completes one shadow rebuild against the current live hot engine.
     pub fn complete_shadow_rebuild(
         &mut self,
@@ -540,8 +640,11 @@ where
             return Ok(self.invalidate_session(HotInvalidationReason::UnrecoverableReplayFailure));
         };
 
-        let (audit_result, rebuilt_engine) =
-            Self::rebuild_shadow_from_snapshot(self.client.clone(), self.max_depth, &snapshot);
+        let (audit_result, rebuilt_engine) = Self::replay_shadow_from_snapshot_for_canonical_rebase(
+            self.client.clone(),
+            self.max_depth,
+            &snapshot,
+        );
 
         match audit_result {
             PeriodicAuditResult::EquivalentPrefix => {
@@ -2631,7 +2734,93 @@ mod tests {
     }
 
     #[test]
-    fn hot_engine_canonical_rebase_mismatch_invalidates_session() {
+    fn hot_engine_canonical_rebase_semantic_drift_rebuilds_retained_suffix() {
+        let client = test_client();
+        let canonical_parent_hash = client.chain_spec().genesis_hash();
+
+        let mut engine = HotEngine::new(client.clone(), 3);
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                1,
+                PayloadId::new([0x63; 8]),
+                canonical_parent_hash,
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("first block should apply");
+        engine
+            .apply_flashblock(&flashblock(
+                0,
+                2,
+                PayloadId::new([0x64; 8]),
+                active_pending_block_wire_hash(&engine),
+                true,
+                vec![decoded_l1_info_tx()],
+            ))
+            .expect("second block should apply");
+
+        let canonical_block = canonical_block_from_pending_block(
+            engine.window.blocks.front().expect("first retained block should exist"),
+        );
+        let canonical_hash = canonical_block.header().hash_slow();
+        insert_canonical_header(&client, &canonical_block);
+
+        let snapshot = engine
+            .retained_suffix_snapshot_after_canonical_anchor(canonical_block.number, canonical_hash)
+            .expect("retained suffix should snapshot");
+        let (audit_result, rebuilt_engine) =
+            HotEngine::rebuild_shadow_from_snapshot(client, 3, &snapshot);
+        assert_eq!(audit_result, PeriodicAuditResult::EquivalentPrefix);
+        let rebuilt_engine = rebuilt_engine.expect("matching rebase should rebuild suffix state");
+        let expected_output = rebuilt_engine
+            .window
+            .blocks
+            .front()
+            .expect("rebuilt suffix block should exist")
+            .published_outputs[0]
+            .clone();
+
+        engine
+            .window
+            .blocks
+            .get_mut(1)
+            .expect("second retained block should exist")
+            .published_outputs[0]
+            .block_timestamp = Some(1_234_567_890);
+
+        let outcome = engine
+            .process_canonical_block(&canonical_block)
+            .expect("rebase should rebuild retained suffix from canonical anchor");
+
+        assert!(matches!(outcome, HotApplyOutcome::CanonicalWindowChanged));
+        assert_eq!(engine.window.anchor, HotWindowAnchor::new(1, canonical_hash));
+        assert!(engine.window.execution.is_some());
+        assert_eq!(engine.window.blocks.len(), 1);
+        assert_eq!(engine.window.blocks.front().map(|block| block.block_number), Some(2));
+        assert_eq!(
+            engine
+                .window
+                .blocks
+                .front()
+                .expect("retained suffix block should remain")
+                .published_outputs[0],
+            expected_output
+        );
+        assert_ne!(
+            engine
+                .window
+                .blocks
+                .front()
+                .expect("retained suffix block should remain")
+                .published_outputs[0]
+                .block_timestamp,
+            Some(1_234_567_890)
+        );
+    }
+
+    #[test]
+    fn hot_engine_canonical_rebase_structural_mismatch_invalidates_session() {
         let client = test_client();
         let canonical_parent_hash = client.chain_spec().genesis_hash();
 
@@ -2667,12 +2856,17 @@ mod tests {
             .blocks
             .get_mut(1)
             .expect("second retained block should exist")
-            .published_outputs[0]
-            .block_timestamp = Some(1_234_567_890);
+            .flashblocks
+            .first_mut()
+            .expect("retained suffix should include its first flashblock")
+            .base
+            .as_mut()
+            .expect("retained suffix should keep its first flashblock base")
+            .parent_hash = B256::with_last_byte(0xee);
 
         let outcome = engine
             .process_canonical_block(&canonical_block)
-            .expect("rebase mismatch should fail closed");
+            .expect("rebase structural mismatch should fail closed");
 
         assert!(matches!(
             outcome,
