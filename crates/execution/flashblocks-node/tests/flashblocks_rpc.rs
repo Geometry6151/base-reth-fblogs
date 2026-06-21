@@ -1507,6 +1507,7 @@ async fn test_base_call_at_flashblock_hot_only() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn base_dry_run_latest_flashblock_returns_missing_snapshot_before_fast_delta() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let response = setup
@@ -1544,6 +1545,7 @@ async fn base_dry_run_at_flashblock_unknown_snapshot_returns_invalid_params() ->
 }
 
 #[tokio::test]
+#[serial]
 async fn base_dry_run_latest_flashblock_returns_snapshot_id_and_gas_used_for_simple_success()
 -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
@@ -1738,6 +1740,7 @@ async fn dry_run_latest_sidecar_reset_clears_warm_state_and_falls_back_until_reb
 }
 
 #[tokio::test]
+#[serial]
 async fn sidecar_overflow_does_not_block_fast_logs() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let mut first_payload = setup.create_first_payload();
@@ -1793,6 +1796,7 @@ async fn sidecar_publishes_matching_latest_warm_state() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial]
 async fn sidecar_recovers_from_drop_using_authoritative_rebuild() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let initial_snapshot_id =
@@ -1829,6 +1833,7 @@ async fn sidecar_recovers_from_drop_using_authoritative_rebuild() -> Result<()> 
 }
 
 #[tokio::test]
+#[serial]
 async fn sidecar_recovers_after_reset_with_authoritative_snapshot_nonce() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let initial_snapshot_id =
@@ -1864,6 +1869,7 @@ async fn sidecar_recovers_after_reset_with_authoritative_snapshot_nonce() -> Res
 }
 
 #[tokio::test]
+#[serial]
 async fn base_dry_run_latest_flashblock_returns_revert_bytes_for_simple_revert() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let expected_snapshot_id =
@@ -1973,6 +1979,7 @@ async fn base_dry_run_latest_flashblock_matches_base_call_at_flashblock_for_succ
 }
 
 #[tokio::test]
+#[serial]
 async fn base_dry_run_latest_flashblock_reports_positive_gas_used_for_success_and_revert()
 -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
