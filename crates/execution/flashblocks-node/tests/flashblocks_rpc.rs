@@ -368,6 +368,7 @@ impl TestSetup {
                 base_fee_per_gas: U256::ZERO,
             }),
             diff: ExecutionPayloadFlashblockDeltaV1 {
+                block_hash: B256::with_last_byte(0x01),
                 blob_gas_used: Some(0),
                 transactions: vec![L1_BLOCK_INFO_DEPOSIT_TX],
                 withdrawals_root: EMPTY_WITHDRAWALS,
@@ -386,7 +387,7 @@ impl TestSetup {
                 state_root: B256::default(),
                 receipts_root: B256::default(),
                 gas_used: 0,
-                block_hash: B256::default(),
+                block_hash: B256::with_last_byte(0x02),
                 blob_gas_used: Some(0),
                 transactions: vec![
                     DEPOSIT_TX,
@@ -425,6 +426,7 @@ impl TestSetup {
                 base_fee_per_gas: U256::ZERO,
             }),
             diff: ExecutionPayloadFlashblockDeltaV1 {
+                block_hash: B256::with_last_byte(0x03),
                 blob_gas_used: Some(0),
                 transactions: vec![unique_l1_block_info_deposit_tx(2)],
                 withdrawals_root: EMPTY_WITHDRAWALS,
@@ -637,7 +639,11 @@ impl TestSetup {
             ))
             .await?;
 
-        let response = ws_stream.next().await.unwrap()?;
+        let response = next_ws_message_with_timeout(
+            &mut ws_stream,
+            "newFastFlashblockLogs subscription acknowledgement",
+        )
+        .await?;
         let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
         assert_eq!(sub["jsonrpc"], "2.0");
         assert_eq!(sub["id"], 1);
@@ -652,16 +658,11 @@ impl TestSetup {
     ) -> Result<FastFlashblockLogsDelta> {
         self.send_flashblock(flashblock).await?;
 
-        let notification = tokio::time::timeout(FAST_DELTA_NOTIFICATION_TIMEOUT, ws_stream.next())
-            .await
-            .map_err(|_| {
-                eyre::eyre!(
-                    "timed out waiting for newFastFlashblockLogs notification after sending flashblock"
-                )
-            })?
-            .ok_or_else(|| {
-                eyre::eyre!("websocket fast delta stream closed before notification arrived")
-            })??;
+        let notification = next_ws_message_with_timeout(
+            ws_stream,
+            "newFastFlashblockLogs notification after sending flashblock",
+        )
+        .await?;
         let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
         Ok(serde_json::from_value(notif["params"]["result"].clone())?)
     }
@@ -788,6 +789,17 @@ impl TestSetup {
 const FAST_DELTA_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const HOT_SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HOT_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+async fn next_ws_message_with_timeout(
+    ws_stream: &mut TestWsStream,
+    context: &str,
+) -> Result<Message> {
+    tokio::time::timeout(FAST_DELTA_NOTIFICATION_TIMEOUT, ws_stream.next())
+        .await
+        .map_err(|_| eyre::eyre!("timed out waiting for {context}"))?
+        .ok_or_else(|| eyre::eyre!("websocket stream closed before {context}"))?
+        .map_err(Into::into)
+}
 
 const TEST_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
 const PENDING_BALANCE: u64 = 4660;
@@ -3121,7 +3133,11 @@ async fn test_new_flashblock_logs_batch_hot_only_is_derived_from_fast_delta() ->
             .into(),
         ))
         .await?;
-    let batch_sub = batch_ws.next().await.unwrap()?;
+    let batch_sub = next_ws_message_with_timeout(
+        &mut batch_ws,
+        "newFlashblockLogsBatch subscription acknowledgement",
+    )
+    .await?;
     let batch_sub: serde_json::Value = serde_json::from_str(batch_sub.to_text()?)?;
     assert!(batch_sub["result"].is_string(), "batch subscription should be accepted");
 
@@ -3138,7 +3154,11 @@ async fn test_new_flashblock_logs_batch_hot_only_is_derived_from_fast_delta() ->
             .into(),
         ))
         .await?;
-    let fast_sub = fast_ws.next().await.unwrap()?;
+    let fast_sub = next_ws_message_with_timeout(
+        &mut fast_ws,
+        "newFastFlashblockLogs subscription acknowledgement",
+    )
+    .await?;
     let fast_sub: serde_json::Value = serde_json::from_str(fast_sub.to_text()?)?;
     assert!(fast_sub["result"].is_string(), "fast subscription should be accepted");
 
@@ -3149,13 +3169,21 @@ async fn test_new_flashblock_logs_batch_hot_only_is_derived_from_fast_delta() ->
             "hot-only logs batch must not depend on PendingBlocks"
         );
 
-        let fast_notification = fast_ws.next().await.unwrap()?;
+        let fast_notification = next_ws_message_with_timeout(
+            &mut fast_ws,
+            "newFastFlashblockLogs notification in hot-only batch parity test",
+        )
+        .await?;
         let fast_notification: serde_json::Value =
             serde_json::from_str(fast_notification.to_text()?)?;
         let fast_delta: FastFlashblockLogsDelta =
             serde_json::from_value(fast_notification["params"]["result"].clone())?;
 
-        let batch_notification = batch_ws.next().await.unwrap()?;
+        let batch_notification = next_ws_message_with_timeout(
+            &mut batch_ws,
+            "newFlashblockLogsBatch notification in hot-only batch parity test",
+        )
+        .await?;
         let batch_notification: serde_json::Value =
             serde_json::from_str(batch_notification.to_text()?)?;
         let batch: FlashblockLogsBatch =
@@ -3186,13 +3214,21 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_hot_only_mode() -> eyre::Re
         ))
         .await?;
 
-    let response = ws_stream.next().await.unwrap()?;
+    let response = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "newFastFlashblockLogs subscription acknowledgement",
+    )
+    .await?;
     let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
     assert_eq!(sub["jsonrpc"], "2.0");
     assert_eq!(sub["id"], 1);
 
     setup.send_flashblock(setup.create_first_payload()).await?;
-    let notification = ws_stream.next().await.unwrap()?;
+    let notification = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "newFastFlashblockLogs notification in hot-only mode test",
+    )
+    .await?;
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
 
     assert_fast_flashblock_snapshot_id(&notif["params"]["result"]["snapshotId"]);
@@ -3470,7 +3506,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_unfiltered() -> eyre::Resul
         ))
         .await?;
 
-    let response = ws_stream.next().await.unwrap()?;
+    let response = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "newFastFlashblockLogs subscription acknowledgement",
+    )
+    .await?;
     let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
     assert_eq!(sub["jsonrpc"], "2.0");
     assert_eq!(sub["id"], 1);
@@ -3478,7 +3518,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_unfiltered() -> eyre::Resul
 
     setup.send_flashblock(setup.create_first_payload()).await?;
 
-    let notification = ws_stream.next().await.unwrap()?;
+    let notification = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "first newFastFlashblockLogs notification in unfiltered test",
+    )
+    .await?;
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
     assert_eq!(notif["method"], "eth_subscription");
     assert_eq!(notif["params"]["subscription"], subscription_id);
@@ -3500,7 +3544,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_unfiltered() -> eyre::Resul
 
     setup.send_flashblock(setup.create_second_payload()).await?;
 
-    let notification = ws_stream.next().await.unwrap()?;
+    let notification = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "second newFastFlashblockLogs notification in unfiltered test",
+    )
+    .await?;
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
     assert_eq!(notif["params"]["subscription"], subscription_id);
 
@@ -3583,7 +3631,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_filter() -> eyre::Result<()
         ))
         .await?;
 
-    let response = ws_stream.next().await.unwrap()?;
+    let response = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "newFastFlashblockLogs subscription acknowledgement",
+    )
+    .await?;
     let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
     assert_eq!(sub["jsonrpc"], "2.0");
     assert_eq!(sub["id"], 1);
@@ -3591,7 +3643,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_filter() -> eyre::Result<()
 
     setup.send_flashblock(setup.create_first_payload()).await?;
 
-    let notification = ws_stream.next().await.unwrap()?;
+    let notification = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "first newFastFlashblockLogs notification in filter test",
+    )
+    .await?;
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
     assert_eq!(notif["params"]["subscription"], subscription_id);
 
@@ -3602,7 +3658,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_filter() -> eyre::Result<()
 
     setup.send_flashblock(setup.create_second_payload()).await?;
 
-    let notification = ws_stream.next().await.unwrap()?;
+    let notification = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "second newFastFlashblockLogs notification in filter test",
+    )
+    .await?;
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
     assert_eq!(notif["params"]["subscription"], subscription_id);
 
@@ -3687,7 +3747,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_null_params() -> eyre::Resu
         ))
         .await?;
 
-    let response = ws_stream.next().await.unwrap()?;
+    let response = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "newFastFlashblockLogs subscription acknowledgement",
+    )
+    .await?;
     let sub: serde_json::Value = serde_json::from_str(response.to_text()?)?;
     assert_eq!(sub["jsonrpc"], "2.0");
     assert_eq!(sub["id"], 1);
@@ -3695,7 +3759,11 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_null_params() -> eyre::Resu
 
     setup.send_flashblock(setup.create_first_payload()).await?;
 
-    let notification = ws_stream.next().await.unwrap()?;
+    let notification = next_ws_message_with_timeout(
+        &mut ws_stream,
+        "newFastFlashblockLogs notification in null-params test",
+    )
+    .await?;
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
     assert_eq!(notif["method"], "eth_subscription");
     assert_eq!(notif["params"]["subscription"], subscription_id);
