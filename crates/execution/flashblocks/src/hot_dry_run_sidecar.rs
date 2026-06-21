@@ -2,10 +2,7 @@
 
 use std::{
     fmt,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use alloy_primitives::B256;
@@ -15,14 +12,11 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{AuditWindowSnapshot, FlashblockSnapshotId, HotSnapshot};
 
-/// Internal availability and observability state for the hot dry-run sidecar.
+/// Low-cardinality availability and observability state for the hot dry-run sidecar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotDryRunSidecarStatus {
-    /// The sidecar holds a warm state for the provided snapshot id.
-    Warm {
-        /// Snapshot id represented by the latest warm state.
-        snapshot_id: FlashblockSnapshotId,
-    },
+    /// The sidecar currently holds a warm state.
+    Warm,
     /// The sidecar is not currently warm.
     Unavailable,
     /// The bounded ingress queue overflowed.
@@ -113,8 +107,7 @@ pub struct HotDryRunSidecarManager {
     sender: mpsc::Sender<HotDryRunSidecarInput>,
     receiver: Arc<Mutex<mpsc::Receiver<HotDryRunSidecarInput>>>,
     latest_warm_state: Arc<ArcSwapOption<HotDryRunWarmState>>,
-    current_generation: AtomicU64,
-    status: StdMutex<HotDryRunSidecarStatus>,
+    publication: StdMutex<(u64, HotDryRunSidecarStatus)>,
 }
 
 impl HotDryRunSidecarManager {
@@ -126,8 +119,7 @@ impl HotDryRunSidecarManager {
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
             latest_warm_state: Arc::new(ArcSwapOption::new(None)),
-            current_generation: AtomicU64::new(0),
-            status: StdMutex::new(HotDryRunSidecarStatus::Unavailable),
+            publication: StdMutex::new((0, HotDryRunSidecarStatus::Unavailable)),
         }
     }
 
@@ -138,12 +130,12 @@ impl HotDryRunSidecarManager {
 
     /// Returns the currently active sidecar generation.
     pub fn current_generation(&self) -> u64 {
-        self.current_generation.load(Ordering::Acquire)
+        self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned").0
     }
 
     /// Returns the current low-cardinality sidecar status.
     pub fn status(&self) -> HotDryRunSidecarStatus {
-        *self.status.lock().expect("hot dry-run sidecar status mutex poisoned")
+        self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned").1
     }
 
     /// Returns the most recently published warm state, if any.
@@ -162,24 +154,35 @@ impl HotDryRunSidecarManager {
         generation: u64,
         warm_state: Arc<HotDryRunWarmState>,
     ) -> bool {
-        if self.current_generation() != generation {
+        let mut publication =
+            self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned");
+
+        if publication.0 != generation {
             return false;
         }
 
         self.latest_warm_state.store(Some(Arc::clone(&warm_state)));
-        *self.status.lock().expect("hot dry-run sidecar status mutex poisoned") =
-            HotDryRunSidecarStatus::Warm { snapshot_id: warm_state.snapshot_id };
+        publication.1 = HotDryRunSidecarStatus::Warm;
         true
     }
 
     /// Clears the latest warm state and advances the generation for stale-work invalidation.
     pub fn mark_unavailable(&self, status: HotDryRunSidecarStatus) {
+        let mut publication =
+            self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned");
+
+        self.mark_unavailable_locked(&mut publication, status);
+    }
+
+    fn mark_unavailable_locked(
+        &self,
+        publication: &mut (u64, HotDryRunSidecarStatus),
+        status: HotDryRunSidecarStatus,
+    ) {
         self.latest_warm_state.store(None);
-        _ = self.current_generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.saturating_add(1))
-        });
-        *self.status.lock().expect("hot dry-run sidecar status mutex poisoned") = match status {
-            HotDryRunSidecarStatus::Warm { .. } => HotDryRunSidecarStatus::Unavailable,
+        publication.0 = publication.0.saturating_add(1);
+        publication.1 = match status {
+            HotDryRunSidecarStatus::Warm => HotDryRunSidecarStatus::Unavailable,
             status => status,
         };
     }
@@ -197,7 +200,10 @@ impl fmt::Debug for HotDryRunSidecarManager {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+    };
 
     use alloy_consensus::{Header, Sealed};
     use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
@@ -327,5 +333,31 @@ mod tests {
 
         let latest = manager.latest_warm_state().expect("warm state should publish");
         assert_eq!(latest.snapshot_id, warm_state.snapshot_id);
+    }
+
+    #[test]
+    fn concurrent_invalidation_prevents_stale_publish_from_republishing_warm_state() {
+        let manager = Arc::new(HotDryRunSidecarManager::new(1));
+        let generation = manager.current_generation();
+
+        assert!(manager.try_publish_warm_state(generation, warm_state(snapshot_id(13))));
+
+        let mut publication =
+            manager.publication.lock().expect("hot dry-run sidecar publication mutex poisoned");
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let manager_for_thread = Arc::clone(&manager);
+        let publish_thread = thread::spawn(move || {
+            attempt_tx.send(()).expect("publisher should signal attempt");
+            manager_for_thread.try_publish_warm_state(generation, warm_state(snapshot_id(15)))
+        });
+
+        attempt_rx.recv().expect("publisher should attempt publish");
+        manager.mark_unavailable_locked(&mut publication, HotDryRunSidecarStatus::Reset);
+        drop(publication);
+
+        assert!(!publish_thread.join().expect("publisher thread should finish"));
+        assert!(manager.current_generation() > generation);
+        assert_eq!(manager.status(), HotDryRunSidecarStatus::Reset);
+        assert!(manager.latest_warm_state().is_none());
     }
 }
