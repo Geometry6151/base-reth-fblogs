@@ -998,6 +998,15 @@ where
     }
 
     async fn apply_hot_only_replay_queue(&self, replay_queue: &mut VecDeque<Flashblock>) -> bool {
+        enum HotReplayQueueOutcome {
+            Delta { ready_cached_block: Option<BlockNumber> },
+            Duplicate,
+            CanonicalWindowChanged,
+            Reset { missing_first_flashblock: bool, hot_window_invalidated: bool },
+            InvalidateSession { reason: HotInvalidationReason },
+            Error { error: StateProcessorError, hot_window_invalidated: bool },
+        }
+
         while let Some(flashblock) = replay_queue.pop_front() {
             let _flashblock_apply_timer =
                 base_metrics::timed!(Metrics::flashblock_apply_duration());
@@ -1007,9 +1016,7 @@ where
                 continue;
             }
 
-            let sidecar_generation = self.hot_dry_run_sidecar_manager.current_generation();
-            let sidecar_status = self.hot_dry_run_sidecar_manager.status();
-            let (outcome, missing_first_flashblock, hot_window_invalidated, replay_snapshot) = {
+            let outcome = {
                 let mut hot_engine = self.hot_engine().lock().await;
                 let missing_first_flashblock = (hot_engine.window.execution.is_none()
                     || hot_engine.window.blocks.is_empty())
@@ -1017,45 +1024,65 @@ where
                 let outcome = hot_engine.apply_flashblock(&flashblock);
                 let hot_window_invalidated =
                     hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
-                let replay_snapshot = match outcome.as_ref() {
-                    Ok(HotApplyOutcome::Delta { snapshot: Some(snapshot), .. })
-                        if sidecar_status != HotDryRunSidecarStatus::Warm =>
-                    {
-                        let anchor = hot_engine.window.anchor;
-                        hot_engine.window.make_audit_snapshot(
-                            sidecar_generation,
-                            snapshot.snapshot_id.nonce(),
-                            anchor.block_number(),
-                            anchor.hash(),
-                        )
+
+                match outcome {
+                    Ok(HotApplyOutcome::Delta { delta, snapshot, ready_cached_block }) => {
+                        let hot_snapshot = snapshot.map(|snapshot| {
+                            let snapshot = Arc::new(*snapshot);
+                            self.hot_snapshot_ring
+                                .lock()
+                                .expect("hot snapshot ring mutex poisoned")
+                                .insert(Arc::clone(&snapshot));
+                            snapshot
+                        });
+                        _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(*delta)));
+
+                        if let Some(hot_snapshot) = hot_snapshot {
+                            let (sidecar_generation, sidecar_status) =
+                                self.hot_dry_run_sidecar_manager.publication_state();
+                            let replay_snapshot = if sidecar_status == HotDryRunSidecarStatus::Warm
+                            {
+                                None
+                            } else {
+                                let anchor = hot_engine.window.anchor;
+                                hot_engine.window.make_audit_snapshot(
+                                    sidecar_generation,
+                                    hot_snapshot.snapshot_id.nonce(),
+                                    anchor.block_number(),
+                                    anchor.hash(),
+                                )
+                            };
+
+                            self.try_publish_hot_dry_run_sidecar_after_send(
+                                Self::build_hot_dry_run_sidecar_input(
+                                    &flashblock,
+                                    hot_snapshot,
+                                    sidecar_status,
+                                    sidecar_generation,
+                                    replay_snapshot,
+                                ),
+                            );
+                        }
+
+                        HotReplayQueueOutcome::Delta { ready_cached_block }
                     }
-                    _ => None,
-                };
-                (outcome, missing_first_flashblock, hot_window_invalidated, replay_snapshot)
+                    Ok(HotApplyOutcome::Duplicate) => HotReplayQueueOutcome::Duplicate,
+                    Ok(HotApplyOutcome::CanonicalWindowChanged) => {
+                        HotReplayQueueOutcome::CanonicalWindowChanged
+                    }
+                    Ok(HotApplyOutcome::Reset) => HotReplayQueueOutcome::Reset {
+                        missing_first_flashblock,
+                        hot_window_invalidated,
+                    },
+                    Ok(HotApplyOutcome::InvalidateSession { reason }) => {
+                        HotReplayQueueOutcome::InvalidateSession { reason }
+                    }
+                    Err(error) => HotReplayQueueOutcome::Error { error, hot_window_invalidated },
+                }
             };
 
             match outcome {
-                Ok(HotApplyOutcome::Delta { delta, snapshot, ready_cached_block }) => {
-                    let hot_snapshot = snapshot.map(|snapshot| {
-                        let snapshot = Arc::new(*snapshot);
-                        self.hot_snapshot_ring
-                            .lock()
-                            .expect("hot snapshot ring mutex poisoned")
-                            .insert(Arc::clone(&snapshot));
-                        snapshot
-                    });
-                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(*delta)));
-                    self.try_publish_hot_dry_run_sidecar_after_send(hot_snapshot.and_then(
-                        |hot_snapshot| {
-                            Self::build_hot_dry_run_sidecar_input(
-                                &flashblock,
-                                hot_snapshot,
-                                sidecar_status,
-                                sidecar_generation,
-                                replay_snapshot,
-                            )
-                        },
-                    ));
+                HotReplayQueueOutcome::Delta { ready_cached_block } => {
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
 
                     if let Some(ready_cached_block) = ready_cached_block {
@@ -1074,15 +1101,18 @@ where
                         }
                     }
                 }
-                Ok(HotApplyOutcome::Duplicate) => {
+                HotReplayQueueOutcome::Duplicate => {
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
-                Ok(HotApplyOutcome::CanonicalWindowChanged) => {
+                HotReplayQueueOutcome::CanonicalWindowChanged => {
                     self.advance_hot_periodic_audit_generation();
                     self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
-                Ok(HotApplyOutcome::Reset) => {
+                HotReplayQueueOutcome::Reset {
+                    missing_first_flashblock,
+                    hot_window_invalidated,
+                } => {
                     self.advance_hot_periodic_audit_generation();
                     if hot_window_invalidated {
                         self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
@@ -1107,12 +1137,12 @@ where
                     }
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
-                Ok(HotApplyOutcome::InvalidateSession { reason }) => {
+                HotReplayQueueOutcome::InvalidateSession { reason } => {
                     self.handle_hot_invalidation(None, reason).await;
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                     return true;
                 }
-                Err(e) => {
+                HotReplayQueueOutcome::Error { error: e, hot_window_invalidated } => {
                     if let StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
                     }) = e

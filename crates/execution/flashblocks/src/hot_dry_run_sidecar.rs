@@ -143,6 +143,11 @@ impl HotDryRunSidecarManager {
         self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned").1
     }
 
+    /// Returns the current sidecar publication generation and status from one lock acquisition.
+    pub fn publication_state(&self) -> (u64, HotDryRunSidecarStatus) {
+        *self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned")
+    }
+
     /// Returns the most recently published warm state, if any.
     pub fn latest_warm_state(&self) -> Option<Arc<HotDryRunWarmState>> {
         self.latest_warm_state.load_full()
