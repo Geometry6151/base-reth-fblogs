@@ -27,6 +27,12 @@ pub use fast_logs::{
     FastFlashblockLogsDeltaError, FastFlashblockTxMeta, FlashblockSnapshotId,
 };
 
+mod hot_dry_run_sidecar;
+pub use hot_dry_run_sidecar::{
+    HotDryRunApplyInput, HotDryRunRebuildInput, HotDryRunSidecarInput,
+    HotDryRunSidecarManager, HotDryRunSidecarStatus, HotDryRunWarmState,
+};
+
 mod hot_engine;
 pub use hot_engine::{
     HotApplyOutcome, HotEngine, HotExecutionDb, HotInvalidationReason, ShadowRebuildCompletion,

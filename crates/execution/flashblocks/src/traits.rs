@@ -13,7 +13,8 @@ use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
 use tokio::sync::broadcast;
 
 use crate::{
-    FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksMode, HotSnapshot, PendingBlocks,
+    FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksMode, HotDryRunWarmState,
+    HotSnapshot, PendingBlocks,
 };
 
 /// Trait for receiving flashblock updates.
@@ -42,6 +43,9 @@ pub trait FlashblocksAPI {
 
     /// Returns the most recently cached hot snapshot for latest dry-run RPC.
     fn get_latest_hot_snapshot(&self) -> Option<Arc<HotSnapshot>>;
+
+    /// Returns the most recently published warm hot dry-run sidecar state.
+    fn get_latest_hot_dry_run_state(&self) -> Option<Arc<HotDryRunWarmState>>;
 
     /// Returns the configured flashblocks runtime mode.
     fn mode(&self) -> FlashblocksMode;

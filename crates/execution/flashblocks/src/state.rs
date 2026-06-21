@@ -21,12 +21,14 @@ use tokio::sync::{
 
 use crate::{
     FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode,
-    FlashblocksReceiver, HotSnapshot, HotSnapshotRing, PendingBlocks, SnapshotCache,
+    FlashblocksReceiver, HotDryRunSidecarManager, HotDryRunWarmState, HotSnapshot,
+    HotSnapshotRing, PendingBlocks, SnapshotCache,
     processor::{StateProcessor, StateProcessorHandles, StateUpdate},
     snapshot_cache::{DEFAULT_SNAPSHOT_CACHE_CAPACITY, DEFAULT_SNAPSHOT_CACHE_TTL},
 };
 
 const FLASHBLOCK_BROADCAST_BUFFER_CAPACITY: usize = 20;
+const HOT_DRY_RUN_SIDECAR_INGRESS_CAPACITY: usize = FLASHBLOCK_BROADCAST_BUFFER_CAPACITY;
 
 // Keep snapshot retention at least as deep as the fast broadcast ring.
 const SNAPSHOT_CACHE_CAPACITY: usize =
@@ -46,6 +48,7 @@ pub struct FlashblocksState {
     rx: Arc<Mutex<mpsc::UnboundedReceiver<StateUpdate>>>,
     fast_flashblock_sender: Sender<FastFlashblockFeedEvent>,
     flashblock_sender: Sender<Arc<PendingBlocks>>,
+    hot_dry_run_sidecar_manager: Arc<HotDryRunSidecarManager>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
     max_pending_blocks_depth: u64,
@@ -67,6 +70,8 @@ impl FlashblocksState {
         let pending_blocks: Arc<ArcSwapOption<PendingBlocks>> = Arc::new(ArcSwapOption::new(None));
         let (fast_flashblock_sender, _) = broadcast::channel(FLASHBLOCK_BROADCAST_BUFFER_CAPACITY);
         let (flashblock_sender, _) = broadcast::channel(FLASHBLOCK_BROADCAST_BUFFER_CAPACITY);
+        let hot_dry_run_sidecar_manager =
+            Arc::new(HotDryRunSidecarManager::new(HOT_DRY_RUN_SIDECAR_INGRESS_CAPACITY));
 
         Self {
             pending_blocks,
@@ -74,6 +79,7 @@ impl FlashblocksState {
             rx: Arc::new(Mutex::new(rx)),
             fast_flashblock_sender,
             flashblock_sender,
+            hot_dry_run_sidecar_manager,
             snapshot_cache: Arc::new(StdMutex::new(SnapshotCache::new(
                 SNAPSHOT_CACHE_CAPACITY,
                 SNAPSHOT_CACHE_RETENTION_TTL,
@@ -193,6 +199,14 @@ impl FlashblocksAPI for FlashblocksState {
         }
 
         self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").latest()
+    }
+
+    fn get_latest_hot_dry_run_state(&self) -> Option<Arc<HotDryRunWarmState>> {
+        if self.mode != FlashblocksMode::HotOnly {
+            return None;
+        }
+
+        self.hot_dry_run_sidecar_manager.latest_warm_state()
     }
 
     fn mode(&self) -> FlashblocksMode {
