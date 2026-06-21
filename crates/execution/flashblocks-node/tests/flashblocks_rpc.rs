@@ -1592,6 +1592,7 @@ async fn dry_run_latest_sidecar_matches_direct_for_success() -> Result<()> {
 
     assert_latest_dry_run_used_sidecar_hit(before_path_counts, after_path_counts);
     assert_eq!(latest, direct);
+    assert_eq!(latest.snapshot_id, snapshot_id);
     assert!(latest.success);
     assert_eq!(latest.revert, None);
     assert_eq!(latest.halt, None);
@@ -1614,6 +1615,7 @@ async fn dry_run_latest_sidecar_matches_direct_for_revert() -> Result<()> {
 
     assert_latest_dry_run_used_sidecar_hit(before_path_counts, after_path_counts);
     assert_eq!(latest, direct);
+    assert_eq!(latest.snapshot_id, snapshot_id);
     assert!(!latest.success);
     assert_eq!(latest.revert, Some(bytes!("0x")));
     assert_eq!(latest.halt, None);
@@ -1639,6 +1641,7 @@ async fn dry_run_latest_sidecar_matches_direct_for_halt() -> Result<()> {
 
     assert_latest_dry_run_used_sidecar_hit(before_path_counts, after_path_counts);
     assert_eq!(latest, direct);
+    assert_eq!(latest.snapshot_id, snapshot_id);
     assert!(!latest.success);
     assert_eq!(latest.revert, None);
     assert!(latest.halt.is_some(), "expected a halt result");
@@ -1674,6 +1677,38 @@ async fn dry_run_latest_sidecar_stale_snapshot_id_falls_back_to_direct_latest_pa
     assert!(
         after_path_counts.2 > before_path_counts.2,
         "expected stale sidecar mismatch accounting on direct fallback"
+    );
+    assert_eq!(latest.snapshot_id, expected_snapshot_id);
+    assert_eq!(latest, direct);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_rollover_stale_snapshot_id_falls_back_to_direct_latest_path()
+-> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let initial_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(initial_snapshot_id).await?;
+
+    setup.harness.flashblocks_state().hold_hot_dry_run_sidecar_worker_for_testing();
+    let next_block_parent_hash = setup.pending_parent_hash_for_next_block().await?;
+    setup.send_flashblock(setup.create_third_payload(next_block_parent_hash)).await?;
+    let expected_snapshot_id = setup.wait_for_latest_hot_snapshot_id(2, 0).await?;
+    let transaction = setup.count1_from_alice();
+    let before_path_counts = latest_dry_run_path_counts();
+
+    let latest = setup.latest_dry_run(transaction.clone()).await?;
+    let after_path_counts = latest_dry_run_path_counts();
+    setup.harness.flashblocks_state().release_hot_dry_run_sidecar_worker_for_testing();
+    let direct = setup.dry_run_at(expected_snapshot_id, transaction).await?;
+
+    assert_latest_dry_run_used_direct_fallback(before_path_counts, after_path_counts);
+    assert!(
+        after_path_counts.2 > before_path_counts.2,
+        "expected stale sidecar mismatch accounting across block rollover"
     );
     assert_eq!(latest.snapshot_id, expected_snapshot_id);
     assert_eq!(latest, direct);
