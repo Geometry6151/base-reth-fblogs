@@ -30,10 +30,11 @@ use base_flashblocks_node::test_harness::FlashblocksHarness;
 use base_node_runner::test_utils::L1_BLOCK_INFO_DEPOSIT_TX;
 use base_test_utils::{Account, DoubleCounter};
 use eyre::Result;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, future::join_all};
 use reth_revm::context::TransactionType;
 use reth_rpc_eth_api::RpcReceipt;
 use serde_json::json;
+use serial_test::serial;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -759,6 +760,28 @@ impl TestSetup {
 
         Ok(serde_json::from_str(response.to_text()?)?)
     }
+
+    async fn latest_dry_run(
+        &self,
+        transaction: BaseTransactionRequest,
+    ) -> Result<FlashblockDryRunResult> {
+        let response =
+            self.ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([transaction])).await?;
+
+        Ok(serde_json::from_value(response["result"].clone())?)
+    }
+
+    async fn dry_run_at(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+    ) -> Result<FlashblockDryRunResult> {
+        let response = self
+            .ws_rpc_request("eth_baseDryRunAtFlashblock", json!([snapshot_id, transaction]))
+            .await?;
+
+        Ok(serde_json::from_value(response["result"].clone())?)
+    }
 }
 
 // Test constants
@@ -786,6 +809,20 @@ const TEST_LOG_TOPIC_1: B256 =
 // Test parent beacon block root for flashblock tests
 const TEST_PARENT_BEACON_BLOCK_ROOT: B256 =
     b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+fn latest_dry_run_path_counts() -> (u64, u64, u64) {
+    FlashblockDryRunResult::latest_rpc_path_counts_for_testing()
+}
+
+fn assert_latest_dry_run_used_sidecar_hit(before: (u64, u64, u64), after: (u64, u64, u64)) {
+    assert_eq!(after.0 - before.0, 1, "expected one sidecar-hit latest dry-run path");
+    assert_eq!(after.1 - before.1, 0, "expected no direct latest dry-run fallback");
+}
+
+fn assert_latest_dry_run_used_direct_fallback(before: (u64, u64, u64), after: (u64, u64, u64)) {
+    assert_eq!(after.0 - before.0, 0, "expected no sidecar-hit latest dry-run path");
+    assert_eq!(after.1 - before.1, 1, "expected one direct latest dry-run fallback");
+}
 
 #[tokio::test]
 async fn test_get_pending_block() -> Result<()> {
@@ -1528,6 +1565,179 @@ async fn base_dry_run_latest_flashblock_returns_snapshot_id_and_gas_used_for_sim
 }
 
 #[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_matches_direct_for_success() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(snapshot_id).await?;
+    let before_path_counts = latest_dry_run_path_counts();
+
+    let latest = setup.latest_dry_run(setup.count1_from_alice()).await?;
+    let after_path_counts = latest_dry_run_path_counts();
+    let direct = setup.dry_run_at(snapshot_id, setup.count1_from_alice()).await?;
+
+    assert_latest_dry_run_used_sidecar_hit(before_path_counts, after_path_counts);
+    assert_eq!(latest, direct);
+    assert!(latest.success);
+    assert_eq!(latest.revert, None);
+    assert_eq!(latest.halt, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_matches_direct_for_revert() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(snapshot_id).await?;
+    let transaction = setup.block_number_guard_create_from_alice(1);
+    let before_path_counts = latest_dry_run_path_counts();
+
+    let latest = setup.latest_dry_run(transaction.clone()).await?;
+    let after_path_counts = latest_dry_run_path_counts();
+    let direct = setup.dry_run_at(snapshot_id, transaction).await?;
+
+    assert_latest_dry_run_used_sidecar_hit(before_path_counts, after_path_counts);
+    assert_eq!(latest, direct);
+    assert!(!latest.success);
+    assert_eq!(latest.revert, Some(bytes!("0x")));
+    assert_eq!(latest.halt, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_matches_direct_for_halt() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(snapshot_id).await?;
+    let transaction = BaseTransactionRequest::default()
+        .from(Account::Alice.address())
+        .gas_limit(25_000)
+        .to(setup.txn_details.log_emitter_a_address);
+    let before_path_counts = latest_dry_run_path_counts();
+
+    let latest = setup.latest_dry_run(transaction.clone()).await?;
+    let after_path_counts = latest_dry_run_path_counts();
+    let direct = setup.dry_run_at(snapshot_id, transaction).await?;
+
+    assert_latest_dry_run_used_sidecar_hit(before_path_counts, after_path_counts);
+    assert_eq!(latest, direct);
+    assert!(!latest.success);
+    assert_eq!(latest.revert, None);
+    assert!(latest.halt.is_some(), "expected a halt result");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_stale_snapshot_id_falls_back_to_direct_latest_path() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let mut first_payload = setup.create_first_payload();
+    first_payload.diff.block_hash = B256::with_last_byte(0x01);
+    setup.send_flashblock(first_payload).await?;
+    let initial_snapshot_id = setup.wait_for_latest_hot_snapshot_id(1, 0).await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(initial_snapshot_id).await?;
+
+    let mut ws_stream = setup.subscribe_fast_flashblock_logs().await?;
+    setup.harness.flashblocks_state().hold_hot_dry_run_sidecar_worker_for_testing();
+    let mut second_payload = setup.create_second_payload();
+    second_payload.diff.block_hash = B256::with_last_byte(0x02);
+    let fast_delta =
+        setup.send_flashblock_and_collect_fast_delta(&mut ws_stream, second_payload).await?;
+    let expected_snapshot_id = fast_delta.snapshot_id;
+    let transaction = setup.count1_from_alice();
+    let before_path_counts = latest_dry_run_path_counts();
+    let latest = setup.latest_dry_run(transaction.clone()).await?;
+    let after_path_counts = latest_dry_run_path_counts();
+    setup.harness.flashblocks_state().release_hot_dry_run_sidecar_worker_for_testing();
+    let direct = setup.dry_run_at(expected_snapshot_id, transaction).await?;
+
+    assert_latest_dry_run_used_direct_fallback(before_path_counts, after_path_counts);
+    assert!(
+        after_path_counts.2 > before_path_counts.2,
+        "expected stale sidecar mismatch accounting on direct fallback"
+    );
+    assert_eq!(latest.snapshot_id, expected_snapshot_id);
+    assert_eq!(latest, direct);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_missing_latest_falls_back_to_direct_latest_path() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let initial_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(initial_snapshot_id).await?;
+
+    setup
+        .harness
+        .flashblocks_state()
+        .force_next_hot_dry_run_sidecar_after_send_failure_for_testing();
+
+    let next_block_parent_hash = setup.pending_parent_hash_for_next_block().await?;
+    let mut third_payload = setup.create_third_payload(next_block_parent_hash);
+    third_payload.diff.block_hash = B256::with_last_byte(0x03);
+    setup.send_flashblock(third_payload).await?;
+    let expected_snapshot_id = setup.wait_for_latest_hot_snapshot_id(2, 0).await?;
+    setup.wait_for_latest_hot_dry_run_state_clear().await?;
+    let before_path_counts = latest_dry_run_path_counts();
+
+    let latest = setup.latest_dry_run(setup.count1_from_alice()).await?;
+    let after_path_counts = latest_dry_run_path_counts();
+    let direct = setup.dry_run_at(expected_snapshot_id, setup.count1_from_alice()).await?;
+
+    assert_latest_dry_run_used_direct_fallback(before_path_counts, after_path_counts);
+    assert_eq!(after_path_counts.2 - before_path_counts.2, 0);
+    assert_eq!(latest.snapshot_id, expected_snapshot_id);
+    assert_eq!(latest, direct);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_latest_sidecar_reset_clears_warm_state_and_falls_back_until_rebuilt() -> Result<()>
+{
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let initial_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(initial_snapshot_id).await?;
+
+    setup.send_flashblock(setup.create_invalidating_gap_payload()).await?;
+    setup.wait_for_latest_hot_snapshot_clear().await?;
+    setup.wait_for_latest_hot_dry_run_state_clear().await?;
+
+    setup.harness.flashblocks_state().hold_hot_dry_run_sidecar_worker_for_testing();
+    let rebuilt_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let before_fallback_counts = latest_dry_run_path_counts();
+    let latest_during_rebuild = setup.latest_dry_run(setup.count1_from_alice()).await?;
+    let after_fallback_counts = latest_dry_run_path_counts();
+    setup.harness.flashblocks_state().release_hot_dry_run_sidecar_worker_for_testing();
+    let direct = setup.dry_run_at(rebuilt_snapshot_id, setup.count1_from_alice()).await?;
+
+    assert_latest_dry_run_used_direct_fallback(before_fallback_counts, after_fallback_counts);
+    assert_eq!(latest_during_rebuild.snapshot_id, rebuilt_snapshot_id);
+    assert_eq!(latest_during_rebuild, direct);
+
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(rebuilt_snapshot_id).await?;
+    let before_sidecar_counts = latest_dry_run_path_counts();
+    let latest_after_rebuild = setup.latest_dry_run(setup.count1_from_alice()).await?;
+    let after_sidecar_counts = latest_dry_run_path_counts();
+
+    assert_latest_dry_run_used_sidecar_hit(before_sidecar_counts, after_sidecar_counts);
+    assert_eq!(latest_after_rebuild, direct);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn sidecar_overflow_does_not_block_fast_logs() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let mut first_payload = setup.create_first_payload();
@@ -1672,6 +1882,39 @@ async fn base_dry_run_latest_flashblock_returns_revert_bytes_for_simple_revert()
     assert_eq!(result.halt, None);
     assert_eq!(result.snapshot_id, expected_snapshot_id);
     assert!(result.gas_used > 0, "expected positive gas used, got {}", result.gas_used);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn sidecar_hit_dry_runs_do_not_mutate_warm_state() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(snapshot_id).await?;
+    let expected = setup.dry_run_at(snapshot_id, setup.count1_from_alice()).await?;
+    let sequential_calls = 3u64;
+    let concurrent_calls = 8u64;
+    let before_path_counts = latest_dry_run_path_counts();
+
+    for _ in 0..sequential_calls {
+        let latest = setup.latest_dry_run(setup.count1_from_alice()).await?;
+        assert_eq!(latest, expected);
+    }
+
+    let concurrent_results =
+        join_all((0..concurrent_calls).map(|_| setup.latest_dry_run(setup.count1_from_alice())))
+            .await;
+    for result in concurrent_results {
+        assert_eq!(result?, expected);
+    }
+
+    let after_path_counts = latest_dry_run_path_counts();
+    assert_eq!(after_path_counts.0 - before_path_counts.0, sequential_calls + concurrent_calls);
+    assert_eq!(after_path_counts.1 - before_path_counts.1, 0);
+
+    let direct_after = setup.dry_run_at(snapshot_id, setup.count1_from_alice()).await?;
+    assert_eq!(direct_after, expected);
 
     Ok(())
 }

@@ -134,6 +134,16 @@ base_metrics::define_metrics! {
     rpc_base_dry_run_latest_code_reads: histogram,
     #[describe("Canonical block-hash reads during one latest hot dry-run")]
     rpc_base_dry_run_latest_block_hash_reads: histogram,
+    #[describe("Count of latest hot dry-run RPCs served from the warm sidecar")]
+    rpc_base_dry_run_latest_sidecar_hit_count: counter,
+    #[describe("Time taken by latest hot dry-run RPCs served from the warm sidecar")]
+    rpc_base_dry_run_latest_sidecar_hit_duration: histogram,
+    #[describe("Count of latest hot dry-run RPCs that fell back to the direct hot snapshot path")]
+    rpc_base_dry_run_latest_direct_fallback_count: counter,
+    #[describe("Time taken by latest hot dry-run RPCs that fell back to the direct hot snapshot path")]
+    rpc_base_dry_run_latest_direct_fallback_duration: histogram,
+    #[describe("Count of latest hot dry-run RPCs that skipped a stale sidecar snapshot")]
+    rpc_base_dry_run_latest_sidecar_stale_count: counter,
     #[describe("Count of successful hot dry-run RPC executions")]
     rpc_base_dry_run_success_count: counter,
     #[describe("Count of reverting hot dry-run RPC executions")]
@@ -218,6 +228,11 @@ mod tests {
         let _ = Metrics::rpc_base_dry_run_latest_storage_reads();
         let _ = Metrics::rpc_base_dry_run_latest_code_reads();
         let _ = Metrics::rpc_base_dry_run_latest_block_hash_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_sidecar_hit_count();
+        let _ = Metrics::rpc_base_dry_run_latest_sidecar_hit_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_direct_fallback_count();
+        let _ = Metrics::rpc_base_dry_run_latest_direct_fallback_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_sidecar_stale_count();
         let _ = Metrics::rpc_base_dry_run_success_count();
         let _ = Metrics::rpc_base_dry_run_revert_count();
         let _ = Metrics::rpc_base_dry_run_halt_count();

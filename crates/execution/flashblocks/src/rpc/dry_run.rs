@@ -25,7 +25,9 @@ use revm::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{FlashblockSnapshotId, HotOverlay, HotOverlayDb, HotSnapshot, Metrics};
+use crate::{
+    FlashblockSnapshotId, HotDryRunWarmState, HotOverlay, HotOverlayDb, HotSnapshot, Metrics,
+};
 
 /// Result returned by hot flashblock dry-run RPC methods.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +61,51 @@ impl FlashblockDryRunResult {
     pub fn halt(snapshot_id: FlashblockSnapshotId, halt: String, gas_used: u64) -> Self {
         Self { success: false, revert: None, halt: Some(halt), gas_used, snapshot_id }
     }
+
+    #[doc(hidden)]
+    pub fn latest_rpc_path_counts_for_testing() -> (u64, u64, u64) {
+        LATEST_DRY_RUN_PATH_COUNTS.snapshot()
+    }
 }
+
+#[derive(Debug)]
+struct LatestDryRunPathCounts {
+    sidecar_hits: AtomicU64,
+    direct_fallbacks: AtomicU64,
+    stale_mismatches: AtomicU64,
+}
+
+impl LatestDryRunPathCounts {
+    const fn new() -> Self {
+        Self {
+            sidecar_hits: AtomicU64::new(0),
+            direct_fallbacks: AtomicU64::new(0),
+            stale_mismatches: AtomicU64::new(0),
+        }
+    }
+
+    fn increment_sidecar_hits(&self) {
+        self.sidecar_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_direct_fallbacks(&self) {
+        self.direct_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_stale_mismatches(&self) {
+        self.stale_mismatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.sidecar_hits.load(Ordering::Relaxed),
+            self.direct_fallbacks.load(Ordering::Relaxed),
+            self.stale_mismatches.load(Ordering::Relaxed),
+        )
+    }
+}
+
+static LATEST_DRY_RUN_PATH_COUNTS: LatestDryRunPathCounts = LatestDryRunPathCounts::new();
 
 #[derive(Debug, Default)]
 struct CanonicalReadCounts {
@@ -171,10 +217,48 @@ fn increment_outcome_metric(result: &FlashblockDryRunResult) -> &'static str {
     }
 }
 
-pub(crate) async fn dry_run_hot_snapshot<Eth>(
+fn dry_run_result_from_execution<Halt>(
+    snapshot_id: FlashblockSnapshotId,
+    result: ExecutionResult<Halt>,
+) -> FlashblockDryRunResult
+where
+    Halt: std::fmt::Debug,
+{
+    match result {
+        ExecutionResult::Success { gas_used, .. } => {
+            FlashblockDryRunResult::success(snapshot_id, gas_used)
+        }
+        ExecutionResult::Revert { gas_used, output } => {
+            FlashblockDryRunResult::revert(snapshot_id, output, gas_used)
+        }
+        ExecutionResult::Halt { gas_used, reason } => {
+            FlashblockDryRunResult::halt(snapshot_id, format!("{reason:?}"), gas_used)
+        }
+    }
+}
+
+fn record_latest_sidecar_hit(duration: Duration) {
+    LATEST_DRY_RUN_PATH_COUNTS.increment_sidecar_hits();
+    Metrics::rpc_base_dry_run_latest_sidecar_hit_count().increment(1);
+    Metrics::rpc_base_dry_run_latest_sidecar_hit_duration().record(duration);
+}
+
+fn record_latest_direct_fallback(duration: Duration) {
+    LATEST_DRY_RUN_PATH_COUNTS.increment_direct_fallbacks();
+    Metrics::rpc_base_dry_run_latest_direct_fallback_count().increment(1);
+    Metrics::rpc_base_dry_run_latest_direct_fallback_duration().record(duration);
+}
+
+fn record_latest_sidecar_stale_mismatch() {
+    LATEST_DRY_RUN_PATH_COUNTS.increment_stale_mismatches();
+    Metrics::rpc_base_dry_run_latest_sidecar_stale_count().increment(1);
+}
+
+async fn dry_run_hot_snapshot_inner<Eth>(
     eth_api: &Eth,
     method: &'static str,
     snapshot: Arc<HotSnapshot>,
+    warm_state: Option<Arc<HotDryRunWarmState>>,
     transaction: BaseTransactionRequest,
 ) -> RpcResult<FlashblockDryRunResult>
 where
@@ -233,7 +317,10 @@ where
                 dry_run_read_counts,
             );
             let overlay_db = HotOverlayDb::new(canonical, overlay);
-            let mut db = State::builder().with_database(overlay_db).build();
+            let mut db = match warm_state {
+                Some(warm_state) => warm_state.build_request_state(overlay_db),
+                None => State::builder().with_database(overlay_db).build(),
+            };
 
             let env_build_start = Instant::now();
             apply_block_overrides(block_overrides, &mut db, evm_env.block_env.inner_mut());
@@ -271,17 +358,7 @@ where
     let canonical_code_reads = read_counts.code_reads();
     let canonical_block_hash_reads = read_counts.block_hash_reads();
 
-    let result = match result.result {
-        ExecutionResult::Success { gas_used, .. } => {
-            FlashblockDryRunResult::success(snapshot_id, gas_used)
-        }
-        ExecutionResult::Revert { gas_used, output } => {
-            FlashblockDryRunResult::revert(snapshot_id, output, gas_used)
-        }
-        ExecutionResult::Halt { gas_used, reason } => {
-            FlashblockDryRunResult::halt(snapshot_id, format!("{reason:?}"), gas_used)
-        }
-    };
+    let result = dry_run_result_from_execution(snapshot_id, result.result);
 
     let outcome = increment_outcome_metric(&result);
     let total_duration = total_start.elapsed();
@@ -304,6 +381,53 @@ where
     );
 
     Ok(result)
+}
+
+pub(crate) async fn dry_run_latest_hot_snapshot<Eth>(
+    eth_api: &Eth,
+    snapshot: Arc<HotSnapshot>,
+    sidecar_latest: Option<Arc<HotDryRunWarmState>>,
+    transaction: BaseTransactionRequest,
+) -> RpcResult<FlashblockDryRunResult>
+where
+    Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
+    ErrorObjectOwned: From<Eth::Error>,
+{
+    if let Some(sidecar_latest) = sidecar_latest {
+        if sidecar_latest.snapshot_id == snapshot.snapshot_id {
+            let path_start = Instant::now();
+            let result = dry_run_hot_snapshot_inner(
+                eth_api,
+                "latest",
+                snapshot,
+                Some(sidecar_latest),
+                transaction,
+            )
+            .await;
+            record_latest_sidecar_hit(path_start.elapsed());
+            return result;
+        }
+
+        record_latest_sidecar_stale_mismatch();
+    }
+
+    let path_start = Instant::now();
+    let result = dry_run_hot_snapshot_inner(eth_api, "latest", snapshot, None, transaction).await;
+    record_latest_direct_fallback(path_start.elapsed());
+    result
+}
+
+pub(crate) async fn dry_run_hot_snapshot<Eth>(
+    eth_api: &Eth,
+    method: &'static str,
+    snapshot: Arc<HotSnapshot>,
+    transaction: BaseTransactionRequest,
+) -> RpcResult<FlashblockDryRunResult>
+where
+    Eth: FullEthApi<NetworkTypes = Base> + Send + Sync + 'static,
+    ErrorObjectOwned: From<Eth::Error>,
+{
+    dry_run_hot_snapshot_inner(eth_api, method, snapshot, None, transaction).await
 }
 
 #[cfg(test)]

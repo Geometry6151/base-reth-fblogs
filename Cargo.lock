@@ -4384,6 +4384,7 @@ dependencies = [
  "reth-transaction-pool",
  "revm",
  "serde_json",
+ "serial_test",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.28.0",

@@ -107,6 +107,16 @@ impl FlashblocksState {
         self.hot_dry_run_sidecar_manager.force_next_after_send_failure_for_testing();
     }
 
+    #[doc(hidden)]
+    pub fn hold_hot_dry_run_sidecar_worker_for_testing(&self) {
+        self.hot_dry_run_sidecar_manager.hold_worker_for_testing();
+    }
+
+    #[doc(hidden)]
+    pub fn release_hot_dry_run_sidecar_worker_for_testing(&self) {
+        self.hot_dry_run_sidecar_manager.release_worker_for_testing();
+    }
+
     /// Starts the flashblocks state processor with the given client.
     ///
     /// This spawns a background task that processes canonical blocks and flashblocks.

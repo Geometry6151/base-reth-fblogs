@@ -81,7 +81,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use super::dry_run::dry_run_hot_snapshot;
+use super::dry_run::{dry_run_hot_snapshot, dry_run_latest_hot_snapshot};
 use crate::{
     FlashblockDryRunResult, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode, HotSnapshot,
     PendingBlocks, PendingBlocksAPI, metrics::Metrics, rpc::types::unsupported_in_hot_only,
@@ -680,7 +680,9 @@ where
             return Err(Self::invalid_flashblock_snapshot("no latest hot flashblock snapshot"));
         };
 
-        dry_run_hot_snapshot(&self.eth_api, "latest", snapshot, transaction).await
+        let sidecar_latest = self.flashblocks_state.get_latest_hot_dry_run_state();
+
+        dry_run_latest_hot_snapshot(&self.eth_api, snapshot, sidecar_latest, transaction).await
     }
 
     async fn base_dry_run_at_flashblock(

@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -413,6 +413,7 @@ pub struct HotDryRunSidecarManager {
     latest_warm_state: Arc<ArcSwapOption<HotDryRunWarmState>>,
     publication: StdMutex<(u64, HotDryRunSidecarStatus)>,
     force_next_after_send_failure_for_testing: AtomicBool,
+    worker_hold_for_testing: Arc<(StdMutex<bool>, Condvar)>,
 }
 
 impl HotDryRunSidecarManager {
@@ -426,6 +427,7 @@ impl HotDryRunSidecarManager {
             latest_warm_state: Arc::new(ArcSwapOption::new(None)),
             publication: StdMutex::new((0, HotDryRunSidecarStatus::Unavailable)),
             force_next_after_send_failure_for_testing: AtomicBool::new(false),
+            worker_hold_for_testing: Arc::new((StdMutex::new(false), Condvar::new())),
         }
     }
 
@@ -454,8 +456,12 @@ impl HotDryRunSidecarManager {
         thread::Builder::new()
             .name("flashblocks-hot-dry-run-sidecar".to_string())
             .spawn(move || {
-                let mut worker =
-                    HotDryRunSidecarWorker::new(client, max_depth, manager, hot_snapshot_ring);
+                let mut worker = HotDryRunSidecarWorker::new(
+                    client,
+                    max_depth,
+                    Arc::clone(&manager),
+                    hot_snapshot_ring,
+                );
 
                 loop {
                     let input = {
@@ -466,6 +472,7 @@ impl HotDryRunSidecarManager {
                         break;
                     };
 
+                    manager.wait_if_worker_held_for_testing();
                     worker.process_input(input);
                 }
             })
@@ -504,6 +511,19 @@ impl HotDryRunSidecarManager {
     #[doc(hidden)]
     pub fn force_next_after_send_failure_for_testing(&self) {
         self.force_next_after_send_failure_for_testing.store(true, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn hold_worker_for_testing(&self) {
+        let (lock, _) = &*self.worker_hold_for_testing;
+        *lock.lock().expect("hot dry-run sidecar worker hold mutex poisoned") = true;
+    }
+
+    #[doc(hidden)]
+    pub fn release_worker_for_testing(&self) {
+        let (lock, condvar) = &*self.worker_hold_for_testing;
+        *lock.lock().expect("hot dry-run sidecar worker hold mutex poisoned") = false;
+        condvar.notify_all();
     }
 
     /// Publishes one newly warmed state if it still belongs to the active generation.
@@ -562,6 +582,15 @@ impl HotDryRunSidecarManager {
             HotDryRunSidecarStatus::Warm => HotDryRunSidecarStatus::Unavailable,
             status => status,
         };
+    }
+
+    fn wait_if_worker_held_for_testing(&self) {
+        let (lock, condvar) = &*self.worker_hold_for_testing;
+        let mut held = lock.lock().expect("hot dry-run sidecar worker hold mutex poisoned");
+
+        while *held {
+            held = condvar.wait(held).expect("hot dry-run sidecar worker hold mutex poisoned");
+        }
     }
 }
 
