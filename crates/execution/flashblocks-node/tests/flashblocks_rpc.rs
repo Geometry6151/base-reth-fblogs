@@ -1619,6 +1619,41 @@ async fn sidecar_recovers_from_drop_using_authoritative_rebuild() -> Result<()> 
 }
 
 #[tokio::test]
+async fn sidecar_recovers_after_reset_with_authoritative_snapshot_nonce() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let initial_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(initial_snapshot_id).await?;
+
+    setup.send_flashblock(setup.create_invalidating_gap_payload()).await?;
+    setup.wait_for_latest_hot_snapshot_clear().await?;
+    setup.wait_for_latest_hot_dry_run_state_clear().await?;
+
+    let rebuilt_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    assert!(
+        rebuilt_snapshot_id.nonce() > initial_snapshot_id.nonce(),
+        "expected reset recovery snapshot nonce to advance beyond the initial warm state"
+    );
+    assert!(
+        rebuilt_snapshot_id.nonce() > 2,
+        "expected authoritative snapshot nonce to exceed the fresh rebuild default"
+    );
+
+    let sidecar_snapshot_id =
+        setup.wait_for_latest_hot_dry_run_snapshot_id(rebuilt_snapshot_id).await?;
+    assert_eq!(sidecar_snapshot_id, rebuilt_snapshot_id);
+
+    let response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+    assert_eq!(result.snapshot_id, rebuilt_snapshot_id);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn base_dry_run_latest_flashblock_returns_revert_bytes_for_simple_revert() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let expected_snapshot_id =

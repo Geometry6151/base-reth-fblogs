@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::Instant,
 };
 
@@ -294,11 +295,13 @@ where
             return;
         }
 
-        let Some(rebuilt_engine) = rebuilt_engine else {
+        let Some(mut rebuilt_engine) = rebuilt_engine else {
             self.manager
                 .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::RebuildFailure);
             return;
         };
+
+        Self::align_rebuilt_engine_snapshot_nonce(&mut rebuilt_engine, input.snapshot_id);
 
         let Some(authoritative_snapshot) = self.authoritative_snapshot(input.snapshot_id) else {
             self.manager.try_mark_unavailable(input.generation, HotDryRunSidecarStatus::Mismatch);
@@ -383,6 +386,13 @@ where
             && active_block.latest_header.hash() == authoritative_snapshot.latest_header.hash()
     }
 
+    fn align_rebuilt_engine_snapshot_nonce(
+        rebuilt_engine: &mut HotEngine<Client>,
+        snapshot_id: FlashblockSnapshotId,
+    ) {
+        rebuilt_engine.next_snapshot_nonce = snapshot_id.nonce();
+    }
+
     fn latest_snapshot_id(hot_engine: &HotEngine<Client>) -> Option<FlashblockSnapshotId> {
         let active_block = hot_engine.window.active_block()?;
 
@@ -441,22 +451,25 @@ impl HotDryRunSidecarManager {
         let receiver = self.receiver();
         let manager = Arc::clone(self);
 
-        tokio::spawn(async move {
-            let mut worker =
-                HotDryRunSidecarWorker::new(client, max_depth, manager, hot_snapshot_ring);
+        thread::Builder::new()
+            .name("flashblocks-hot-dry-run-sidecar".to_string())
+            .spawn(move || {
+                let mut worker =
+                    HotDryRunSidecarWorker::new(client, max_depth, manager, hot_snapshot_ring);
 
-            loop {
-                let input = {
-                    let mut receiver = receiver.lock().await;
-                    receiver.recv().await
-                };
-                let Some(input) = input else {
-                    break;
-                };
+                loop {
+                    let input = {
+                        let mut receiver = receiver.blocking_lock();
+                        receiver.blocking_recv()
+                    };
+                    let Some(input) = input else {
+                        break;
+                    };
 
-                worker.process_input(input);
-            }
-        });
+                    worker.process_input(input);
+                }
+            })
+            .expect("hot dry-run sidecar worker thread should spawn");
     }
 
     /// Returns the currently active sidecar generation.
