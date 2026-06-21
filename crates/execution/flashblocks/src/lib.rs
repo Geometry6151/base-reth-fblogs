@@ -29,8 +29,8 @@ pub use fast_logs::{
 
 mod hot_dry_run_sidecar;
 pub use hot_dry_run_sidecar::{
-    HotDryRunApplyInput, HotDryRunRebuildInput, HotDryRunSidecarInput,
-    HotDryRunSidecarManager, HotDryRunSidecarStatus, HotDryRunWarmState,
+    HotDryRunApplyInput, HotDryRunRebuildInput, HotDryRunSidecarInput, HotDryRunSidecarManager,
+    HotDryRunSidecarStatus, HotDryRunWarmState,
 };
 
 mod hot_engine;
