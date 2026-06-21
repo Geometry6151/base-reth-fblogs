@@ -2,7 +2,10 @@
 
 use std::{
     fmt,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use alloy_primitives::B256;
@@ -108,6 +111,7 @@ pub struct HotDryRunSidecarManager {
     receiver: Arc<Mutex<mpsc::Receiver<HotDryRunSidecarInput>>>,
     latest_warm_state: Arc<ArcSwapOption<HotDryRunWarmState>>,
     publication: StdMutex<(u64, HotDryRunSidecarStatus)>,
+    force_next_after_send_failure_for_testing: AtomicBool,
 }
 
 impl HotDryRunSidecarManager {
@@ -120,6 +124,7 @@ impl HotDryRunSidecarManager {
             receiver: Arc::new(Mutex::new(receiver)),
             latest_warm_state: Arc::new(ArcSwapOption::new(None)),
             publication: StdMutex::new((0, HotDryRunSidecarStatus::Unavailable)),
+            force_next_after_send_failure_for_testing: AtomicBool::new(false),
         }
     }
 
@@ -145,7 +150,16 @@ impl HotDryRunSidecarManager {
 
     /// Attempts to enqueue one sidecar work item without blocking.
     pub fn try_publish_after_send(&self, input: HotDryRunSidecarInput) -> bool {
+        if self.force_next_after_send_failure_for_testing.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+
         self.sender.try_send(input).is_ok()
+    }
+
+    #[doc(hidden)]
+    pub fn force_next_after_send_failure_for_testing(&self) {
+        self.force_next_after_send_failure_for_testing.store(true, Ordering::Relaxed);
     }
 
     /// Publishes one newly warmed state if it still belongs to the active generation.
@@ -359,5 +373,15 @@ mod tests {
         assert!(manager.current_generation() > generation);
         assert_eq!(manager.status(), HotDryRunSidecarStatus::Reset);
         assert!(manager.latest_warm_state().is_none());
+    }
+
+    #[test]
+    fn forced_after_send_failure_only_blocks_one_enqueue_attempt() {
+        let manager = HotDryRunSidecarManager::new(2);
+
+        manager.force_next_after_send_failure_for_testing();
+
+        assert!(!manager.try_publish_after_send(apply_input(0, snapshot_id(21))));
+        assert!(manager.try_publish_after_send(apply_input(0, snapshot_id(22))));
     }
 }

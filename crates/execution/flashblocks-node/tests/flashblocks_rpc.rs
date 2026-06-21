@@ -1429,6 +1429,39 @@ async fn base_dry_run_latest_flashblock_returns_snapshot_id_and_gas_used_for_sim
 }
 
 #[tokio::test]
+async fn sidecar_overflow_does_not_block_fast_logs() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let mut first_payload = setup.create_first_payload();
+    first_payload.diff.block_hash = B256::with_last_byte(0x01);
+    setup.send_flashblock(first_payload).await?;
+    let _ = setup.wait_for_latest_hot_snapshot_id(1, 0).await?;
+
+    let mut ws_stream = setup.subscribe_fast_flashblock_logs().await?;
+    setup
+        .harness
+        .flashblocks_state()
+        .force_next_hot_dry_run_sidecar_after_send_failure_for_testing();
+    let mut second_payload = setup.create_second_payload();
+    second_payload.diff.block_hash = B256::with_last_byte(0x02);
+
+    let fast_delta =
+        setup.send_flashblock_and_collect_fast_delta(&mut ws_stream, second_payload).await?;
+
+    let response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+
+    assert!(result.success);
+    assert_eq!(result.revert, None);
+    assert_eq!(result.halt, None);
+    assert_eq!(result.snapshot_id, fast_delta.snapshot_id);
+    assert!(result.gas_used > 0, "expected positive gas used, got {}", result.gas_used);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn base_dry_run_latest_flashblock_returns_revert_bytes_for_simple_revert() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let expected_snapshot_id =

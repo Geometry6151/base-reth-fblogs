@@ -21,8 +21,8 @@ use tokio::sync::{
 
 use crate::{
     FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode,
-    FlashblocksReceiver, HotDryRunSidecarManager, HotDryRunWarmState, HotSnapshot,
-    HotSnapshotRing, PendingBlocks, SnapshotCache,
+    FlashblocksReceiver, HotDryRunSidecarManager, HotDryRunWarmState, HotSnapshot, HotSnapshotRing,
+    PendingBlocks, SnapshotCache,
     processor::{StateProcessor, StateProcessorHandles, StateUpdate},
     snapshot_cache::{DEFAULT_SNAPSHOT_CACHE_CAPACITY, DEFAULT_SNAPSHOT_CACHE_TTL},
 };
@@ -102,6 +102,11 @@ impl FlashblocksState {
         Arc::clone(&self.hot_snapshot_ring)
     }
 
+    #[doc(hidden)]
+    pub fn force_next_hot_dry_run_sidecar_after_send_failure_for_testing(&self) {
+        self.hot_dry_run_sidecar_manager.force_next_after_send_failure_for_testing();
+    }
+
     /// Starts the flashblocks state processor with the given client.
     ///
     /// This spawns a background task that processes canonical blocks and flashblocks.
@@ -125,6 +130,7 @@ impl FlashblocksState {
                 self.flashblock_sender.clone(),
                 Arc::clone(&self.snapshot_cache),
                 Arc::clone(&self.hot_snapshot_ring),
+                Arc::clone(&self.hot_dry_run_sidecar_manager),
             ),
         );
 

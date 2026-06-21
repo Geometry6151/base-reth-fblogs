@@ -37,10 +37,12 @@ use tokio::{
 
 use crate::{
     AuditWindowSnapshot, BlockAssembler, CachedFlashblock, ExecutionError, FastFlashblockFeedEvent,
-    FastFlashblockLogsDelta, FlashblockCache, FlashblocksMode, HotApplyOutcome, HotEngine,
-    HotInvalidationReason, HotSnapshotRing, PendingBlocks, PendingBlocksBuilder,
-    PendingStateBuilder, PeriodicAuditFailure, PeriodicAuditResult, ProviderError, Result,
-    ShadowRebuildCompletion, SnapshotCache, StateProcessorError,
+    FastFlashblockLogsDelta, FlashblockCache, FlashblocksMode, HotApplyOutcome,
+    HotDryRunApplyInput, HotDryRunRebuildInput, HotDryRunSidecarInput, HotDryRunSidecarManager,
+    HotDryRunSidecarStatus, HotEngine, HotInvalidationReason, HotSnapshot, HotSnapshotRing,
+    PendingBlocks, PendingBlocksBuilder, PendingStateBuilder, PeriodicAuditFailure,
+    PeriodicAuditResult, ProviderError, Result, ShadowRebuildCompletion, SnapshotCache,
+    StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -78,6 +80,7 @@ pub struct StateProcessor<Client> {
     cache: Arc<Mutex<FlashblockCache>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    hot_dry_run_sidecar_manager: Arc<HotDryRunSidecarManager>,
     next_snapshot_nonce: Arc<AtomicU64>,
     hot_engine: Option<Arc<Mutex<HotEngine<Client>>>>,
     hot_periodic_audit: Arc<StdMutex<HotPeriodicAuditState<Client>>>,
@@ -92,6 +95,7 @@ pub struct StateProcessorHandles {
     sender: Sender<Arc<PendingBlocks>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    hot_dry_run_sidecar_manager: Arc<HotDryRunSidecarManager>,
 }
 
 impl StateProcessorHandles {
@@ -102,8 +106,16 @@ impl StateProcessorHandles {
         sender: Sender<Arc<PendingBlocks>>,
         snapshot_cache: Arc<StdMutex<SnapshotCache>>,
         hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+        hot_dry_run_sidecar_manager: Arc<HotDryRunSidecarManager>,
     ) -> Self {
-        Self { rx, fast_sender, sender, snapshot_cache, hot_snapshot_ring }
+        Self {
+            rx,
+            fast_sender,
+            sender,
+            snapshot_cache,
+            hot_snapshot_ring,
+            hot_dry_run_sidecar_manager,
+        }
     }
 }
 
@@ -361,8 +373,14 @@ where
         let cache = FlashblockCache::new(latest_canonical_block);
         let hot_engine = (mode == FlashblocksMode::HotOnly)
             .then(|| Arc::new(Mutex::new(HotEngine::new(client.clone(), max_depth))));
-        let StateProcessorHandles { rx, fast_sender, sender, snapshot_cache, hot_snapshot_ring } =
-            handles;
+        let StateProcessorHandles {
+            rx,
+            fast_sender,
+            sender,
+            snapshot_cache,
+            hot_snapshot_ring,
+            hot_dry_run_sidecar_manager,
+        } = handles;
 
         Self {
             pending_blocks,
@@ -375,6 +393,7 @@ where
             cache: Arc::new(Mutex::new(cache)),
             snapshot_cache,
             hot_snapshot_ring,
+            hot_dry_run_sidecar_manager,
             next_snapshot_nonce: Arc::new(AtomicU64::new(0)),
             hot_engine,
             hot_periodic_audit: Arc::new(StdMutex::new(HotPeriodicAuditState::new(
@@ -632,7 +651,7 @@ where
         match completion {
             ShadowRebuildCompletion::EquivalentSwapped => {
                 Metrics::hot_periodic_audit_success_count().increment(1);
-                self.clear_hot_snapshot_ring();
+                self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
                 {
                     let mut state =
                         self.hot_periodic_audit.lock().expect("hot periodic audit mutex poisoned");
@@ -853,6 +872,61 @@ where
         }
     }
 
+    fn mark_hot_dry_run_sidecar_unavailable(&self, status: HotDryRunSidecarStatus) {
+        self.hot_dry_run_sidecar_manager.mark_unavailable(status);
+    }
+
+    fn hot_dry_run_sidecar_invalidation_status(
+        reason: HotInvalidationReason,
+    ) -> HotDryRunSidecarStatus {
+        match reason {
+            HotInvalidationReason::CanonicalConflict
+            | HotInvalidationReason::UnrecoverableReplayFailure
+            | HotInvalidationReason::SpeculativeDepthExceeded
+            | HotInvalidationReason::ContinuityViolation
+            | HotInvalidationReason::PeriodicAuditFailed { .. } => HotDryRunSidecarStatus::Mismatch,
+        }
+    }
+
+    fn build_hot_dry_run_sidecar_input(
+        flashblock: &Flashblock,
+        hot_snapshot: Arc<HotSnapshot>,
+        sidecar_status: HotDryRunSidecarStatus,
+        sidecar_generation: u64,
+        replay_snapshot: Option<AuditWindowSnapshot>,
+    ) -> Option<HotDryRunSidecarInput> {
+        let expected_latest_header_hash = hot_snapshot.latest_header.hash();
+
+        if sidecar_status == HotDryRunSidecarStatus::Warm {
+            return Some(HotDryRunSidecarInput::Apply(HotDryRunApplyInput {
+                generation: sidecar_generation,
+                snapshot_id: hot_snapshot.snapshot_id,
+                flashblock: flashblock.clone(),
+                canonical_base_parent_hash: hot_snapshot.canonical_base_parent_hash,
+                expected_latest_header_hash,
+            }));
+        }
+
+        replay_snapshot.map(|replay_snapshot| {
+            HotDryRunSidecarInput::RebuildFromSnapshot(HotDryRunRebuildInput {
+                generation: sidecar_generation,
+                snapshot_id: hot_snapshot.snapshot_id,
+                replay_snapshot,
+                expected_latest_header_hash,
+            })
+        })
+    }
+
+    fn try_publish_hot_dry_run_sidecar_after_send(&self, input: Option<HotDryRunSidecarInput>) {
+        let Some(input) = input else {
+            return;
+        };
+
+        if !self.hot_dry_run_sidecar_manager.try_publish_after_send(input) {
+            self.mark_hot_dry_run_sidecar_unavailable(HotDryRunSidecarStatus::Overflow);
+        }
+    }
+
     async fn apply_hot_only_canonical(&self, block: RecoveredBlock<BaseBlock>) {
         self.update_hot_periodic_audit_latest_seen_canonical(block.number);
         let block_hash = block.header().hash_slow();
@@ -870,11 +944,11 @@ where
             Ok(HotApplyOutcome::Duplicate) => {}
             Ok(HotApplyOutcome::CanonicalWindowChanged) => {
                 self.advance_hot_periodic_audit_generation();
-                self.clear_hot_snapshot_ring();
+                self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
             }
             Ok(HotApplyOutcome::Reset) => {
                 self.advance_hot_periodic_audit_generation();
-                self.clear_hot_snapshot_ring();
+                self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
                 _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
             }
             Ok(HotApplyOutcome::InvalidateSession { reason }) => {
@@ -933,7 +1007,9 @@ where
                 continue;
             }
 
-            let (outcome, missing_first_flashblock, hot_window_invalidated) = {
+            let sidecar_generation = self.hot_dry_run_sidecar_manager.current_generation();
+            let sidecar_status = self.hot_dry_run_sidecar_manager.status();
+            let (outcome, missing_first_flashblock, hot_window_invalidated, replay_snapshot) = {
                 let mut hot_engine = self.hot_engine().lock().await;
                 let missing_first_flashblock = (hot_engine.window.execution.is_none()
                     || hot_engine.window.blocks.is_empty())
@@ -941,18 +1017,45 @@ where
                 let outcome = hot_engine.apply_flashblock(&flashblock);
                 let hot_window_invalidated =
                     hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
-                (outcome, missing_first_flashblock, hot_window_invalidated)
+                let replay_snapshot = match outcome.as_ref() {
+                    Ok(HotApplyOutcome::Delta { snapshot: Some(snapshot), .. })
+                        if sidecar_status != HotDryRunSidecarStatus::Warm =>
+                    {
+                        let anchor = hot_engine.window.anchor;
+                        hot_engine.window.make_audit_snapshot(
+                            sidecar_generation,
+                            snapshot.snapshot_id.nonce(),
+                            anchor.block_number(),
+                            anchor.hash(),
+                        )
+                    }
+                    _ => None,
+                };
+                (outcome, missing_first_flashblock, hot_window_invalidated, replay_snapshot)
             };
 
             match outcome {
                 Ok(HotApplyOutcome::Delta { delta, snapshot, ready_cached_block }) => {
-                    if let Some(snapshot) = snapshot {
+                    let hot_snapshot = snapshot.map(|snapshot| {
+                        let snapshot = Arc::new(*snapshot);
                         self.hot_snapshot_ring
                             .lock()
                             .expect("hot snapshot ring mutex poisoned")
-                            .insert(Arc::new(*snapshot));
-                    }
+                            .insert(Arc::clone(&snapshot));
+                        snapshot
+                    });
                     _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(*delta)));
+                    self.try_publish_hot_dry_run_sidecar_after_send(hot_snapshot.and_then(
+                        |hot_snapshot| {
+                            Self::build_hot_dry_run_sidecar_input(
+                                &flashblock,
+                                hot_snapshot,
+                                sidecar_status,
+                                sidecar_generation,
+                                replay_snapshot,
+                            )
+                        },
+                    ));
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
 
                     if let Some(ready_cached_block) = ready_cached_block {
@@ -976,13 +1079,13 @@ where
                 }
                 Ok(HotApplyOutcome::CanonicalWindowChanged) => {
                     self.advance_hot_periodic_audit_generation();
-                    self.clear_hot_snapshot_ring();
+                    self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
                 Ok(HotApplyOutcome::Reset) => {
                     self.advance_hot_periodic_audit_generation();
                     if hot_window_invalidated {
-                        self.clear_hot_snapshot_ring();
+                        self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
                     }
 
                     if missing_first_flashblock {
@@ -1023,7 +1126,7 @@ where
 
                     if hot_window_invalidated {
                         self.advance_hot_periodic_audit_generation();
-                        self.clear_hot_snapshot_ring();
+                        self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
                         _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
                     }
 
@@ -1062,7 +1165,7 @@ where
 
         self.hot_engine().lock().await.reset();
         self.advance_hot_periodic_audit_generation();
-        self.clear_hot_snapshot_ring();
+        self.clear_hot_snapshot_ring(HotDryRunSidecarStatus::Reset);
         Metrics::hot_cache_insert_missing_first_count().increment(1);
         true
     }
@@ -1303,8 +1406,9 @@ where
         self.snapshot_cache.lock().expect("snapshot cache mutex poisoned").clear();
     }
 
-    fn clear_hot_snapshot_ring(&self) {
+    fn clear_hot_snapshot_ring(&self, sidecar_status: HotDryRunSidecarStatus) {
         self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").clear();
+        self.mark_hot_dry_run_sidecar_unavailable(sidecar_status);
     }
 
     async fn handle_hot_invalidation(
@@ -1318,7 +1422,7 @@ where
         self.advance_hot_periodic_audit_generation();
         self.hot_engine().lock().await.reset();
         warn!(reason = ?reason, "invalidated hot flashblock session");
-        self.clear_hot_snapshot_ring();
+        self.clear_hot_snapshot_ring(Self::hot_dry_run_sidecar_invalidation_status(reason));
 
         let mut cache = self.cache.lock().await;
         cache.clear();
@@ -1548,8 +1652,9 @@ mod tests {
 
     use super::{StateProcessor, StateProcessorHandles, StateUpdate};
     use crate::{
-        BlockAssembler, FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksMode, HotEngine,
-        HotSnapshotRing, PeriodicAuditFailure, PeriodicAuditResult, SnapshotCache,
+        BlockAssembler, FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksMode,
+        HotDryRunSidecarManager, HotEngine, HotSnapshotRing, PeriodicAuditFailure,
+        PeriodicAuditResult, SnapshotCache,
     };
 
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1588,6 +1693,7 @@ mod tests {
             sender,
             Arc::new(std::sync::Mutex::new(SnapshotCache::new(capacity, Duration::from_secs(1)))),
             Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(capacity))),
+            Arc::new(HotDryRunSidecarManager::new(capacity)),
         )
     }
 
