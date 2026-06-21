@@ -1,13 +1,19 @@
 //! Hot snapshot handles for pinned flashblock RPC.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, OnceLock},
+};
 
 use alloy_consensus::{Header, Sealed};
 use alloy_eips::{BlockId, RpcBlockHash};
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types::{BlockOverrides, state::StateOverride};
 
-use crate::FlashblockSnapshotId;
+use crate::{
+    FlashblockSnapshotId,
+    hot_overlay::{HotOverlay, HotOverlayError},
+};
 
 /// Queryable snapshot produced by the hot engine.
 #[derive(Clone, Debug)]
@@ -24,6 +30,8 @@ pub struct HotSnapshot {
     pub state_overrides: StateOverride,
     /// Block environment overrides for pinned call-style RPC.
     pub block_overrides: BlockOverrides,
+    /// Lazily initialized immutable overlay used by the direct dry-run evaluator.
+    dry_run_overlay: Arc<OnceLock<Result<Arc<HotOverlay>, HotOverlayError>>>,
 }
 
 impl HotSnapshot {
@@ -46,7 +54,13 @@ impl HotSnapshot {
             latest_header,
             state_overrides,
             block_overrides,
+            dry_run_overlay: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Returns the lazy overlay cell used by direct dry-run evaluation.
+    pub fn dry_run_overlay(&self) -> &OnceLock<Result<Arc<HotOverlay>, HotOverlayError>> {
+        self.dry_run_overlay.as_ref()
     }
 
     /// Builds pinned block overrides from the represented pending header.
@@ -91,6 +105,11 @@ impl HotSnapshotRing {
         self.entries.push_back(snapshot);
     }
 
+    /// Returns the most recently inserted hot snapshot if one exists.
+    pub fn latest(&self) -> Option<Arc<HotSnapshot>> {
+        self.entries.back().cloned()
+    }
+
     /// Returns the hot snapshot for the given identifier if it exists.
     pub fn get(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<HotSnapshot>> {
         self.entries.iter().find(|snapshot| snapshot.snapshot_id == snapshot_id).cloned()
@@ -104,7 +123,7 @@ impl HotSnapshotRing {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use alloy_consensus::{Header, Sealed};
     use alloy_primitives::B256;
@@ -157,6 +176,7 @@ mod tests {
             latest_header: header(nonce),
             state_overrides: alloy_rpc_types::state::StateOverride::default(),
             block_overrides: block_overrides(),
+            dry_run_overlay: Arc::new(OnceLock::new()),
         })
     }
 
@@ -177,6 +197,7 @@ mod tests {
         assert_eq!(snapshot.canonical_base_parent_hash, canonical_base_parent_hash);
         assert_eq!(snapshot.latest_header, latest_header);
         assert_eq!(snapshot.block_overrides, HotSnapshot::block_overrides(&latest_header));
+        assert!(snapshot.dry_run_overlay().get().is_none());
         assert_eq!(
             snapshot.canonical_base_block,
             alloy_eips::BlockId::Hash(alloy_eips::RpcBlockHash::from_hash(
@@ -195,6 +216,21 @@ mod tests {
 
         let cached = ring.get(snapshot.snapshot_id).expect("snapshot should be retained");
         assert!(Arc::ptr_eq(&snapshot, &cached));
+    }
+
+    #[test]
+    fn hot_snapshot_ring_latest_returns_most_recent_snapshot() {
+        let mut ring = HotSnapshotRing::new(2);
+        let first = hot_snapshot(1);
+        let second = hot_snapshot(2);
+
+        assert!(ring.latest().is_none());
+
+        ring.insert(Arc::clone(&first));
+        assert!(Arc::ptr_eq(&first, &ring.latest().expect("latest first")));
+
+        ring.insert(Arc::clone(&second));
+        assert!(Arc::ptr_eq(&second, &ring.latest().expect("latest second")));
     }
 
     #[test]

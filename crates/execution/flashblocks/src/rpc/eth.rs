@@ -1,6 +1,9 @@
 //! RPC trait definitions and implementations for flashblocks.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
 
@@ -78,9 +81,10 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{debug, trace, warn};
 
+use super::dry_run::dry_run_hot_snapshot;
 use crate::{
-    FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode, HotSnapshot, PendingBlocks,
-    PendingBlocksAPI, metrics::Metrics, rpc::types::unsupported_in_hot_only,
+    FlashblockDryRunResult, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode, HotSnapshot,
+    PendingBlocks, PendingBlocksAPI, metrics::Metrics, rpc::types::unsupported_in_hot_only,
 };
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
@@ -171,6 +175,21 @@ pub trait EthApiOverride {
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<alloy_primitives::Bytes>;
+
+    /// Executes one dry-run against the latest cached hot flashblock snapshot.
+    #[method(name = "baseDryRunLatestFlashblock")]
+    async fn base_dry_run_latest_flashblock(
+        &self,
+        transaction: BaseTransactionRequest,
+    ) -> RpcResult<FlashblockDryRunResult>;
+
+    /// Executes one dry-run against a specific cached hot flashblock snapshot.
+    #[method(name = "baseDryRunAtFlashblock")]
+    async fn base_dry_run_at_flashblock(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+    ) -> RpcResult<FlashblockDryRunResult>;
 
     /// Simulates transactions with flashblock state support.
     #[method(name = "simulateV1")]
@@ -641,6 +660,49 @@ where
                 .map_err(Into::into)
             }
         }
+    }
+
+    async fn base_dry_run_latest_flashblock(
+        &self,
+        transaction: BaseTransactionRequest,
+    ) -> RpcResult<FlashblockDryRunResult> {
+        debug!(
+            message = "rpc::base_dry_run_latest_flashblock",
+            transaction = ?transaction,
+        );
+
+        let latest_lookup_start = Instant::now();
+        let snapshot = self.flashblocks_state.get_latest_hot_snapshot();
+        Metrics::rpc_base_dry_run_latest_lookup_duration().record(latest_lookup_start.elapsed());
+
+        let Some(snapshot) = snapshot else {
+            Metrics::rpc_base_dry_run_error_count().increment(1);
+            return Err(Self::invalid_flashblock_snapshot("no latest hot flashblock snapshot"));
+        };
+
+        dry_run_hot_snapshot(&self.eth_api, "latest", snapshot, transaction).await
+    }
+
+    async fn base_dry_run_at_flashblock(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+        transaction: BaseTransactionRequest,
+    ) -> RpcResult<FlashblockDryRunResult> {
+        debug!(
+            message = "rpc::base_dry_run_at_flashblock",
+            snapshot_id = ?snapshot_id,
+            transaction = ?transaction,
+        );
+
+        let snapshot = match self.get_hot_flashblock_snapshot(snapshot_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                Metrics::rpc_base_dry_run_error_count().increment(1);
+                return Err(error);
+            }
+        };
+
+        dry_run_hot_snapshot(&self.eth_api, "at", snapshot, transaction).await
     }
 
     async fn simulate_v1(

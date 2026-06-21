@@ -40,6 +40,9 @@ pub trait FlashblocksAPI {
     /// Returns a cached hot snapshot for pinned flashblock RPC.
     fn get_hot_snapshot(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<HotSnapshot>>;
 
+    /// Returns the most recently cached hot snapshot for latest dry-run RPC.
+    fn get_latest_hot_snapshot(&self) -> Option<Arc<HotSnapshot>>;
+
     /// Returns the configured flashblocks runtime mode.
     fn mode(&self) -> FlashblocksMode;
 

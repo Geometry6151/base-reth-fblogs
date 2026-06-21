@@ -106,6 +106,42 @@ base_metrics::define_metrics! {
     pinned_estimate_gas_duration: histogram,
     #[describe("Time taken to execute a call against a pinned flashblock snapshot")]
     pinned_call_duration: histogram,
+    #[describe("Time taken to resolve the latest hot snapshot for dry-run RPC")]
+    rpc_base_dry_run_latest_lookup_duration: histogram,
+    #[describe("Time taken to execute the latest hot snapshot dry-run RPC end-to-end")]
+    rpc_base_dry_run_latest_duration: histogram,
+    #[describe("Time taken to execute the snapshot-id hot dry-run RPC end-to-end")]
+    rpc_base_dry_run_at_duration: histogram,
+    #[describe("Time taken to fetch or lazily build the immutable hot dry-run overlay")]
+    rpc_base_dry_run_overlay_init_duration: histogram,
+    #[describe("Time taken to resolve the canonical block env for hot dry-run")]
+    rpc_base_dry_run_canonical_env_duration: histogram,
+    #[describe("Time taken to open the canonical state provider for hot dry-run")]
+    rpc_base_dry_run_canonical_state_open_duration: histogram,
+    #[describe("Time taken to construct the final env and tx env for hot dry-run")]
+    rpc_base_dry_run_env_build_duration: histogram,
+    #[describe("Time taken by the single EVM execution in hot dry-run")]
+    rpc_base_dry_run_evm_duration: histogram,
+    #[describe("Number of overlay accounts in one hot dry-run snapshot")]
+    rpc_base_dry_run_overlay_account_count: histogram,
+    #[describe("Number of overlay storage slots in one hot dry-run snapshot")]
+    rpc_base_dry_run_overlay_slot_count: histogram,
+    #[describe("Canonical account reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_account_reads: histogram,
+    #[describe("Canonical storage reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_storage_reads: histogram,
+    #[describe("Canonical code reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_code_reads: histogram,
+    #[describe("Canonical block-hash reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_block_hash_reads: histogram,
+    #[describe("Count of successful hot dry-run RPC executions")]
+    rpc_base_dry_run_success_count: counter,
+    #[describe("Count of reverting hot dry-run RPC executions")]
+    rpc_base_dry_run_revert_count: counter,
+    #[describe("Count of halted hot dry-run RPC executions")]
+    rpc_base_dry_run_halt_count: counter,
+    #[describe("Count of hot dry-run RPC errors")]
+    rpc_base_dry_run_error_count: counter,
     #[describe("Time spent on parallel sender recovery")]
     sender_recovery_duration: histogram,
     #[describe("Number of Flashblocks that arrive in an unexpected order")]
@@ -168,5 +204,23 @@ mod tests {
         let _ = Metrics::hot_periodic_audit_overlap_count();
         let _ = Metrics::hot_periodic_audit_stale_result_count();
         let _ = Metrics::hot_periodic_audit_replayed_flashblock_count();
+        let _ = Metrics::rpc_base_dry_run_latest_lookup_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_duration();
+        let _ = Metrics::rpc_base_dry_run_at_duration();
+        let _ = Metrics::rpc_base_dry_run_overlay_init_duration();
+        let _ = Metrics::rpc_base_dry_run_canonical_env_duration();
+        let _ = Metrics::rpc_base_dry_run_canonical_state_open_duration();
+        let _ = Metrics::rpc_base_dry_run_env_build_duration();
+        let _ = Metrics::rpc_base_dry_run_evm_duration();
+        let _ = Metrics::rpc_base_dry_run_overlay_account_count();
+        let _ = Metrics::rpc_base_dry_run_overlay_slot_count();
+        let _ = Metrics::rpc_base_dry_run_latest_account_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_storage_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_code_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_block_hash_reads();
+        let _ = Metrics::rpc_base_dry_run_success_count();
+        let _ = Metrics::rpc_base_dry_run_revert_count();
+        let _ = Metrics::rpc_base_dry_run_halt_count();
+        let _ = Metrics::rpc_base_dry_run_error_count();
     }
 }

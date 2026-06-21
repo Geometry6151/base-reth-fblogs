@@ -32,6 +32,9 @@ pub use hot_engine::{
     HotApplyOutcome, HotEngine, HotExecutionDb, HotInvalidationReason, ShadowRebuildCompletion,
 };
 
+mod hot_overlay;
+pub use hot_overlay::{HotOverlay, HotOverlayDb, HotOverlayError, OverlayAccount};
+
 mod hot_mode;
 pub use hot_mode::FlashblocksMode;
 
@@ -85,6 +88,7 @@ mod config;
 pub use config::FlashblocksConfig;
 
 mod rpc;
+pub use rpc::FlashblockDryRunResult;
 pub use rpc::{
     BaseSubscriptionKind, BlockNumberOrTagExt, EthApiExt, EthApiOverrideServer, EthPubSub,
     EthPubSubApiServer, ExtendedSubscriptionKind, FlashblockLog, FlashblockLogsBatch,

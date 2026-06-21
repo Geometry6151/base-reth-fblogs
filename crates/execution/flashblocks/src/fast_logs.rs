@@ -412,6 +412,16 @@ mod tests {
     }
 
     #[test]
+    fn fast_delta_serialization_fixture_covers_full_schema_and_excludes_overlay_fields() {
+        let json = serde_json::to_string(&test_delta()).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"snapshotId":{"nonce":"0x1","blockNumber":"0x2","flashblockIndex":"0x3","payloadId":"0x0404040404040404","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000005"},"blockNumber":"0x2","flashblockIndex":"0x3","payloadId":"0x0404040404040404","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000005","blockTimestamp":"0x6","logs":[{"txHash":"0x0000000000000000000000000000000000000000000000000000000000000007","txIndex":"0x8","logIndexInTx":"0x0","logIndexInBlock":"0x9","address":"0x000000000000000000000000000000000000000a","topics":["0x000000000000000000000000000000000000000000000000000000000000000b"],"data":"0x0c0d"}],"transactions":[{"hash":"0x000000000000000000000000000000000000000000000000000000000000000e","index":"0x8","status":"0x1"}]}"#,
+        );
+    }
+
+    #[test]
     fn fast_flashblock_logs_delta_serialize_rejects_mismatched_identity_fields() {
         let err = serde_json::to_value(&FastFlashblockLogsDelta {
             snapshot_id: test_snapshot_id(),

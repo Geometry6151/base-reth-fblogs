@@ -187,6 +187,14 @@ impl FlashblocksAPI for FlashblocksState {
         self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").get(snapshot_id)
     }
 
+    fn get_latest_hot_snapshot(&self) -> Option<Arc<HotSnapshot>> {
+        if self.mode != FlashblocksMode::HotOnly {
+            return None;
+        }
+
+        self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").latest()
+    }
+
     fn mode(&self) -> FlashblocksMode {
         self.mode
     }
@@ -438,6 +446,10 @@ mod tests {
             panic!("expected hot-only fast flashblock delta event");
         };
 
+        let latest = state
+            .get_latest_hot_snapshot()
+            .expect("latest hot snapshot should exist after fast delta");
+        assert_eq!(latest.snapshot_id, delta.snapshot_id);
         assert!(state.get_hot_snapshot(delta.snapshot_id).is_some());
         assert!((*state.get_pending_blocks()).is_none());
         assert!(matches!(compat_receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));

@@ -1,6 +1,6 @@
 //! Integration tests covering the Flashblocks RPC surface area.
 
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use DoubleCounter::DoubleCounterInstance;
 use alloy_consensus::{Transaction, constants::EMPTY_WITHDRAWALS};
@@ -23,8 +23,8 @@ use base_common_flashblocks::{
 use base_common_network::Base;
 use base_common_rpc_types::BaseTransactionRequest;
 use base_flashblocks::{
-    FastFlashblockLogsDelta, FlashblockLogsBatch, FlashblockSnapshotId, FlashblocksAPI,
-    FlashblocksMode,
+    FastFlashblockLogsDelta, FlashblockDryRunResult, FlashblockLogsBatch, FlashblockSnapshotId,
+    FlashblocksAPI, FlashblocksMode,
 };
 use base_flashblocks_node::test_harness::FlashblocksHarness;
 use base_node_runner::test_utils::L1_BLOCK_INFO_DEPOSIT_TX;
@@ -445,6 +445,20 @@ impl TestSetup {
         counter.count2().into_transaction_request()
     }
 
+    fn count1_from_alice(&self) -> BaseTransactionRequest {
+        self.count1().from(Account::Alice.address()).gas_limit(100_000)
+    }
+
+    fn block_number_guard_create_from_alice(
+        &self,
+        expected_block_number: u8,
+    ) -> BaseTransactionRequest {
+        BaseTransactionRequest::default()
+            .from(Account::Alice.address())
+            .gas_limit(100_000)
+            .input(TransactionInput::new(block_number_revert_if_eq_runtime(expected_block_number)))
+    }
+
     async fn send_flashblock(&self, flashblock: Flashblock) -> Result<()> {
         self.harness.send_flashblock(flashblock).await
     }
@@ -457,6 +471,53 @@ impl TestSetup {
         self.send_flashblock(second_payload).await?;
 
         Ok(())
+    }
+
+    async fn send_test_payloads_and_wait_for_latest_hot_snapshot_id(
+        &self,
+    ) -> Result<FlashblockSnapshotId> {
+        let mut first_payload = self.create_first_payload();
+        first_payload.diff.block_hash = B256::with_last_byte(0x01);
+
+        let mut second_payload = self.create_second_payload();
+        second_payload.diff.block_hash = B256::with_last_byte(0x02);
+        let expected_block_number = second_payload.metadata.block_number;
+        let expected_flashblock_index = second_payload.index;
+
+        self.send_flashblock(first_payload).await?;
+        self.send_flashblock(second_payload).await?;
+
+        self.wait_for_latest_hot_snapshot_id(expected_block_number, expected_flashblock_index).await
+    }
+
+    async fn wait_for_latest_hot_snapshot_id(
+        &self,
+        expected_block_number: u64,
+        expected_flashblock_index: u64,
+    ) -> Result<FlashblockSnapshotId> {
+        let flashblocks_state = self.harness.flashblocks_state();
+        let deadline = tokio::time::Instant::now() + HOT_SNAPSHOT_WAIT_TIMEOUT;
+
+        loop {
+            if let Some(snapshot) = flashblocks_state.get_latest_hot_snapshot() {
+                let snapshot_id = snapshot.snapshot_id;
+                if snapshot_id.block_number() == expected_block_number
+                    && snapshot_id.flashblock_index() == expected_flashblock_index
+                {
+                    return Ok(snapshot_id);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(eyre::eyre!(
+                    "timed out waiting for latest hot snapshot for block {} flashblock {}",
+                    expected_block_number,
+                    expected_flashblock_index,
+                ));
+            }
+
+            tokio::time::sleep(HOT_SNAPSHOT_POLL_INTERVAL).await;
+        }
     }
 
     async fn subscribe_fast_flashblock_logs(&self) -> Result<TestWsStream> {
@@ -491,7 +552,16 @@ impl TestSetup {
     ) -> Result<FastFlashblockLogsDelta> {
         self.send_flashblock(flashblock).await?;
 
-        let notification = ws_stream.next().await.unwrap()?;
+        let notification = tokio::time::timeout(FAST_DELTA_NOTIFICATION_TIMEOUT, ws_stream.next())
+            .await
+            .map_err(|_| {
+                eyre::eyre!(
+                    "timed out waiting for newFastFlashblockLogs notification after sending flashblock"
+                )
+            })?
+            .ok_or_else(|| {
+                eyre::eyre!("websocket fast delta stream closed before notification arrived")
+            })??;
         let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
         Ok(serde_json::from_value(notif["params"]["result"].clone())?)
     }
@@ -521,7 +591,7 @@ impl TestSetup {
         let second_delta = self
             .send_flashblock_and_collect_fast_delta(&mut ws_stream, self.create_second_payload())
             .await?;
-        let next_block_parent_hash = self.pending_parent_hash_for_next_block(&second_delta).await?;
+        let next_block_parent_hash = self.pending_parent_hash_for_next_block().await?;
         let third_delta = self
             .send_flashblock_and_collect_fast_delta(
                 &mut ws_stream,
@@ -532,10 +602,7 @@ impl TestSetup {
         Ok((vec![first_delta, second_delta, third_delta], next_block_parent_hash))
     }
 
-    async fn pending_parent_hash_for_next_block(
-        &self,
-        latest_delta: &FastFlashblockLogsDelta,
-    ) -> Result<B256> {
+    async fn pending_parent_hash_for_next_block(&self) -> Result<B256> {
         match self.mode {
             FlashblocksMode::Legacy => Ok(self
                 .harness
@@ -547,8 +614,8 @@ impl TestSetup {
             FlashblocksMode::HotOnly => Ok(self
                 .harness
                 .flashblocks_state()
-                .get_hot_snapshot(latest_delta.snapshot_id)
-                .expect("hot-only delta should retain a hot snapshot")
+                .get_latest_hot_snapshot()
+                .expect("latest hot snapshot should exist after fast delta")
                 .latest_header
                 .hash()),
         }
@@ -568,9 +635,38 @@ impl TestSetup {
 
         Ok(receipt)
     }
+
+    async fn ws_rpc_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (mut ws_stream, _) = connect_async(&self.harness.ws_url()).await?;
+
+        ws_stream
+            .send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+
+        let response = ws_stream.next().await.expect("websocket rpc response expected")?;
+
+        Ok(serde_json::from_str(response.to_text()?)?)
+    }
 }
 
 // Test constants
+const FAST_DELTA_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+const HOT_SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const HOT_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 const TEST_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
 const PENDING_BALANCE: u64 = 4660;
 
@@ -1270,6 +1366,166 @@ async fn test_base_call_at_flashblock_hot_only() -> Result<()> {
         u256_return_data(42),
         "user block overrides should take precedence over snapshot defaults"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_latest_flashblock_returns_missing_snapshot_before_fast_delta() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+
+    assert_eq!(response["error"]["code"], json!(-32602));
+    assert_eq!(response["error"]["message"], json!("no latest hot flashblock snapshot"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_at_flashblock_unknown_snapshot_returns_invalid_params() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = FlashblockSnapshotId::new(
+        0x99,
+        0x88,
+        0x77,
+        PayloadId::new([0x55; 8]),
+        B256::repeat_byte(0x44),
+    );
+
+    let response = setup
+        .ws_rpc_request(
+            "eth_baseDryRunAtFlashblock",
+            json!([snapshot_id, setup.count1_from_alice()]),
+        )
+        .await?;
+
+    assert_eq!(response["error"]["code"], json!(-32602));
+    assert_eq!(response["error"]["message"], json!("unknown flashblock snapshot"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_latest_flashblock_returns_snapshot_id_and_gas_used_for_simple_success()
+-> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let expected_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+
+    let response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+
+    assert!(result.success);
+    assert_eq!(result.revert, None);
+    assert_eq!(result.halt, None);
+    assert_eq!(result.snapshot_id, expected_snapshot_id);
+    assert!(result.gas_used > 0, "expected positive gas used, got {}", result.gas_used);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_latest_flashblock_returns_revert_bytes_for_simple_revert() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let expected_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+
+    let response = setup
+        .ws_rpc_request(
+            "eth_baseDryRunLatestFlashblock",
+            json!([setup.block_number_guard_create_from_alice(1)]),
+        )
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+
+    assert!(!result.success);
+    assert_eq!(result.revert, Some(bytes!("0x")));
+    assert_eq!(result.halt, None);
+    assert_eq!(result.snapshot_id, expected_snapshot_id);
+    assert!(result.gas_used > 0, "expected positive gas used, got {}", result.gas_used);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_latest_flashblock_matches_base_call_at_flashblock_for_success_and_revert_parity()
+-> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+
+    let dry_run_success_response = setup
+        .ws_rpc_request(
+            "eth_baseDryRunAtFlashblock",
+            json!([snapshot_id, setup.count1_from_alice()]),
+        )
+        .await?;
+    let dry_run_success: FlashblockDryRunResult =
+        serde_json::from_value(dry_run_success_response["result"].clone())?;
+    let base_call_success_response = setup
+        .ws_rpc_request(
+            "eth_baseCallAtFlashblock",
+            json!([snapshot_id, setup.count1_from_alice(), null, null]),
+        )
+        .await?;
+    let base_call_success: Bytes =
+        serde_json::from_value(base_call_success_response["result"].clone())?;
+
+    assert!(dry_run_success.success);
+    assert_eq!(dry_run_success.revert, None);
+    assert_eq!(base_call_success, u256_return_data(2));
+
+    let dry_run_revert_response = setup
+        .ws_rpc_request(
+            "eth_baseDryRunAtFlashblock",
+            json!([snapshot_id, setup.block_number_guard_create_from_alice(1)]),
+        )
+        .await?;
+    let dry_run_revert: FlashblockDryRunResult =
+        serde_json::from_value(dry_run_revert_response["result"].clone())?;
+
+    assert!(!dry_run_revert.success);
+    assert_eq!(dry_run_revert.revert, Some(bytes!("0x")));
+
+    let base_call_revert_response = setup
+        .ws_rpc_request(
+            "eth_baseCallAtFlashblock",
+            json!([snapshot_id, setup.block_number_guard_create_from_alice(1), null, null]),
+        )
+        .await?;
+    let error_message = base_call_revert_response["error"]["message"]
+        .as_str()
+        .expect("json-rpc error response expected");
+    assert!(error_message.contains("revert"), "unexpected revert error: {}", error_message);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_latest_flashblock_reports_positive_gas_used_for_success_and_revert()
+-> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let _snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+
+    let success_response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+    let success: FlashblockDryRunResult =
+        serde_json::from_value(success_response["result"].clone())?;
+
+    let revert_response = setup
+        .ws_rpc_request(
+            "eth_baseDryRunLatestFlashblock",
+            json!([setup.block_number_guard_create_from_alice(1)]),
+        )
+        .await?;
+    let revert: FlashblockDryRunResult = serde_json::from_value(revert_response["result"].clone())?;
+
+    assert!(success.gas_used > 0, "expected positive success gas used, got {}", success.gas_used);
+    assert!(revert.gas_used > 0, "expected positive revert gas used, got {}", revert.gas_used);
 
     Ok(())
 }
@@ -2465,6 +2721,14 @@ async fn test_eth_subscribe_new_fast_flashblock_logs_hot_only_mode() -> eyre::Re
     let notif: serde_json::Value = serde_json::from_str(notification.to_text()?)?;
 
     assert_fast_flashblock_snapshot_id(&notif["params"]["result"]["snapshotId"]);
+    let snapshot_id: FlashblockSnapshotId =
+        serde_json::from_value(notif["params"]["result"]["snapshotId"].clone())?;
+    let latest = setup
+        .harness
+        .flashblocks_state()
+        .get_latest_hot_snapshot()
+        .expect("latest hot snapshot should exist after fast delta");
+    assert_eq!(latest.snapshot_id, snapshot_id);
     assert!(notif["params"]["result"]["logs"].is_array());
     assert!(notif["params"]["result"]["transactions"].is_array());
 
