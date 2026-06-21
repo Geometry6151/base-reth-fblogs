@@ -1,19 +1,34 @@
 //! Manager-owned state for the hot dry-run sidecar control plane.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
+use alloy_consensus::Header;
 use alloy_primitives::B256;
 use arc_swap::ArcSwapOption;
+use base_common_chains::Upgrades;
 use base_common_flashblocks::Flashblock;
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use reth_provider::{BlockReaderIdExt, StateProviderFactory};
+use reth_revm::State;
+use revm::Database;
+use revm_database::{
+    bal::BalState,
+    states::{BundleState, CacheState, TransitionState},
+};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{AuditWindowSnapshot, FlashblockSnapshotId, HotSnapshot};
+use crate::{
+    AuditWindowSnapshot, FlashblockSnapshotId, HotApplyOutcome, HotEngine, HotExecutionDb,
+    HotExecutionState, HotSnapshot, HotSnapshotRing, Metrics, PeriodicAuditResult,
+};
 
 /// Low-cardinality availability and observability state for the hot dry-run sidecar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,12 +111,288 @@ pub struct HotDryRunWarmState {
     pub snapshot_id: FlashblockSnapshotId,
     /// Request-safe immutable snapshot material for dry-run RPC.
     pub hot_snapshot: Arc<HotSnapshot>,
+    execution_seed: HotDryRunExecutionSeed,
+}
+
+#[derive(Clone, Debug)]
+struct HotDryRunExecutionSeed {
+    cache: CacheState,
+    transition_state: Option<TransitionState>,
+    bundle_state: BundleState,
+    use_preloaded_bundle: bool,
+    block_hashes: BTreeMap<u64, B256>,
+    bal_state: BalState,
+}
+
+impl Default for HotDryRunExecutionSeed {
+    fn default() -> Self {
+        let state = State::builder().build();
+
+        Self {
+            cache: state.cache,
+            transition_state: state.transition_state,
+            bundle_state: state.bundle_state,
+            use_preloaded_bundle: state.use_preloaded_bundle,
+            block_hashes: state.block_hashes,
+            bal_state: state.bal_state,
+        }
+    }
+}
+
+impl HotDryRunExecutionSeed {
+    fn from_execution_state(execution: &HotExecutionState<HotExecutionDb>) -> Self {
+        let bundle_size = execution.db.bundle_state.state.len();
+        let bundle_clone_start = Instant::now();
+        let bundle_state = execution.db.bundle_state.clone();
+        Metrics::bundle_state_clone_duration().record(bundle_clone_start.elapsed());
+        Metrics::bundle_state_clone_size().record(bundle_size as f64);
+
+        Self {
+            cache: execution.db.cache.clone(),
+            transition_state: execution.db.transition_state.clone(),
+            bundle_state,
+            use_preloaded_bundle: execution.db.use_preloaded_bundle,
+            block_hashes: execution.db.block_hashes.clone(),
+            bal_state: execution.db.bal_state.clone(),
+        }
+    }
 }
 
 impl HotDryRunWarmState {
     /// Creates a new published warm state from one immutable hot snapshot.
     pub fn new(hot_snapshot: Arc<HotSnapshot>) -> Self {
-        Self { snapshot_id: hot_snapshot.snapshot_id, hot_snapshot }
+        Self {
+            snapshot_id: hot_snapshot.snapshot_id,
+            hot_snapshot,
+            execution_seed: HotDryRunExecutionSeed::default(),
+        }
+    }
+
+    /// Creates a new published warm state from one immutable hot snapshot plus sidecar execution.
+    pub fn from_execution(
+        hot_snapshot: Arc<HotSnapshot>,
+        execution: &HotExecutionState<HotExecutionDb>,
+    ) -> Self {
+        Self {
+            snapshot_id: hot_snapshot.snapshot_id,
+            hot_snapshot,
+            execution_seed: HotDryRunExecutionSeed::from_execution_state(execution),
+        }
+    }
+
+    /// Builds a request-local execution state without mutating the published sidecar base.
+    pub fn build_request_state<DB>(&self, database: DB) -> State<DB>
+    where
+        DB: Database,
+    {
+        State {
+            cache: self.execution_seed.cache.clone(),
+            database,
+            transition_state: self.execution_seed.transition_state.clone(),
+            bundle_state: self.execution_seed.bundle_state.clone(),
+            use_preloaded_bundle: self.execution_seed.use_preloaded_bundle,
+            block_hashes: self.execution_seed.block_hashes.clone(),
+            bal_state: self.execution_seed.bal_state.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HotDryRunSidecarWorker<Client> {
+    client: Client,
+    max_depth: u64,
+    manager: Arc<HotDryRunSidecarManager>,
+    hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    hot_engine: HotEngine<Client>,
+}
+
+impl<Client> HotDryRunSidecarWorker<Client>
+where
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: EthChainSpec<Header = Header> + Upgrades>
+        + BlockReaderIdExt<Header = Header>
+        + Clone
+        + Send
+        + 'static,
+{
+    fn new(
+        client: Client,
+        max_depth: u64,
+        manager: Arc<HotDryRunSidecarManager>,
+        hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    ) -> Self {
+        let hot_engine = HotEngine::new(client.clone(), max_depth);
+
+        Self { client, max_depth, manager, hot_snapshot_ring, hot_engine }
+    }
+
+    fn process_input(&mut self, input: HotDryRunSidecarInput) {
+        if !self.manager.generation_matches(input.generation()) {
+            return;
+        }
+
+        match input {
+            HotDryRunSidecarInput::Apply(input) => self.process_apply(input),
+            HotDryRunSidecarInput::RebuildFromSnapshot(input) => self.process_rebuild(input),
+        }
+    }
+
+    fn process_apply(&mut self, input: HotDryRunApplyInput) {
+        let outcome = match self.hot_engine.apply_flashblock(&input.flashblock) {
+            Ok(outcome) => outcome,
+            Err(_error) => {
+                self.manager
+                    .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::ApplyFailure);
+                return;
+            }
+        };
+
+        let HotApplyOutcome::Delta { snapshot: Some(snapshot), .. } = outcome else {
+            self.manager
+                .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::ApplyFailure);
+            return;
+        };
+
+        let sidecar_snapshot = Arc::new(*snapshot);
+        let Some(authoritative_snapshot) = self.authoritative_snapshot(input.snapshot_id) else {
+            self.manager.try_mark_unavailable(input.generation, HotDryRunSidecarStatus::Mismatch);
+            return;
+        };
+
+        if !Self::authoritative_snapshot_matches_apply_input(
+            &input,
+            authoritative_snapshot.as_ref(),
+        ) || !Self::sidecar_snapshot_matches_authoritative(
+            sidecar_snapshot.as_ref(),
+            authoritative_snapshot.as_ref(),
+        ) {
+            self.manager.try_mark_unavailable(input.generation, HotDryRunSidecarStatus::Mismatch);
+            return;
+        }
+
+        let Some(execution) = self.hot_engine.window.execution.as_ref() else {
+            self.manager
+                .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::ApplyFailure);
+            return;
+        };
+
+        let warm_state =
+            Arc::new(HotDryRunWarmState::from_execution(authoritative_snapshot, execution));
+        let _ = self.manager.try_publish_warm_state(input.generation, warm_state);
+    }
+
+    fn process_rebuild(&mut self, input: HotDryRunRebuildInput) {
+        let (audit_result, rebuilt_engine) = HotEngine::rebuild_shadow_from_snapshot(
+            self.client.clone(),
+            self.max_depth,
+            &input.replay_snapshot,
+        );
+
+        if audit_result != PeriodicAuditResult::EquivalentPrefix {
+            self.manager
+                .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::RebuildFailure);
+            return;
+        }
+
+        let Some(rebuilt_engine) = rebuilt_engine else {
+            self.manager
+                .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::RebuildFailure);
+            return;
+        };
+
+        let Some(authoritative_snapshot) = self.authoritative_snapshot(input.snapshot_id) else {
+            self.manager.try_mark_unavailable(input.generation, HotDryRunSidecarStatus::Mismatch);
+            return;
+        };
+
+        if !Self::authoritative_snapshot_matches_rebuild_input(
+            &input,
+            authoritative_snapshot.as_ref(),
+        ) || !Self::rebuilt_engine_matches_authoritative(
+            &rebuilt_engine,
+            authoritative_snapshot.as_ref(),
+        ) {
+            self.manager.try_mark_unavailable(input.generation, HotDryRunSidecarStatus::Mismatch);
+            return;
+        }
+
+        let Some(execution) = rebuilt_engine.window.execution.as_ref() else {
+            self.manager
+                .try_mark_unavailable(input.generation, HotDryRunSidecarStatus::RebuildFailure);
+            return;
+        };
+
+        let warm_state = Arc::new(HotDryRunWarmState::from_execution(
+            Arc::clone(&authoritative_snapshot),
+            execution,
+        ));
+
+        if self.manager.try_publish_warm_state(input.generation, warm_state) {
+            self.hot_engine = rebuilt_engine;
+        }
+    }
+
+    fn authoritative_snapshot(
+        &self,
+        snapshot_id: FlashblockSnapshotId,
+    ) -> Option<Arc<HotSnapshot>> {
+        self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").get(snapshot_id)
+    }
+
+    fn authoritative_snapshot_matches_apply_input(
+        input: &HotDryRunApplyInput,
+        authoritative_snapshot: &HotSnapshot,
+    ) -> bool {
+        authoritative_snapshot.snapshot_id == input.snapshot_id
+            && authoritative_snapshot.canonical_base_parent_hash == input.canonical_base_parent_hash
+            && authoritative_snapshot.latest_header.hash() == input.expected_latest_header_hash
+    }
+
+    fn authoritative_snapshot_matches_rebuild_input(
+        input: &HotDryRunRebuildInput,
+        authoritative_snapshot: &HotSnapshot,
+    ) -> bool {
+        authoritative_snapshot.snapshot_id == input.snapshot_id
+            && authoritative_snapshot.latest_header.hash() == input.expected_latest_header_hash
+    }
+
+    fn sidecar_snapshot_matches_authoritative(
+        sidecar_snapshot: &HotSnapshot,
+        authoritative_snapshot: &HotSnapshot,
+    ) -> bool {
+        sidecar_snapshot.snapshot_id == authoritative_snapshot.snapshot_id
+            && sidecar_snapshot.canonical_base_parent_hash
+                == authoritative_snapshot.canonical_base_parent_hash
+            && sidecar_snapshot.latest_header.hash() == authoritative_snapshot.latest_header.hash()
+    }
+
+    fn rebuilt_engine_matches_authoritative(
+        rebuilt_engine: &HotEngine<Client>,
+        authoritative_snapshot: &HotSnapshot,
+    ) -> bool {
+        let Some(sidecar_snapshot_id) = Self::latest_snapshot_id(rebuilt_engine) else {
+            return false;
+        };
+        let Some(active_block) = rebuilt_engine.window.active_block() else {
+            return false;
+        };
+
+        sidecar_snapshot_id == authoritative_snapshot.snapshot_id
+            && rebuilt_engine.window.anchor.hash()
+                == authoritative_snapshot.canonical_base_parent_hash
+            && active_block.latest_header.hash() == authoritative_snapshot.latest_header.hash()
+    }
+
+    fn latest_snapshot_id(hot_engine: &HotEngine<Client>) -> Option<FlashblockSnapshotId> {
+        let active_block = hot_engine.window.active_block()?;
+
+        Some(FlashblockSnapshotId::new(
+            hot_engine.next_snapshot_nonce,
+            active_block.block_number,
+            active_block.latest_flashblock_index,
+            active_block.payload_id,
+            active_block.parent_hash,
+        ))
     }
 }
 
@@ -131,6 +422,41 @@ impl HotDryRunSidecarManager {
     /// Returns the bounded work receiver for the sidecar worker.
     pub fn receiver(&self) -> Arc<Mutex<mpsc::Receiver<HotDryRunSidecarInput>>> {
         Arc::clone(&self.receiver)
+    }
+
+    /// Starts one independent sidecar worker task.
+    pub fn spawn_worker<Client>(
+        self: &Arc<Self>,
+        client: Client,
+        max_depth: u64,
+        hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    ) where
+        Client: StateProviderFactory
+            + ChainSpecProvider<ChainSpec: EthChainSpec<Header = Header> + Upgrades>
+            + BlockReaderIdExt<Header = Header>
+            + Clone
+            + Send
+            + 'static,
+    {
+        let receiver = self.receiver();
+        let manager = Arc::clone(self);
+
+        tokio::spawn(async move {
+            let mut worker =
+                HotDryRunSidecarWorker::new(client, max_depth, manager, hot_snapshot_ring);
+
+            loop {
+                let input = {
+                    let mut receiver = receiver.lock().await;
+                    receiver.recv().await
+                };
+                let Some(input) = input else {
+                    break;
+                };
+
+                worker.process_input(input);
+            }
+        });
     }
 
     /// Returns the currently active sidecar generation.
@@ -182,6 +508,25 @@ impl HotDryRunSidecarManager {
 
         self.latest_warm_state.store(Some(Arc::clone(&warm_state)));
         publication.1 = HotDryRunSidecarStatus::Warm;
+        true
+    }
+
+    /// Returns whether the provided generation is still active.
+    pub fn generation_matches(&self, generation: u64) -> bool {
+        self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned").0
+            == generation
+    }
+
+    /// Clears the latest warm state only if the provided generation is still active.
+    pub fn try_mark_unavailable(&self, generation: u64, status: HotDryRunSidecarStatus) -> bool {
+        let mut publication =
+            self.publication.lock().expect("hot dry-run sidecar publication mutex poisoned");
+
+        if publication.0 != generation {
+            return false;
+        }
+
+        self.mark_unavailable_locked(&mut publication, status);
         true
     }
 

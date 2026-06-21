@@ -120,7 +120,7 @@ impl FlashblocksState {
             + 'static,
     {
         let state_processor = StateProcessor::new_with_mode(
-            client,
+            client.clone(),
             Arc::clone(&self.pending_blocks),
             self.max_pending_blocks_depth,
             self.mode,
@@ -133,6 +133,14 @@ impl FlashblocksState {
                 Arc::clone(&self.hot_dry_run_sidecar_manager),
             ),
         );
+
+        if self.mode == FlashblocksMode::HotOnly {
+            self.hot_dry_run_sidecar_manager.spawn_worker(
+                client.clone(),
+                self.max_pending_blocks_depth,
+                Arc::clone(&self.hot_snapshot_ring),
+            );
+        }
 
         tokio::spawn(async move {
             state_processor.start().await;

@@ -433,6 +433,46 @@ impl TestSetup {
         }
     }
 
+    fn create_fourth_payload(&self) -> Flashblock {
+        Flashblock {
+            payload_id: PayloadId::new([1; 8]),
+            index: 1,
+            base: None,
+            diff: ExecutionPayloadFlashblockDeltaV1 {
+                state_root: B256::default(),
+                receipts_root: B256::default(),
+                gas_used: 0,
+                block_hash: B256::with_last_byte(0x04),
+                blob_gas_used: Some(0),
+                transactions: vec![unique_l1_block_info_deposit_tx(3)],
+                withdrawals: Vec::new(),
+                logs_bloom: Default::default(),
+                withdrawals_root: EMPTY_WITHDRAWALS,
+            },
+            metadata: Metadata { block_number: 2 },
+        }
+    }
+
+    fn create_invalidating_gap_payload(&self) -> Flashblock {
+        Flashblock {
+            payload_id: PayloadId::new([0; 8]),
+            index: 3,
+            base: None,
+            diff: ExecutionPayloadFlashblockDeltaV1 {
+                state_root: B256::default(),
+                receipts_root: B256::default(),
+                gas_used: 0,
+                block_hash: B256::with_last_byte(0xfe),
+                blob_gas_used: Some(0),
+                transactions: vec![],
+                withdrawals: Vec::new(),
+                logs_bloom: Default::default(),
+                withdrawals_root: EMPTY_WITHDRAWALS,
+            },
+            metadata: Metadata { block_number: 1 },
+        }
+    }
+
     fn count1(&self) -> BaseTransactionRequest {
         let counter =
             DoubleCounterInstance::new(self.txn_details.counter_address, self.harness.provider());
@@ -514,6 +554,65 @@ impl TestSetup {
                     expected_block_number,
                     expected_flashblock_index,
                 ));
+            }
+
+            tokio::time::sleep(HOT_SNAPSHOT_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_latest_hot_dry_run_snapshot_id(
+        &self,
+        expected_snapshot_id: FlashblockSnapshotId,
+    ) -> Result<FlashblockSnapshotId> {
+        let flashblocks_state = self.harness.flashblocks_state();
+        let deadline = tokio::time::Instant::now() + HOT_SNAPSHOT_WAIT_TIMEOUT;
+
+        loop {
+            if let Some(warm_state) = flashblocks_state.get_latest_hot_dry_run_state() {
+                if warm_state.snapshot_id == expected_snapshot_id {
+                    return Ok(warm_state.snapshot_id);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(eyre::eyre!(
+                    "timed out waiting for latest hot dry-run state for snapshot {:?}",
+                    expected_snapshot_id,
+                ));
+            }
+
+            tokio::time::sleep(HOT_SNAPSHOT_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_latest_hot_dry_run_state_clear(&self) -> Result<()> {
+        let flashblocks_state = self.harness.flashblocks_state();
+        let deadline = tokio::time::Instant::now() + HOT_SNAPSHOT_WAIT_TIMEOUT;
+
+        loop {
+            if flashblocks_state.get_latest_hot_dry_run_state().is_none() {
+                return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(eyre::eyre!("timed out waiting for latest hot dry-run state to clear"));
+            }
+
+            tokio::time::sleep(HOT_SNAPSHOT_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_latest_hot_snapshot_clear(&self) -> Result<()> {
+        let flashblocks_state = self.harness.flashblocks_state();
+        let deadline = tokio::time::Instant::now() + HOT_SNAPSHOT_WAIT_TIMEOUT;
+
+        loop {
+            if flashblocks_state.get_latest_hot_snapshot().is_none() {
+                return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(eyre::eyre!("timed out waiting for latest hot snapshot to clear"));
             }
 
             tokio::time::sleep(HOT_SNAPSHOT_POLL_INTERVAL).await;
@@ -1457,6 +1556,64 @@ async fn sidecar_overflow_does_not_block_fast_logs() -> Result<()> {
     assert_eq!(result.halt, None);
     assert_eq!(result.snapshot_id, fast_delta.snapshot_id);
     assert!(result.gas_used > 0, "expected positive gas used, got {}", result.gas_used);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sidecar_publishes_matching_latest_warm_state() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let expected_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let flashblocks_state = setup.harness.flashblocks_state();
+
+    let main_latest =
+        flashblocks_state.get_latest_hot_snapshot().expect("latest hot snapshot should exist");
+    assert_eq!(main_latest.snapshot_id, expected_snapshot_id);
+
+    let sidecar_snapshot_id =
+        setup.wait_for_latest_hot_dry_run_snapshot_id(expected_snapshot_id).await?;
+    assert_eq!(sidecar_snapshot_id, main_latest.snapshot_id);
+
+    setup.send_flashblock(setup.create_invalidating_gap_payload()).await?;
+    setup.wait_for_latest_hot_snapshot_clear().await?;
+    setup.wait_for_latest_hot_dry_run_state_clear().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sidecar_recovers_from_drop_using_authoritative_rebuild() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let initial_snapshot_id =
+        setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let _ = setup.wait_for_latest_hot_dry_run_snapshot_id(initial_snapshot_id).await?;
+
+    setup
+        .harness
+        .flashblocks_state()
+        .force_next_hot_dry_run_sidecar_after_send_failure_for_testing();
+
+    let next_block_parent_hash = setup.pending_parent_hash_for_next_block().await?;
+    let mut third_payload = setup.create_third_payload(next_block_parent_hash);
+    third_payload.diff.block_hash = B256::with_last_byte(0x03);
+    setup.send_flashblock(third_payload).await?;
+    let dropped_snapshot_id = setup.wait_for_latest_hot_snapshot_id(2, 0).await?;
+    setup.wait_for_latest_hot_dry_run_state_clear().await?;
+
+    setup.send_flashblock(setup.create_fourth_payload()).await?;
+    let rebuilt_snapshot_id = setup.wait_for_latest_hot_snapshot_id(2, 1).await?;
+    assert_ne!(rebuilt_snapshot_id, dropped_snapshot_id);
+
+    let sidecar_snapshot_id =
+        setup.wait_for_latest_hot_dry_run_snapshot_id(rebuilt_snapshot_id).await?;
+    assert_eq!(sidecar_snapshot_id, rebuilt_snapshot_id);
+
+    let response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+    assert_eq!(result.snapshot_id, rebuilt_snapshot_id);
 
     Ok(())
 }
