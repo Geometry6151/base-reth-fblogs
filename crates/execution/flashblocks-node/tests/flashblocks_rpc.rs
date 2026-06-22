@@ -1427,6 +1427,66 @@ async fn latest_hot_dry_run_seed_matches_latest_hot_snapshot_after_fast_delta() 
 }
 
 #[tokio::test]
+async fn base_dry_run_latest_flashblock_with_matching_seed_does_not_initialize_snapshot_overlay()
+-> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+    let seed_snapshot_id = setup.wait_for_latest_hot_snapshot_seed_match().await?;
+    assert_eq!(seed_snapshot_id, snapshot_id);
+
+    let snapshot = setup
+        .harness
+        .flashblocks_state()
+        .get_hot_snapshot(snapshot_id)
+        .expect("latest hot snapshot should exist after matching-seed setup");
+    assert!(snapshot.dry_run_overlay().get().is_none());
+
+    let response = setup
+        .ws_rpc_request("eth_baseDryRunLatestFlashblock", json!([setup.count1_from_alice()]))
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+
+    assert!(result.success);
+    assert_eq!(result.snapshot_id, snapshot_id);
+    assert!(
+        snapshot.dry_run_overlay().get().is_none(),
+        "matching-seed latest dry-run should reuse the seed without initializing the snapshot overlay"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_dry_run_at_flashblock_initializes_snapshot_overlay() -> Result<()> {
+    let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
+    let snapshot_id = setup.send_test_payloads_and_wait_for_latest_hot_snapshot_id().await?;
+
+    let snapshot = setup
+        .harness
+        .flashblocks_state()
+        .get_hot_snapshot(snapshot_id)
+        .expect("latest hot snapshot should exist before direct dry-run setup");
+    assert!(snapshot.dry_run_overlay().get().is_none());
+
+    let response = setup
+        .ws_rpc_request(
+            "eth_baseDryRunAtFlashblock",
+            json!([snapshot_id, setup.count1_from_alice()]),
+        )
+        .await?;
+    let result: FlashblockDryRunResult = serde_json::from_value(response["result"].clone())?;
+
+    assert!(result.success);
+    assert_eq!(result.snapshot_id, snapshot_id);
+    assert!(
+        snapshot.dry_run_overlay().get().is_some(),
+        "direct snapshot dry-run should initialize the snapshot overlay"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn base_dry_run_at_flashblock_unknown_snapshot_returns_invalid_params() -> Result<()> {
     let setup = TestSetup::new_with_mode(FlashblocksMode::HotOnly).await?;
     let snapshot_id = FlashblockSnapshotId::new(

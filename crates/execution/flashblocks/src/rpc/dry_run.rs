@@ -178,6 +178,23 @@ fn latest_seed_matches_snapshot(
     seed_snapshot_id == Some(snapshot_id)
 }
 
+fn snapshot_overlay_counts(snapshot: &HotSnapshot) -> (usize, usize) {
+    let account_count = snapshot.state_overrides.len();
+    let storage_slot_count = snapshot
+        .state_overrides
+        .values()
+        .map(|account_override| {
+            account_override
+                .state
+                .as_ref()
+                .or(account_override.state_diff.as_ref())
+                .map_or(0, |storage| storage.len())
+        })
+        .sum::<usize>();
+
+    (account_count, storage_slot_count)
+}
+
 pub(crate) async fn dry_run_hot_snapshot<Eth>(
     eth_api: &Eth,
     method: &'static str,
@@ -242,6 +259,7 @@ where
     debug_assert!(matches!(method, "latest" | "at"));
 
     let total_start = Instant::now();
+    let use_seed_state = seed.is_some();
     let snapshot_id = snapshot.snapshot_id;
     let canonical_base_block = snapshot.canonical_base_block;
     let block_overrides = snapshot.block_overrides.clone();
@@ -260,16 +278,25 @@ where
     let _permit = permit;
 
     let overlay_start = Instant::now();
-    let overlay = snapshot
-        .dry_run_overlay()
-        .get_or_init(|| HotOverlay::from_state_override(&snapshot.state_overrides).map(Arc::new))
-        .as_ref();
-    Metrics::rpc_base_dry_run_overlay_init_duration().record(overlay_start.elapsed());
-    let overlay = overlay
-        .map(Arc::clone)
-        .map_err(|err| Eth::Error::from_eth_err(EthApiError::InvalidParams(err.to_string())))?;
-    let overlay_accounts = overlay.account_count();
-    let overlay_slots = overlay.storage_slot_count();
+    let (overlay, overlay_accounts, overlay_slots) = if use_seed_state {
+        let (overlay_accounts, overlay_slots) = snapshot_overlay_counts(snapshot.as_ref());
+        Metrics::rpc_base_dry_run_overlay_init_duration().record(overlay_start.elapsed());
+        (None, overlay_accounts, overlay_slots)
+    } else {
+        let overlay = snapshot
+            .dry_run_overlay()
+            .get_or_init(|| {
+                HotOverlay::from_state_override(&snapshot.state_overrides).map(Arc::new)
+            })
+            .as_ref();
+        Metrics::rpc_base_dry_run_overlay_init_duration().record(overlay_start.elapsed());
+        let overlay = overlay
+            .map(Arc::clone)
+            .map_err(|err| Eth::Error::from_eth_err(EthApiError::InvalidParams(err.to_string())))?;
+        let overlay_accounts = overlay.account_count();
+        let overlay_slots = overlay.storage_slot_count();
+        (Some(overlay), overlay_accounts, overlay_slots)
+    };
     Metrics::rpc_base_dry_run_overlay_account_count().record(overlay_accounts as f64);
     Metrics::rpc_base_dry_run_overlay_slot_count().record(overlay_slots as f64);
 
@@ -290,27 +317,45 @@ where
                 StateProviderDatabase::new(StateProviderTraitObjWrapper(state)),
                 dry_run_read_counts,
             );
-            let overlay_db = HotOverlayDb::new(canonical, overlay);
-            let mut db = match seed {
-                Some(seed) => seed.build_request_state(overlay_db),
-                None => State::builder().with_database(overlay_db).build(),
-            };
+            if let Some(seed) = seed {
+                let mut db = seed.build_request_state(canonical);
 
-            let env_build_start = Instant::now();
-            apply_block_overrides(block_overrides, &mut db, evm_env.block_env.inner_mut());
+                let env_build_start = Instant::now();
+                apply_block_overrides(block_overrides, &mut db, evm_env.block_env.inner_mut());
 
-            let prepared_env =
-                this.prepare_call_env(evm_env, transaction, &mut db, EvmOverrides::default());
-            Metrics::rpc_base_dry_run_env_build_duration().record(env_build_start.elapsed());
-            let (evm_env, tx_env) = prepared_env?;
+                let prepared_env =
+                    this.prepare_call_env(evm_env, transaction, &mut db, EvmOverrides::default());
+                Metrics::rpc_base_dry_run_env_build_duration().record(env_build_start.elapsed());
+                let (evm_env, tx_env) = prepared_env?;
 
-            let evm_start = Instant::now();
-            let execution = this.transact(db, evm_env, tx_env);
-            let evm_duration = evm_start.elapsed();
-            Metrics::rpc_base_dry_run_evm_duration().record(evm_duration);
-            let execution = execution?;
+                let evm_start = Instant::now();
+                let execution = this.transact(db, evm_env, tx_env);
+                let evm_duration = evm_start.elapsed();
+                Metrics::rpc_base_dry_run_evm_duration().record(evm_duration);
+                let execution = execution?;
 
-            Ok((execution, overlay_accounts, overlay_slots, evm_duration))
+                Ok((execution, overlay_accounts, overlay_slots, evm_duration))
+            } else {
+                let overlay = overlay.expect("direct hot snapshot dry-run requires overlay DB");
+                let overlay_db = HotOverlayDb::new(canonical, overlay);
+                let mut db = State::builder().with_database(overlay_db).build();
+
+                let env_build_start = Instant::now();
+                apply_block_overrides(block_overrides, &mut db, evm_env.block_env.inner_mut());
+
+                let prepared_env =
+                    this.prepare_call_env(evm_env, transaction, &mut db, EvmOverrides::default());
+                Metrics::rpc_base_dry_run_env_build_duration().record(env_build_start.elapsed());
+                let (evm_env, tx_env) = prepared_env?;
+
+                let evm_start = Instant::now();
+                let execution = this.transact(db, evm_env, tx_env);
+                let evm_duration = evm_start.elapsed();
+                Metrics::rpc_base_dry_run_evm_duration().record(evm_duration);
+                let execution = execution?;
+
+                Ok((execution, overlay_accounts, overlay_slots, evm_duration))
+            }
         })
         .await;
 
