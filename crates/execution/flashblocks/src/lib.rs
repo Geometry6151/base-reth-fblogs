@@ -41,6 +41,9 @@ pub use hot_mode::FlashblocksMode;
 mod hot_snapshot;
 pub use hot_snapshot::{HotSnapshot, HotSnapshotRing};
 
+mod hot_dry_run_seed;
+pub use hot_dry_run_seed::{HotDryRunExecutionSeed, HotDryRunSeed, LatestHotDryRunSeedCache};
+
 mod hot_window;
 pub use hot_window::{
     HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow, HotWindowAnchor,

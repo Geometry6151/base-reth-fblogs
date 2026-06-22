@@ -38,9 +38,9 @@ use tokio::{
 use crate::{
     AuditWindowSnapshot, BlockAssembler, CachedFlashblock, ExecutionError, FastFlashblockFeedEvent,
     FastFlashblockLogsDelta, FlashblockCache, FlashblocksMode, HotApplyOutcome, HotEngine,
-    HotInvalidationReason, HotSnapshotRing, PendingBlocks, PendingBlocksBuilder,
-    PendingStateBuilder, PeriodicAuditFailure, PeriodicAuditResult, ProviderError, Result,
-    ShadowRebuildCompletion, SnapshotCache, StateProcessorError,
+    HotInvalidationReason, HotSnapshot, HotSnapshotRing, LatestHotDryRunSeedCache, PendingBlocks,
+    PendingBlocksBuilder, PendingStateBuilder, PeriodicAuditFailure, PeriodicAuditResult,
+    ProviderError, Result, ShadowRebuildCompletion, SnapshotCache, StateProcessorError,
     metrics::Metrics,
     validation::{
         CanonicalBlockReconciler, FlashblockSequenceValidator, ReconciliationStrategy,
@@ -78,6 +78,7 @@ pub struct StateProcessor<Client> {
     cache: Arc<Mutex<FlashblockCache>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    latest_hot_dry_run_seed: Arc<LatestHotDryRunSeedCache>,
     next_snapshot_nonce: Arc<AtomicU64>,
     hot_engine: Option<Arc<Mutex<HotEngine<Client>>>>,
     hot_periodic_audit: Arc<StdMutex<HotPeriodicAuditState<Client>>>,
@@ -92,6 +93,7 @@ pub struct StateProcessorHandles {
     sender: Sender<Arc<PendingBlocks>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    latest_hot_dry_run_seed: Arc<LatestHotDryRunSeedCache>,
 }
 
 impl StateProcessorHandles {
@@ -102,8 +104,9 @@ impl StateProcessorHandles {
         sender: Sender<Arc<PendingBlocks>>,
         snapshot_cache: Arc<StdMutex<SnapshotCache>>,
         hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+        latest_hot_dry_run_seed: Arc<LatestHotDryRunSeedCache>,
     ) -> Self {
-        Self { rx, fast_sender, sender, snapshot_cache, hot_snapshot_ring }
+        Self { rx, fast_sender, sender, snapshot_cache, hot_snapshot_ring, latest_hot_dry_run_seed }
     }
 }
 
@@ -361,8 +364,14 @@ where
         let cache = FlashblockCache::new(latest_canonical_block);
         let hot_engine = (mode == FlashblocksMode::HotOnly)
             .then(|| Arc::new(Mutex::new(HotEngine::new(client.clone(), max_depth))));
-        let StateProcessorHandles { rx, fast_sender, sender, snapshot_cache, hot_snapshot_ring } =
-            handles;
+        let StateProcessorHandles {
+            rx,
+            fast_sender,
+            sender,
+            snapshot_cache,
+            hot_snapshot_ring,
+            latest_hot_dry_run_seed,
+        } = handles;
 
         Self {
             pending_blocks,
@@ -375,6 +384,7 @@ where
             cache: Arc::new(Mutex::new(cache)),
             snapshot_cache,
             hot_snapshot_ring,
+            latest_hot_dry_run_seed,
             next_snapshot_nonce: Arc::new(AtomicU64::new(0)),
             hot_engine,
             hot_periodic_audit: Arc::new(StdMutex::new(HotPeriodicAuditState::new(
@@ -856,16 +866,11 @@ where
     async fn apply_hot_only_canonical(&self, block: RecoveredBlock<BaseBlock>) {
         self.update_hot_periodic_audit_latest_seen_canonical(block.number);
         let block_hash = block.header().hash_slow();
-        let outcome = self.hot_engine().lock().await.process_canonical_block(&block);
+        let mut hot_engine = self.hot_engine().lock().await;
+        let outcome = hot_engine.process_canonical_block(&block);
         match outcome {
             Ok(HotApplyOutcome::Delta { delta, snapshot, .. }) => {
-                if let Some(snapshot) = snapshot {
-                    self.hot_snapshot_ring
-                        .lock()
-                        .expect("hot snapshot ring mutex poisoned")
-                        .insert(Arc::new(*snapshot));
-                }
-                _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(*delta)));
+                self.publish_hot_only_delta(&hot_engine, delta, snapshot);
             }
             Ok(HotApplyOutcome::Duplicate) => {}
             Ok(HotApplyOutcome::CanonicalWindowChanged) => {
@@ -878,6 +883,7 @@ where
                 _ = self.fast_sender.send(FastFlashblockFeedEvent::Resync);
             }
             Ok(HotApplyOutcome::InvalidateSession { reason }) => {
+                drop(hot_engine);
                 self.handle_hot_invalidation(Some(block.number), reason).await;
                 return;
             }
@@ -886,6 +892,7 @@ where
                 return;
             }
         }
+        drop(hot_engine);
 
         let mut cache = self.cache.lock().await;
         cache.update_canonical(block.number);
@@ -917,6 +924,30 @@ where
         }
     }
 
+    fn publish_hot_only_delta(
+        &self,
+        hot_engine: &HotEngine<Client>,
+        delta: Box<FastFlashblockLogsDelta>,
+        snapshot: Option<Box<HotSnapshot>>,
+    ) {
+        let hot_snapshot = snapshot.map(|snapshot| {
+            let snapshot = Arc::new(*snapshot);
+            self.hot_snapshot_ring
+                .lock()
+                .expect("hot snapshot ring mutex poisoned")
+                .insert(Arc::clone(&snapshot));
+            snapshot
+        });
+
+        _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(*delta)));
+
+        if let Some(hot_snapshot) = hot_snapshot {
+            if let Some(seed) = hot_engine.fork_dry_run_seed(Arc::clone(&hot_snapshot)) {
+                self.latest_hot_dry_run_seed.publish(Arc::new(seed));
+            }
+        }
+    }
+
     async fn apply_hot_only_flashblock(&self, flashblock: Flashblock) -> bool {
         let mut replay_queue = VecDeque::from([flashblock]);
 
@@ -933,26 +964,18 @@ where
                 continue;
             }
 
-            let (outcome, missing_first_flashblock, hot_window_invalidated) = {
-                let mut hot_engine = self.hot_engine().lock().await;
-                let missing_first_flashblock = (hot_engine.window.execution.is_none()
-                    || hot_engine.window.blocks.is_empty())
-                    && flashblock.index > 0;
-                let outcome = hot_engine.apply_flashblock(&flashblock);
-                let hot_window_invalidated =
-                    hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
-                (outcome, missing_first_flashblock, hot_window_invalidated)
-            };
+            let mut hot_engine = self.hot_engine().lock().await;
+            let missing_first_flashblock = (hot_engine.window.execution.is_none()
+                || hot_engine.window.blocks.is_empty())
+                && flashblock.index > 0;
+            let outcome = hot_engine.apply_flashblock(&flashblock);
+            let hot_window_invalidated =
+                hot_engine.window.execution.is_none() || hot_engine.window.blocks.is_empty();
 
             match outcome {
                 Ok(HotApplyOutcome::Delta { delta, snapshot, ready_cached_block }) => {
-                    if let Some(snapshot) = snapshot {
-                        self.hot_snapshot_ring
-                            .lock()
-                            .expect("hot snapshot ring mutex poisoned")
-                            .insert(Arc::new(*snapshot));
-                    }
-                    _ = self.fast_sender.send(FastFlashblockFeedEvent::Delta(Arc::new(*delta)));
+                    self.publish_hot_only_delta(&hot_engine, delta, snapshot);
+                    drop(hot_engine);
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
 
                     if let Some(ready_cached_block) = ready_cached_block {
@@ -972,14 +995,17 @@ where
                     }
                 }
                 Ok(HotApplyOutcome::Duplicate) => {
+                    drop(hot_engine);
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
                 Ok(HotApplyOutcome::CanonicalWindowChanged) => {
+                    drop(hot_engine);
                     self.advance_hot_periodic_audit_generation();
                     self.clear_hot_snapshot_ring();
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
                 Ok(HotApplyOutcome::Reset) => {
+                    drop(hot_engine);
                     self.advance_hot_periodic_audit_generation();
                     if hot_window_invalidated {
                         self.clear_hot_snapshot_ring();
@@ -1005,11 +1031,13 @@ where
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                 }
                 Ok(HotApplyOutcome::InvalidateSession { reason }) => {
+                    drop(hot_engine);
                     self.handle_hot_invalidation(None, reason).await;
                     Metrics::block_processing_duration().record(block_processing_start.elapsed());
                     return true;
                 }
                 Err(e) => {
+                    drop(hot_engine);
                     if let StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
                     }) = e
@@ -1305,6 +1333,7 @@ where
 
     fn clear_hot_snapshot_ring(&self) {
         self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").clear();
+        self.latest_hot_dry_run_seed.clear();
     }
 
     async fn handle_hot_invalidation(
@@ -1549,7 +1578,8 @@ mod tests {
     use super::{StateProcessor, StateProcessorHandles, StateUpdate};
     use crate::{
         BlockAssembler, FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksMode, HotEngine,
-        HotSnapshotRing, PeriodicAuditFailure, PeriodicAuditResult, SnapshotCache,
+        HotSnapshotRing, LatestHotDryRunSeedCache, PeriodicAuditFailure, PeriodicAuditResult,
+        SnapshotCache,
     };
 
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1588,6 +1618,7 @@ mod tests {
             sender,
             Arc::new(std::sync::Mutex::new(SnapshotCache::new(capacity, Duration::from_secs(1)))),
             Arc::new(std::sync::Mutex::new(HotSnapshotRing::new(capacity))),
+            Arc::new(LatestHotDryRunSeedCache::default()),
         )
     }
 

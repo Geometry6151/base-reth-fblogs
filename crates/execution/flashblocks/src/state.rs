@@ -21,7 +21,8 @@ use tokio::sync::{
 
 use crate::{
     FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksAPI, FlashblocksMode,
-    FlashblocksReceiver, HotSnapshot, HotSnapshotRing, PendingBlocks, SnapshotCache,
+    FlashblocksReceiver, HotDryRunSeed, HotSnapshot, HotSnapshotRing, LatestHotDryRunSeedCache,
+    PendingBlocks, SnapshotCache,
     processor::{StateProcessor, StateProcessorHandles, StateUpdate},
     snapshot_cache::{DEFAULT_SNAPSHOT_CACHE_CAPACITY, DEFAULT_SNAPSHOT_CACHE_TTL},
 };
@@ -48,6 +49,7 @@ pub struct FlashblocksState {
     flashblock_sender: Sender<Arc<PendingBlocks>>,
     snapshot_cache: Arc<StdMutex<SnapshotCache>>,
     hot_snapshot_ring: Arc<StdMutex<HotSnapshotRing>>,
+    latest_hot_dry_run_seed: Arc<LatestHotDryRunSeedCache>,
     max_pending_blocks_depth: u64,
     mode: FlashblocksMode,
 }
@@ -81,6 +83,7 @@ impl FlashblocksState {
             hot_snapshot_ring: Arc::new(StdMutex::new(HotSnapshotRing::new(
                 SNAPSHOT_CACHE_CAPACITY,
             ))),
+            latest_hot_dry_run_seed: Arc::new(LatestHotDryRunSeedCache::default()),
             max_pending_blocks_depth,
             mode,
         }
@@ -119,6 +122,7 @@ impl FlashblocksState {
                 self.flashblock_sender.clone(),
                 Arc::clone(&self.snapshot_cache),
                 Arc::clone(&self.hot_snapshot_ring),
+                Arc::clone(&self.latest_hot_dry_run_seed),
             ),
         );
 
@@ -195,6 +199,14 @@ impl FlashblocksAPI for FlashblocksState {
         self.hot_snapshot_ring.lock().expect("hot snapshot ring mutex poisoned").latest()
     }
 
+    fn get_latest_hot_dry_run_seed(&self) -> Option<Arc<HotDryRunSeed>> {
+        if self.mode != FlashblocksMode::HotOnly {
+            return None;
+        }
+
+        self.latest_hot_dry_run_seed.latest()
+    }
+
     fn mode(&self) -> FlashblocksMode {
         self.mode
     }
@@ -212,6 +224,18 @@ impl FlashblocksState {
     pub fn set_pending_blocks_for_testing(&self, pending_blocks: Option<PendingBlocks>) {
         self.snapshot_cache.lock().expect("snapshot cache mutex poisoned").clear();
         self.pending_blocks.store(pending_blocks.map(Arc::new));
+    }
+
+    #[cfg(test)]
+    /// Clears the latest hot dry-run seed cache in tests.
+    pub fn clear_latest_hot_dry_run_seed_for_test(&self) {
+        self.latest_hot_dry_run_seed.clear();
+    }
+
+    #[cfg(test)]
+    /// Publishes a latest hot dry-run seed in tests.
+    pub fn publish_latest_hot_dry_run_seed_for_test(&self, seed: Arc<HotDryRunSeed>) {
+        self.latest_hot_dry_run_seed.publish(seed);
     }
 }
 
@@ -334,6 +358,19 @@ mod tests {
         })
         .await
         .expect("hot snapshot should clear");
+    }
+
+    async fn wait_for_latest_hot_dry_run_seed_clear(state: &FlashblocksState) {
+        timeout(RECV_TIMEOUT, async {
+            loop {
+                if state.get_latest_hot_dry_run_seed().is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("latest hot dry-run seed should clear");
     }
 
     #[test]
@@ -554,6 +591,9 @@ mod tests {
         let stale_snapshot = state
             .get_hot_snapshot(first_delta.snapshot_id)
             .expect("initial hot snapshot should be retained");
+        let stale_seed = state
+            .get_latest_hot_dry_run_seed()
+            .expect("initial hot dry-run seed should be retained");
 
         let mut malformed_flashblock =
             test_flashblock(1, 1, PayloadId::new([0x71; 8]), parent_hash);
@@ -563,13 +603,19 @@ mod tests {
         let resync_event = recv_fast_flashblock_event(&mut fast_receiver).await;
         assert!(matches!(resync_event, FastFlashblockFeedEvent::Resync));
         wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+        wait_for_latest_hot_dry_run_seed_clear(&state).await;
 
         state
             .hot_snapshot_ring()
             .lock()
             .expect("hot snapshot ring mutex poisoned")
             .insert(Arc::clone(&stale_snapshot));
+        state.publish_latest_hot_dry_run_seed_for_test(Arc::clone(&stale_seed));
         assert!(state.get_hot_snapshot(first_delta.snapshot_id).is_some());
+        assert_eq!(
+            state.get_latest_hot_dry_run_seed().as_ref().map(|seed| seed.snapshot_id),
+            Some(stale_seed.snapshot_id)
+        );
 
         state.on_flashblock_received(test_flashblock(
             1,
@@ -581,6 +627,7 @@ mod tests {
         let resync_event = recv_fast_flashblock_event(&mut fast_receiver).await;
         assert!(matches!(resync_event, FastFlashblockFeedEvent::Resync));
         wait_for_hot_snapshot_clear(&state, first_delta.snapshot_id).await;
+        wait_for_latest_hot_dry_run_seed_clear(&state).await;
     }
 
     #[tokio::test]

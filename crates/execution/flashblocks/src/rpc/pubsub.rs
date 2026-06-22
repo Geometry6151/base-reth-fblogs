@@ -290,10 +290,10 @@ where
                             return Ok(());
                         }
                     };
-                let sink = pending.accept().await?;
                 // Subscribe before spawning so fast update creation sees this subscriber
                 // immediately via `receiver_count()`.
                 let receiver = self.flashblocks_state.subscribe_to_fast_flashblock_logs();
+                let sink = pending.accept().await?;
 
                 tokio::spawn(async move {
                     pipe_fast_flashblock_logs_subscription(sink, receiver, filter).await;
@@ -309,10 +309,10 @@ where
                         }
                     };
                 if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
-                    let sink = pending.accept().await?;
                     // Subscribe before spawning so fast update creation sees this subscriber
                     // immediately via `receiver_count()`.
                     let receiver = self.flashblocks_state.subscribe_to_fast_flashblock_logs();
+                    let sink = pending.accept().await?;
 
                     tokio::spawn(async move {
                         pipe_flashblock_logs_batch_from_fast_delta_subscription(

@@ -108,6 +108,14 @@ base_metrics::define_metrics! {
     pinned_call_duration: histogram,
     #[describe("Time taken to resolve the latest hot snapshot for dry-run RPC")]
     rpc_base_dry_run_latest_lookup_duration: histogram,
+    #[describe("Count of latest hot dry-run RPC requests that used an exact-match dry-run seed")]
+    rpc_base_dry_run_latest_seed_hit_count: counter,
+    #[describe("Time taken by latest hot dry-run RPC requests that used an exact-match dry-run seed")]
+    rpc_base_dry_run_latest_seed_hit_duration: histogram,
+    #[describe("Count of latest hot dry-run RPC requests whose cached seed snapshot id mismatched the authoritative latest snapshot")]
+    rpc_base_dry_run_latest_seed_stale_count: counter,
+    #[describe("Count of latest hot dry-run RPC requests that fell back to direct snapshot evaluation")]
+    rpc_base_dry_run_latest_direct_fallback_count: counter,
     #[describe("Time taken to execute the latest hot snapshot dry-run RPC end-to-end")]
     rpc_base_dry_run_latest_duration: histogram,
     #[describe("Time taken to execute the snapshot-id hot dry-run RPC end-to-end")]
@@ -122,6 +130,10 @@ base_metrics::define_metrics! {
     rpc_base_dry_run_env_build_duration: histogram,
     #[describe("Time taken by the single EVM execution in hot dry-run")]
     rpc_base_dry_run_evm_duration: histogram,
+    #[describe("Time taken to fork a request-local hot dry-run seed from live execution state")]
+    hot_dry_run_seed_fork_duration: histogram,
+    #[describe("Number of bundle-state accounts carried into one forked hot dry-run seed")]
+    hot_dry_run_seed_bundle_state_size: histogram,
     #[describe("Number of overlay accounts in one hot dry-run snapshot")]
     rpc_base_dry_run_overlay_account_count: histogram,
     #[describe("Number of overlay storage slots in one hot dry-run snapshot")]
@@ -205,6 +217,10 @@ mod tests {
         let _ = Metrics::hot_periodic_audit_stale_result_count();
         let _ = Metrics::hot_periodic_audit_replayed_flashblock_count();
         let _ = Metrics::rpc_base_dry_run_latest_lookup_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_seed_hit_count();
+        let _ = Metrics::rpc_base_dry_run_latest_seed_hit_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_seed_stale_count();
+        let _ = Metrics::rpc_base_dry_run_latest_direct_fallback_count();
         let _ = Metrics::rpc_base_dry_run_latest_duration();
         let _ = Metrics::rpc_base_dry_run_at_duration();
         let _ = Metrics::rpc_base_dry_run_overlay_init_duration();
@@ -212,6 +228,8 @@ mod tests {
         let _ = Metrics::rpc_base_dry_run_canonical_state_open_duration();
         let _ = Metrics::rpc_base_dry_run_env_build_duration();
         let _ = Metrics::rpc_base_dry_run_evm_duration();
+        let _ = Metrics::hot_dry_run_seed_fork_duration();
+        let _ = Metrics::hot_dry_run_seed_bundle_state_size();
         let _ = Metrics::rpc_base_dry_run_overlay_account_count();
         let _ = Metrics::rpc_base_dry_run_overlay_slot_count();
         let _ = Metrics::rpc_base_dry_run_latest_account_reads();

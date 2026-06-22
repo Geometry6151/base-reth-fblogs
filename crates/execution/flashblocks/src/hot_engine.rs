@@ -1,5 +1,7 @@
 //! Suffix-only hot engine for speed-first flashblock logs.
 
+use std::sync::Arc;
+
 use alloy_consensus::{
     Header, Sealed, TxReceipt,
     transaction::{Recovered, SignerRecoverable},
@@ -23,9 +25,10 @@ use reth_storage_api::StateProviderBox;
 use crate::{
     AuditWindowSnapshot, BlockAssembler, ExecutionError, FastFlashblockLog,
     FastFlashblockLogsDelta, FastFlashblockTxMeta, FlashblockSequenceValidator,
-    FlashblockSnapshotId, HotExecutionState, HotPendingBlock, HotPendingWindow, HotSnapshot,
-    HotWindowAnchor, Metrics, PendingStateBuilder, PeriodicAuditFailure, PeriodicAuditResult,
-    ProviderError, Result, RetainedFastOutput, SequenceValidationResult, StateProcessorError,
+    FlashblockSnapshotId, HotDryRunSeed, HotExecutionState, HotPendingBlock, HotPendingWindow,
+    HotSnapshot, HotWindowAnchor, Metrics, PendingStateBuilder, PeriodicAuditFailure,
+    PeriodicAuditResult, ProviderError, Result, RetainedFastOutput, SequenceValidationResult,
+    StateProcessorError,
     periodic_audit::{PeriodicAuditMismatchOrigin, PeriodicAuditOutputMismatch},
 };
 
@@ -599,6 +602,25 @@ where
     /// Resets the current pending hot window.
     pub fn reset(&mut self) {
         self.window.reset();
+    }
+
+    /// Forks a request-local dry-run seed from the live hot execution state when it still matches
+    /// the supplied hot snapshot.
+    pub fn fork_dry_run_seed(&self, hot_snapshot: Arc<HotSnapshot>) -> Option<HotDryRunSeed> {
+        let active_block = self.window.active_block()?;
+        let execution = self.window.execution.as_ref()?;
+
+        if active_block.block_number != hot_snapshot.snapshot_id.block_number()
+            || active_block.latest_flashblock_index != hot_snapshot.snapshot_id.flashblock_index()
+            || active_block.payload_id != hot_snapshot.snapshot_id.payload_id()
+            || active_block.parent_hash != hot_snapshot.snapshot_id.parent_hash()
+            || active_block.latest_header.hash() != hot_snapshot.latest_header.hash()
+            || execution.last_header.hash() != hot_snapshot.latest_header.hash()
+        {
+            return None;
+        }
+
+        Some(HotDryRunSeed::from_execution(hot_snapshot, execution))
     }
 
     fn invalidate_session(&mut self, reason: HotInvalidationReason) -> HotApplyOutcome {
