@@ -1,6 +1,6 @@
 //! Cache for flashblocks that arrive before their canonical block.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use alloy_primitives::BlockNumber;
 use base_common_flashblocks::Flashblock;
@@ -18,11 +18,20 @@ pub struct FlashblockCache {
     /// Flashblocks keyed by block number, then by flashblock index. Using a
     /// nested map deduplicates by index — a later flashblock with the same
     /// index silently replaces the earlier one.
-    entries: HashMap<BlockNumber, HashMap<u64, Flashblock>>,
+    entries: HashMap<BlockNumber, HashMap<u64, CachedFlashblock>>,
 
     /// The latest canonical block number we have observed, used to decide
     /// whether a flashblock is close enough to cache.
     latest_canonical: Option<BlockNumber>,
+}
+
+/// Cached flashblock with local cache insertion time for dwell diagnostics.
+#[derive(Clone, Debug)]
+pub struct CachedFlashblock {
+    /// Cached flashblock payload.
+    pub flashblock: Flashblock,
+    /// Local time when the flashblock entered the cache.
+    pub inserted_at: Instant,
 }
 
 impl FlashblockCache {
@@ -51,25 +60,47 @@ impl FlashblockCache {
     /// Returns `true` if the flashblock was cached, `false` if it was rejected
     /// because its block number exceeds the cache-ahead limit.
     pub fn insert(&mut self, flashblock: Flashblock) -> bool {
+        self.insert_at(flashblock, Instant::now())
+    }
+
+    /// Inserts a flashblock into the cache with an explicit insertion timestamp.
+    ///
+    /// Returns `true` if the flashblock was cached, `false` if it was rejected
+    /// because its block number exceeds the cache-ahead limit.
+    pub fn insert_at(&mut self, flashblock: Flashblock, inserted_at: Instant) -> bool {
         let block_number = flashblock.metadata.block_number;
         if !self.is_cacheable(block_number) {
             return false;
         }
         let min_block_number_to_retain = block_number.saturating_sub(MAX_CACHE_AHEAD_BLOCKS);
         self.entries.retain(|&bn, _| bn > min_block_number_to_retain);
-        self.entries.entry(block_number).or_default().insert(flashblock.index, flashblock);
+        self.entries
+            .entry(block_number)
+            .or_default()
+            .insert(flashblock.index, CachedFlashblock { flashblock, inserted_at });
         true
+    }
+
+    /// Drains all cached flashblocks with their cache metadata for the given block number,
+    /// returning them sorted by index. Returns an empty `Vec` when nothing is cached.
+    pub fn drain_cached(&mut self, block_number: BlockNumber) -> Vec<CachedFlashblock> {
+        let Some(by_index) = self.entries.remove(&block_number) else {
+            return Vec::new();
+        };
+        let mut flashblocks: Vec<CachedFlashblock> = by_index.into_values().collect();
+        flashblocks.sort_by_key(|cached| cached.flashblock.index);
+        flashblocks
     }
 
     /// Drains all cached flashblocks for the given block number, returning them
     /// sorted by index. Returns an empty `Vec` when nothing is cached.
     pub fn drain(&mut self, block_number: BlockNumber) -> Vec<Flashblock> {
-        let Some(by_index) = self.entries.remove(&block_number) else {
-            return Vec::new();
-        };
-        let mut flashblocks: Vec<Flashblock> = by_index.into_values().collect();
-        flashblocks.sort_by_key(|fb| fb.index);
-        flashblocks
+        self.drain_cached(block_number).into_iter().map(|cached| cached.flashblock).collect()
+    }
+
+    /// Removes every cached flashblock while preserving the latest canonical watermark.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// Updates the latest canonical block number and evicts any cached entries
@@ -205,5 +236,31 @@ mod tests {
         assert_eq!(drained[0].index, 0);
         assert_eq!(drained[1].index, 1);
         assert_eq!(drained[2].index, 2);
+    }
+
+    #[test]
+    fn drain_cached_preserves_inserted_at() {
+        let mut cache = FlashblockCache::new(10);
+        let inserted_at = std::time::Instant::now();
+        let flashblock = make_flashblock(11, 0);
+
+        assert!(cache.insert_at(flashblock.clone(), inserted_at));
+
+        let drained = cache.drain_cached(11);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].flashblock.index, flashblock.index);
+        assert_eq!(drained[0].inserted_at, inserted_at);
+    }
+
+    #[test]
+    fn clear_removes_entries_without_losing_canonical_watermark() {
+        let mut cache = FlashblockCache::new(10);
+
+        assert!(cache.insert(make_flashblock(11, 0)));
+        assert!(cache.insert(make_flashblock(12, 0)));
+        cache.clear();
+
+        assert!(cache.is_empty());
+        assert!(cache.insert(make_flashblock(13, 0)));
     }
 }

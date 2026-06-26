@@ -11,6 +11,7 @@
 //! - `MockERC20`: Solmate's `MockERC20` (lib/solmate)
 //! - `TransparentUpgradeableProxy`: `OpenZeppelin`'s proxy (lib/openzeppelin-contracts)
 
+use alloy_consensus::constants::EMPTY_WITHDRAWALS;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
@@ -88,6 +89,7 @@ impl Erc20TestSetup {
             diff: ExecutionPayloadFlashblockDeltaV1 {
                 blob_gas_used: Some(0),
                 transactions: vec![L1_BLOCK_INFO_DEPOSIT_TX],
+                withdrawals_root: EMPTY_WITHDRAWALS,
                 ..Default::default()
             },
             metadata: Metadata::new(1),
@@ -114,7 +116,7 @@ impl Erc20TestSetup {
                 transactions,
                 withdrawals: Vec::new(),
                 logs_bloom: Default::default(),
-                withdrawals_root: Default::default(),
+                withdrawals_root: EMPTY_WITHDRAWALS,
             },
             metadata: Metadata::new(1),
         }
@@ -135,7 +137,7 @@ impl Erc20TestSetup {
                 transactions: vec![mint_tx],
                 withdrawals: Vec::new(),
                 logs_bloom: Default::default(),
-                withdrawals_root: Default::default(),
+                withdrawals_root: EMPTY_WITHDRAWALS,
             },
             metadata: Metadata::new(1),
         }

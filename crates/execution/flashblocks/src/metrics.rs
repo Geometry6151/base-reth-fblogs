@@ -6,8 +6,154 @@ base_metrics::define_metrics! {
     upstream_errors: counter,
     #[describe("Count of messages received from the upstream source")]
     upstream_messages: counter,
-    #[describe("Time taken to process a message")]
+    #[describe("Time taken to decode upstream flashblock messages")]
+    upstream_decode_duration: histogram,
+    #[describe("Time taken to successfully apply a flashblock to pending state")]
     block_processing_duration: histogram,
+    #[describe("Time taken to attempt applying a flashblock, including success, cache, and error paths")]
+    flashblock_apply_duration: histogram,
+    #[describe("Time spent waiting in the flashblock state queue before processing starts")]
+    state_queue_delay_duration: histogram,
+    #[describe("Time taken to build pending state from flashblocks")]
+    pending_state_build_duration: histogram,
+    #[describe("Time taken to execute only the new hot suffix transactions")]
+    hot_suffix_execute_duration: histogram,
+    #[describe("Number of transactions executed in one hot suffix apply")]
+    hot_suffix_tx_count: histogram,
+    #[describe("Time taken to build a hot fast-log delta from executed suffix results")]
+    hot_delta_build_duration: histogram,
+    #[describe("Time taken to roll the hot window to the next pending block")]
+    hot_window_rollover_duration: histogram,
+    #[describe("Time taken to derive pending header parts from carried post-state")]
+    hot_header_parts_from_post_state_duration: histogram,
+    #[describe("Time taken to merge transitions and derive the pending state root")]
+    hot_state_root_duration: histogram,
+    #[describe("Time taken to derive the pending withdrawals storage root when required")]
+    hot_storage_root_duration: histogram,
+    #[describe("Time taken to derive the pending receipts root")]
+    hot_receipts_root_duration: histogram,
+    #[describe("Time taken to build the pending logs bloom from ordered receipts")]
+    hot_logs_bloom_build_duration: histogram,
+    #[describe("Time taken for one hot-only periodic shadow rebuild audit attempt")]
+    hot_periodic_audit_duration: histogram,
+    #[describe("Count of successful hot-only periodic shadow rebuild audit attempts")]
+    hot_periodic_audit_success_count: counter,
+    #[describe("Count of failed hot-only periodic shadow rebuild audit attempts")]
+    hot_periodic_audit_failure_count: counter,
+    #[describe("Count of hot-only periodic shadow rebuild audits that exceeded the timeout")]
+    hot_periodic_audit_timeout_count: counter,
+    #[describe("Count of hot-only periodic shadow rebuild triggers rejected because an older audit was still in flight")]
+    hot_periodic_audit_overlap_count: counter,
+    #[describe("Count of finished hot-only periodic shadow rebuild audit results ignored because the live generation/window had already advanced")]
+    hot_periodic_audit_stale_result_count: counter,
+    #[describe("Number of retained flashblocks replayed by one hot-only periodic shadow rebuild audit attempt")]
+    hot_periodic_audit_replayed_flashblock_count: histogram,
+    #[describe("Count of times the hot window was reset from flashblock sequencing or parent mismatch")]
+    hot_window_reset_count: counter,
+    #[describe("Count of hot window resets caused by receiving a non-zero flashblock index without an active window")]
+    hot_window_reset_non_zero_first_index_count: counter,
+    #[describe("Count of hot window resets caused by a non-sequential same-block flashblock gap")]
+    hot_window_reset_sequence_gap_count: counter,
+    #[describe("Count of hot window resets caused by receiving a new block without flashblock index zero")]
+    hot_window_reset_invalid_new_block_index_count: counter,
+    #[describe("Count of hot window resets caused by first-flashblock parent mismatch against canonical")]
+    hot_window_reset_first_parent_mismatch_count: counter,
+    #[describe("Count of hot window resets caused by missing active block state")]
+    hot_window_reset_missing_active_block_count: counter,
+    #[describe("Count of hot window resets caused by same-block parent mismatch")]
+    hot_window_reset_same_block_parent_mismatch_count: counter,
+    #[describe("Count of hot rollover parent mismatches recovered by reanchoring to canonical state")]
+    hot_window_reanchor_canonical_parent_count: counter,
+    #[describe("Time taken to materialize an optional hot snapshot from carried execution state")]
+    hot_snapshot_materialize_duration: histogram,
+    #[describe("Count of times canonical processing forced a hot window reset")]
+    hot_canonical_reset_count: counter,
+    #[describe("Count of hot-only flashblocks cached while waiting for a missing canonical parent")]
+    hot_cache_insert_missing_canonical_count: counter,
+    #[describe("Count of hot-only non-zero flashblocks cached while waiting for the first cached flashblock to replay")]
+    hot_cache_insert_missing_first_count: counter,
+    #[describe("Number of cached hot-only flashblocks drained after a canonical block")]
+    hot_cache_drain_flashblock_count: histogram,
+    #[describe("Time a hot-only flashblock spent cached before replay")]
+    hot_cache_dwell_duration: histogram,
+    #[describe("Time taken to build the newFastFlashblockLogs delta from pending state")]
+    fast_delta_build_duration: histogram,
+    #[describe("Time taken to build the newFlashblocks block payload from pending state")]
+    new_flashblocks_build_duration: histogram,
+    #[describe("Time taken to build the newFlashblockLogsBatch payload")]
+    logs_batch_build_duration: histogram,
+    #[describe("Time taken to serialize newFlashblockLogsBatch subscription payloads")]
+    logs_batch_pubsub_serialize_duration: histogram,
+    #[describe("Time taken to serialize newFastFlashblockLogs subscription payloads")]
+    fast_pubsub_serialize_duration: histogram,
+    #[describe("Time taken to send newFastFlashblockLogs subscription payloads")]
+    fast_pubsub_send_duration: histogram,
+    #[describe("Time taken to send newFlashblockLogsBatch subscription payloads")]
+    logs_batch_pubsub_send_duration: histogram,
+    #[describe("Time taken to insert a pending snapshot into the snapshot cache")]
+    snapshot_cache_insert_duration: histogram,
+    #[describe("Time taken to look up a pending snapshot in the snapshot cache")]
+    snapshot_cache_get_duration: histogram,
+    #[describe("Time taken to clear the snapshot cache")]
+    snapshot_cache_clear_duration: histogram,
+    #[describe("Count of snapshot cache hits")]
+    snapshot_cache_hits: counter,
+    #[describe("Count of snapshot cache misses, including key-not-found and expired reads")]
+    snapshot_cache_misses: counter,
+    #[describe("Count of snapshot cache evictions from capacity pressure or explicit pruning")]
+    snapshot_cache_evictions: counter,
+    #[describe("Time taken to estimate gas against a state-pinned flashblock snapshot with best-effort block env")]
+    pinned_estimate_gas_duration: histogram,
+    #[describe("Time taken to execute a call against a pinned flashblock snapshot")]
+    pinned_call_duration: histogram,
+    #[describe("Time taken to resolve the latest hot snapshot for dry-run RPC")]
+    rpc_base_dry_run_latest_lookup_duration: histogram,
+    #[describe("Count of latest hot dry-run RPC requests that used an exact-match dry-run seed")]
+    rpc_base_dry_run_latest_seed_hit_count: counter,
+    #[describe("Time taken by latest hot dry-run RPC requests that used an exact-match dry-run seed")]
+    rpc_base_dry_run_latest_seed_hit_duration: histogram,
+    #[describe("Count of latest hot dry-run RPC requests whose cached seed snapshot id mismatched the authoritative latest snapshot")]
+    rpc_base_dry_run_latest_seed_stale_count: counter,
+    #[describe("Count of latest hot dry-run RPC requests that fell back to direct snapshot evaluation")]
+    rpc_base_dry_run_latest_direct_fallback_count: counter,
+    #[describe("Time taken to execute the latest hot snapshot dry-run RPC end-to-end")]
+    rpc_base_dry_run_latest_duration: histogram,
+    #[describe("Time taken to execute the snapshot-id hot dry-run RPC end-to-end")]
+    rpc_base_dry_run_at_duration: histogram,
+    #[describe("Time taken to fetch or lazily build the immutable hot dry-run overlay")]
+    rpc_base_dry_run_overlay_init_duration: histogram,
+    #[describe("Time taken to resolve the canonical block env for hot dry-run")]
+    rpc_base_dry_run_canonical_env_duration: histogram,
+    #[describe("Time taken to open the canonical state provider for hot dry-run")]
+    rpc_base_dry_run_canonical_state_open_duration: histogram,
+    #[describe("Time taken to construct the final env and tx env for hot dry-run")]
+    rpc_base_dry_run_env_build_duration: histogram,
+    #[describe("Time taken by the single EVM execution in hot dry-run")]
+    rpc_base_dry_run_evm_duration: histogram,
+    #[describe("Time taken to fork a request-local hot dry-run seed from live execution state")]
+    hot_dry_run_seed_fork_duration: histogram,
+    #[describe("Number of bundle-state accounts carried into one forked hot dry-run seed")]
+    hot_dry_run_seed_bundle_state_size: histogram,
+    #[describe("Number of overlay accounts in one hot dry-run snapshot")]
+    rpc_base_dry_run_overlay_account_count: histogram,
+    #[describe("Number of overlay storage slots in one hot dry-run snapshot")]
+    rpc_base_dry_run_overlay_slot_count: histogram,
+    #[describe("Canonical account reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_account_reads: histogram,
+    #[describe("Canonical storage reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_storage_reads: histogram,
+    #[describe("Canonical code reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_code_reads: histogram,
+    #[describe("Canonical block-hash reads during one latest hot dry-run")]
+    rpc_base_dry_run_latest_block_hash_reads: histogram,
+    #[describe("Count of successful hot dry-run RPC executions")]
+    rpc_base_dry_run_success_count: counter,
+    #[describe("Count of reverting hot dry-run RPC executions")]
+    rpc_base_dry_run_revert_count: counter,
+    #[describe("Count of halted hot dry-run RPC executions")]
+    rpc_base_dry_run_halt_count: counter,
+    #[describe("Count of hot dry-run RPC errors")]
+    rpc_base_dry_run_error_count: counter,
     #[describe("Time spent on parallel sender recovery")]
     sender_recovery_duration: histogram,
     #[describe("Number of Flashblocks that arrive in an unexpected order")]
@@ -50,4 +196,49 @@ base_metrics::define_metrics! {
     bundle_state_clone_duration: histogram,
     #[describe("Size of bundle state being cloned (number of accounts)")]
     bundle_state_clone_size: histogram,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Metrics;
+
+    #[test]
+    fn flashblocks_diagnostic_metric_accessors_exist() {
+        let _ = Metrics::hot_header_parts_from_post_state_duration();
+        let _ = Metrics::hot_state_root_duration();
+        let _ = Metrics::hot_storage_root_duration();
+        let _ = Metrics::hot_receipts_root_duration();
+        let _ = Metrics::hot_logs_bloom_build_duration();
+        let _ = Metrics::hot_periodic_audit_duration();
+        let _ = Metrics::hot_periodic_audit_success_count();
+        let _ = Metrics::hot_periodic_audit_failure_count();
+        let _ = Metrics::hot_periodic_audit_timeout_count();
+        let _ = Metrics::hot_periodic_audit_overlap_count();
+        let _ = Metrics::hot_periodic_audit_stale_result_count();
+        let _ = Metrics::hot_periodic_audit_replayed_flashblock_count();
+        let _ = Metrics::rpc_base_dry_run_latest_lookup_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_seed_hit_count();
+        let _ = Metrics::rpc_base_dry_run_latest_seed_hit_duration();
+        let _ = Metrics::rpc_base_dry_run_latest_seed_stale_count();
+        let _ = Metrics::rpc_base_dry_run_latest_direct_fallback_count();
+        let _ = Metrics::rpc_base_dry_run_latest_duration();
+        let _ = Metrics::rpc_base_dry_run_at_duration();
+        let _ = Metrics::rpc_base_dry_run_overlay_init_duration();
+        let _ = Metrics::rpc_base_dry_run_canonical_env_duration();
+        let _ = Metrics::rpc_base_dry_run_canonical_state_open_duration();
+        let _ = Metrics::rpc_base_dry_run_env_build_duration();
+        let _ = Metrics::rpc_base_dry_run_evm_duration();
+        let _ = Metrics::hot_dry_run_seed_fork_duration();
+        let _ = Metrics::hot_dry_run_seed_bundle_state_size();
+        let _ = Metrics::rpc_base_dry_run_overlay_account_count();
+        let _ = Metrics::rpc_base_dry_run_overlay_slot_count();
+        let _ = Metrics::rpc_base_dry_run_latest_account_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_storage_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_code_reads();
+        let _ = Metrics::rpc_base_dry_run_latest_block_hash_reads();
+        let _ = Metrics::rpc_base_dry_run_success_count();
+        let _ = Metrics::rpc_base_dry_run_revert_count();
+        let _ = Metrics::rpc_base_dry_run_halt_count();
+        let _ = Metrics::rpc_base_dry_run_error_count();
+    }
 }

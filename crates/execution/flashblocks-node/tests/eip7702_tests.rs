@@ -3,7 +3,7 @@
 //! These tests verify that EIP-7702 authorization and delegation
 //! transactions work correctly in the pending/flashblocks state.
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEip7702};
+use alloy_consensus::{constants::EMPTY_WITHDRAWALS, SignableTransaction, TxEip1559, TxEip7702};
 use alloy_eips::{eip2718::Encodable2718, eip7702::Authorization};
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -138,6 +138,7 @@ fn create_base_flashblock(setup: &TestSetup) -> Flashblock {
         diff: ExecutionPayloadFlashblockDeltaV1 {
             blob_gas_used: Some(0),
             transactions: vec![L1_BLOCK_INFO_DEPOSIT_TX, setup.account_deploy_tx.clone()],
+            withdrawals_root: EMPTY_WITHDRAWALS,
             ..Default::default()
         },
         metadata: Metadata::new(1),
@@ -158,7 +159,7 @@ fn create_eip7702_flashblock(eip7702_tx: Bytes, cumulative_gas: u64) -> Flashblo
             transactions: vec![eip7702_tx],
             withdrawals: Vec::new(),
             logs_bloom: Default::default(),
-            withdrawals_root: Default::default(),
+            withdrawals_root: EMPTY_WITHDRAWALS,
         },
         metadata: Metadata::new(1),
     }
@@ -263,7 +264,7 @@ async fn test_eip7702_multiple_delegations_same_flashblock() -> Result<()> {
             transactions: vec![tx_alice, tx_bob],
             withdrawals: Vec::new(),
             logs_bloom: Default::default(),
-            withdrawals_root: Default::default(),
+            withdrawals_root: EMPTY_WITHDRAWALS,
         },
         metadata: Metadata::new(1),
     };
@@ -381,7 +382,7 @@ async fn test_eip7702_delegation_then_execution() -> Result<()> {
             transactions: vec![execution_tx],
             withdrawals: Vec::new(),
             logs_bloom: Default::default(),
-            withdrawals_root: Default::default(),
+            withdrawals_root: EMPTY_WITHDRAWALS,
         },
         metadata: Metadata::new(1),
     };

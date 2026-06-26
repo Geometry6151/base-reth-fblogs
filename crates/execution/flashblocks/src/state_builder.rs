@@ -2,24 +2,30 @@ use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::{
     Block, Header, TxReceipt,
+    constants::EMPTY_WITHDRAWALS,
+    proofs::ordered_trie_root_with_encoder,
     transaction::{Recovered, TransactionMeta},
 };
-use alloy_eips::Encodable2718;
+use alloy_eips::{Encodable2718, eip7685::EMPTY_REQUESTS_HASH};
 use alloy_evm::{
     Database as AlloyDatabase,
     block::{StateDB, SystemCaller},
 };
-use alloy_primitives::B256;
+use alloy_primitives::{B256, keccak256, logs_bloom};
 use alloy_rpc_types::TransactionTrait;
 use alloy_rpc_types_eth::state::StateOverride;
 use base_common_chains::Upgrades;
-use base_common_consensus::{BasePrimitives, BaseReceipt, BaseTxEnvelope, Predeploys};
+use base_common_consensus::{
+    BasePrimitives, BaseReceipt, BaseReceiptEnvelope, BaseTxEnvelope, Predeploys,
+};
 use base_common_evm::{BaseHaltReason, L1BlockInfo, ensure_create2_deployer};
 use base_common_flz::tx_estimated_size_fjord as estimate_tx_compressed_size;
 use base_common_rpc_types::{BaseTransactionReceipt, Transaction};
 use base_execution_rpc::BaseReceiptBuilder as BaseRpcReceiptBuilder;
 use reth_evm::{Evm, FromRecoveredTx};
+use reth_revm::{State, database::StateProviderDatabase};
 use reth_rpc_convert::transaction::ConvertReceiptInput;
+use reth_storage_api::StateProviderBox;
 use revm::{
     Database, DatabaseCommit,
     context::{
@@ -28,8 +34,12 @@ use revm::{
     },
     state::EvmState,
 };
+use revm_database::states::bundle_state::BundleRetention;
 
-use crate::{ExecutionError, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder};
+use crate::{
+    ExecutionError, Metrics, PendingBlocks, StateProcessorError, UnifiedReceiptBuilder,
+    hot_window::HotExecutedHeaderParts,
+};
 
 /// Represents the result of executing or fetching a cached pending transaction.
 #[derive(Debug, Clone)]
@@ -86,11 +96,34 @@ where
         l1_block_info: L1BlockInfo,
         state_overrides: StateOverride,
     ) -> Self {
+        Self::new_with_cursors(
+            chain_spec,
+            evm,
+            pending_block,
+            prev_pending_blocks,
+            l1_block_info,
+            state_overrides,
+            (0, 0),
+        )
+    }
+
+    /// Creates a new pending state builder with explicit gas and log cursors.
+    pub fn new_with_cursors(
+        chain_spec: ChainSpec,
+        evm: E,
+        pending_block: Block<BaseTxEnvelope, Header>,
+        prev_pending_blocks: Option<Arc<PendingBlocks>>,
+        l1_block_info: L1BlockInfo,
+        state_overrides: StateOverride,
+        cursors: (u64, usize),
+    ) -> Self {
+        let (cumulative_gas_used, next_log_index) = cursors;
+
         Self {
             pending_block,
             evm,
-            cumulative_gas_used: 0,
-            next_log_index: 0,
+            cumulative_gas_used,
+            next_log_index,
             prev_pending_blocks,
             l1_block_info,
             state_overrides,
@@ -125,17 +158,8 @@ where
         self.next_log_index
     }
 
-    /// Executes a single transaction and updates internal state.
-    /// Should be called in order for each transaction.
-    #[instrument(level = "debug", skip_all, fields(tx_hash = %transaction.tx_hash(), idx = idx))]
-    pub fn execute_transaction(
-        &mut self,
-        idx: usize,
-        transaction: Recovered<BaseTxEnvelope>,
-    ) -> Result<ExecutedPendingTransaction, StateProcessorError> {
-        let tx_hash = transaction.tx_hash();
-
-        let effective_gas_price = if transaction.is_deposit() {
+    fn effective_gas_price(&self, transaction: &Recovered<BaseTxEnvelope>) -> u128 {
+        if transaction.is_deposit() {
             0
         } else {
             self.pending_block
@@ -145,7 +169,19 @@ where
                         + base_fee as u128
                 })
                 .unwrap_or_else(|| transaction.max_fee_per_gas())
-        };
+        }
+    }
+
+    /// Executes a single transaction and updates internal state.
+    /// Should be called in order for each transaction.
+    #[instrument(level = "debug", skip_all, fields(tx_hash = %transaction.tx_hash(), idx = idx))]
+    pub fn execute_transaction(
+        &mut self,
+        idx: usize,
+        transaction: Recovered<BaseTxEnvelope>,
+    ) -> Result<ExecutedPendingTransaction, StateProcessorError> {
+        let tx_hash = transaction.tx_hash();
+        let effective_gas_price = self.effective_gas_price(&transaction);
 
         // Check if we have all the data we need to reuse the previous execution.
         let cached_execution = self.prev_pending_blocks.as_ref().and_then(|p| {
@@ -164,6 +200,17 @@ where
         } else {
             self.execute_with_evm(transaction, idx, effective_gas_price)
         }
+    }
+
+    /// Executes a single new transaction without consulting cached pending execution data.
+    #[instrument(level = "debug", skip_all, fields(tx_hash = %transaction.tx_hash(), idx = idx))]
+    pub fn execute_new_transaction(
+        &mut self,
+        idx: usize,
+        transaction: Recovered<BaseTxEnvelope>,
+    ) -> Result<ExecutedPendingTransaction, StateProcessorError> {
+        let effective_gas_price = self.effective_gas_price(&transaction);
+        self.execute_with_evm(transaction, idx, effective_gas_price)
     }
 
     /// Applies EIP-4788, EIP-2935, and Canyon create2 deployer pre-execution changes to the EVM.
@@ -406,6 +453,140 @@ where
             .into()),
         }
     }
+}
+
+/// Derives pending-block header material from a carried post-state database.
+#[derive(Debug, Default)]
+pub struct PendingHeaderBuilder;
+
+impl PendingHeaderBuilder {
+    /// Derives locally executed header material from the current post-state and ordered receipts.
+    pub fn from_post_state<ChainSpec: Upgrades>(
+        chain_spec: &ChainSpec,
+        timestamp: u64,
+        cumulative_gas_used: u64,
+        db: &mut State<StateProviderDatabase<StateProviderBox>>,
+        receipts: &[BaseTransactionReceipt],
+    ) -> Result<HotExecutedHeaderParts, StateProcessorError> {
+        let _header_parts_timer =
+            base_metrics::timed!(Metrics::hot_header_parts_from_post_state_duration());
+
+        let (state_root, withdrawals_storage) = {
+            let _state_root_timer = base_metrics::timed!(Metrics::hot_state_root_duration());
+            db.merge_transitions(BundleRetention::Reverts);
+
+            let state_provider = db.database.as_ref();
+            let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
+            let withdrawals_storage = hashed_state
+                .storages
+                .get(&keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER))
+                .cloned()
+                .unwrap_or_default();
+            let state_root = state_provider
+                .state_root(hashed_state)
+                .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?;
+
+            (state_root, withdrawals_storage)
+        };
+
+        let state_provider = db.database.as_ref();
+        let is_isthmus_active = chain_spec.is_isthmus_active_at_timestamp(timestamp);
+        let withdrawals_root = if is_isthmus_active {
+            let _storage_root_timer = base_metrics::timed!(Metrics::hot_storage_root_duration());
+            state_provider
+                .storage_root(Predeploys::L2_TO_L1_MESSAGE_PASSER, withdrawals_storage)
+                .map_err(|error| ExecutionError::EvmEnv(error.to_string()))?
+        } else if chain_spec.is_canyon_active_at_timestamp(timestamp) {
+            EMPTY_WITHDRAWALS
+        } else {
+            B256::ZERO
+        };
+
+        let receipt_envelopes =
+            receipts.iter().cloned().map(BaseReceiptEnvelope::from).collect::<Vec<_>>();
+        let receipts_root = {
+            let _receipts_root_timer = base_metrics::timed!(Metrics::hot_receipts_root_duration());
+            calculate_receipts_root(&receipt_envelopes, chain_spec, timestamp)
+        };
+        let logs_bloom = {
+            let _logs_bloom_timer = base_metrics::timed!(Metrics::hot_logs_bloom_build_duration());
+            logs_bloom(receipt_envelopes.iter().flat_map(|receipt| receipt.logs()))
+        };
+        let blob_gas_used = if chain_spec.is_jovian_active_at_timestamp(timestamp) {
+            Some(receipts.iter().filter_map(|receipt| receipt.inner.blob_gas_used).sum())
+        } else if chain_spec.is_ecotone_active_at_timestamp(timestamp) {
+            Some(0)
+        } else {
+            None
+        };
+
+        Ok(HotExecutedHeaderParts {
+            gas_used: cumulative_gas_used,
+            logs_bloom,
+            receipts_root,
+            state_root,
+            withdrawals_root,
+            blob_gas_used,
+            requests_hash: is_isthmus_active.then_some(EMPTY_REQUESTS_HASH),
+        })
+    }
+}
+
+impl<E, ChainSpec> PendingStateBuilder<E, ChainSpec>
+where
+    E: Evm<DB = State<StateProviderDatabase<StateProviderBox>>, HaltReason = BaseHaltReason>,
+    E::Tx: FromRecoveredTx<BaseTxEnvelope>,
+    ChainSpec: Upgrades + Clone,
+{
+    /// Consumes the builder and returns the database, state overrides, and locally derived header
+    /// material for the full pending block.
+    pub fn into_db_state_overrides_and_header_parts(
+        self,
+        receipts: &[BaseTransactionReceipt],
+    ) -> Result<
+        (State<StateProviderDatabase<StateProviderBox>>, StateOverride, HotExecutedHeaderParts),
+        StateProcessorError,
+    > {
+        let Self { cumulative_gas_used, evm, pending_block, chain_spec, state_overrides, .. } =
+            self;
+
+        let mut db = evm.into_db();
+        let header_parts = PendingHeaderBuilder::from_post_state(
+            &chain_spec,
+            pending_block.timestamp,
+            cumulative_gas_used,
+            &mut db,
+            receipts,
+        )?;
+
+        Ok((db, state_overrides, header_parts))
+    }
+}
+
+fn calculate_receipts_root<ChainSpec: Upgrades>(
+    receipts: &[BaseReceiptEnvelope],
+    chain_spec: &ChainSpec,
+    timestamp: u64,
+) -> B256 {
+    if chain_spec.is_regolith_active_at_timestamp(timestamp)
+        && !chain_spec.is_canyon_active_at_timestamp(timestamp)
+    {
+        let receipts = receipts
+            .iter()
+            .cloned()
+            .map(|receipt| match receipt {
+                BaseReceiptEnvelope::Deposit(mut deposit_receipt) => {
+                    deposit_receipt.receipt.deposit_nonce = None;
+                    BaseReceiptEnvelope::Deposit(deposit_receipt)
+                }
+                _ => receipt,
+            })
+            .collect::<Vec<_>>();
+
+        return ordered_trie_root_with_encoder(&receipts, |receipt, buf| receipt.encode_2718(buf));
+    }
+
+    ordered_trie_root_with_encoder(receipts, |receipt, buf| receipt.encode_2718(buf))
 }
 
 #[cfg(test)]
@@ -663,6 +844,135 @@ mod tests {
             .expect("cached transaction execution failed");
 
         assert_eq!(cached_result.execution_time_us, Some(1_234));
+    }
+
+    #[test]
+    fn new_with_cursors_preserves_provided_cursors() {
+        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
+        let header = Header {
+            number: 1,
+            timestamp: 100,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
+        };
+        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
+        let evm_env = evm_config.evm_env(&header).expect("failed to create evm env");
+        let evm = evm_config.evm_with_env(InMemoryDB::default(), evm_env);
+        let pending_block = Block { header, body: Default::default() };
+
+        let builder = PendingStateBuilder::new_with_cursors(
+            (*chain_spec).clone(),
+            evm,
+            pending_block,
+            None,
+            L1BlockInfo::default(),
+            StateOverride::default(),
+            (42, 7),
+        );
+
+        assert_eq!(builder.cumulative_gas_used, 42);
+        assert_eq!(builder.next_log_index, 7);
+    }
+
+    #[test]
+    fn execute_new_transaction_bypasses_prev_pending_cache() {
+        let chain_spec = Arc::new(BaseChainSpecBuilder::base_mainnet().build());
+        let evm_config = BaseEvmConfig::base(Arc::clone(&chain_spec));
+
+        let header = Header {
+            number: 1,
+            timestamp: 100,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
+        };
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            Address::ZERO,
+            AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                ..Default::default()
+            },
+        );
+
+        let evm_env = evm_config.evm_env(&header).expect("failed to create evm env");
+        let evm = evm_config.evm_with_env(db.clone(), evm_env);
+        let pending_block = Block { header: header.clone(), body: Default::default() };
+        let mut first_builder = PendingStateBuilder::new(
+            (*chain_spec).clone(),
+            evm,
+            pending_block,
+            None,
+            L1BlockInfo::default(),
+            StateOverride::default(),
+        );
+
+        let tx = create_legacy_tx();
+        let tx_hash = tx.tx_hash();
+        let first_result =
+            first_builder.execute_transaction(0, tx).expect("transaction execution failed");
+
+        let mut cached_receipt = first_result.receipt.clone();
+        cached_receipt.inner.gas_used += 1;
+
+        let mut pending_blocks_builder = crate::PendingBlocksBuilder::new();
+        pending_blocks_builder
+            .with_header(alloy_consensus::Sealed::new_unchecked(header.clone(), B256::ZERO));
+        pending_blocks_builder.with_flashblocks([Flashblock {
+            payload_id: PayloadId::default(),
+            index: 0,
+            base: Some(ExecutionPayloadBaseV1 {
+                parent_beacon_block_root: B256::ZERO,
+                parent_hash: B256::ZERO,
+                fee_recipient: Address::ZERO,
+                prev_randao: B256::ZERO,
+                block_number: header.number,
+                gas_limit: header.gas_limit,
+                timestamp: header.timestamp,
+                extra_data: Default::default(),
+                base_fee_per_gas: U256::from(header.base_fee_per_gas.unwrap_or_default()),
+            }),
+            diff: ExecutionPayloadFlashblockDeltaV1 {
+                state_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Default::default(),
+                gas_used: cached_receipt.inner.gas_used,
+                block_hash: B256::ZERO,
+                transactions: vec![],
+                withdrawals: vec![],
+                withdrawals_root: B256::ZERO,
+                blob_gas_used: None,
+            },
+            metadata: Metadata::new(header.number),
+        }]);
+        pending_blocks_builder.with_receipt(tx_hash, cached_receipt.clone());
+        pending_blocks_builder.with_transaction_state(tx_hash, first_result.state.clone());
+        pending_blocks_builder.with_transaction_result(tx_hash, first_result.result);
+        pending_blocks_builder.with_execution_time(tx_hash, 1_234);
+
+        let prev_pending_blocks =
+            Arc::new(pending_blocks_builder.build().expect("should build cached pending blocks"));
+
+        let second_evm_env = evm_config.evm_env(&header).expect("failed to create evm env");
+        let second_evm = evm_config.evm_with_env(db, second_evm_env);
+        let second_pending_block = Block { header, body: Default::default() };
+        let mut second_builder = PendingStateBuilder::new(
+            (*chain_spec).clone(),
+            second_evm,
+            second_pending_block,
+            Some(prev_pending_blocks),
+            L1BlockInfo::default(),
+            StateOverride::default(),
+        );
+
+        let fresh_result = second_builder
+            .execute_new_transaction(0, create_legacy_tx())
+            .expect("fresh transaction execution failed");
+
+        assert_eq!(fresh_result.receipt.inner.gas_used, first_result.receipt.inner.gas_used);
+        assert_ne!(fresh_result.receipt.inner.gas_used, cached_receipt.inner.gas_used);
     }
 
     #[test]

@@ -147,6 +147,10 @@ pub enum StateProcessorError {
     #[error(transparent)]
     Build(#[from] BuildError),
 
+    /// Hot engine state or sequencing error.
+    #[error("hot engine error: {0}")]
+    HotEngine(String),
+
     /// Missing first flashblock, so this one can't be processed.
     #[error("missing first flashblock: cannot build pending blocks without first flashblock")]
     MissingFirstFlashblock,
@@ -260,6 +264,7 @@ mod tests {
     #[case::provider(StateProcessorError::from(ProviderError::MissingCanonicalHeader { block_number: 100 }))]
     #[case::execution(StateProcessorError::from(ExecutionError::GasOverflow))]
     #[case::build(StateProcessorError::from(BuildError::MissingHeaders))]
+    #[case::hot_engine(StateProcessorError::HotEngine("not wired".to_string()))]
     fn test_state_processor_error_from_variants(#[case] error: StateProcessorError) {
         let debug_str = format!("{error:?}");
         assert!(!debug_str.is_empty());

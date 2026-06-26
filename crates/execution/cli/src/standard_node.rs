@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base_bundle_extension::BundleExtension;
-use base_flashblocks::FlashblocksConfig;
+use base_flashblocks::{FlashblocksConfig, FlashblocksMode};
 use base_flashblocks_node::FlashblocksExtension;
 use base_metering::{MeteredOpcodes, MeteringConfig, MeteringExtension, MeteringResourceLimits};
 use base_node_core::args::RollupArgs;
@@ -126,6 +126,15 @@ pub struct RpcStandardNodeArgs {
     #[arg(long, alias = "websocket-url")]
     pub flashblocks_url: Option<Url>,
 
+    /// Flashblocks processing mode.
+    #[arg(
+        long = "flashblocks.mode",
+        value_name = "FLASHBLOCKS_MODE",
+        default_value = "legacy",
+        requires = "flashblocks_url"
+    )]
+    pub flashblocks_mode: FlashblocksMode,
+
     /// The max pending blocks depth.
     #[arg(
         long = "max-pending-blocks-depth",
@@ -183,8 +192,12 @@ impl From<RpcStandardNodeArgs> for StandardNodeArgs {
 impl From<&StandardNodeArgs> for Option<FlashblocksConfig> {
     fn from(args: &StandardNodeArgs) -> Self {
         args.rpc.flashblocks_url.clone().map(|url| {
-            let mut config = FlashblocksConfig::new(url, args.rpc.max_pending_blocks_depth)
-                .with_subscriber_ping_interval(args.rpc.flashblocks_ping_interval);
+            let mut config = FlashblocksConfig::new_with_mode(
+                url,
+                args.rpc.max_pending_blocks_depth,
+                args.rpc.flashblocks_mode,
+            )
+            .with_subscriber_ping_interval(args.rpc.flashblocks_ping_interval);
             config.cached_execution = args.rpc.flashblocks_cached_execution;
             config
         })
@@ -349,5 +362,39 @@ mod tests {
             .expect("flashblocks config should exist");
 
         assert_eq!(config.subscriber_ping_interval, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn standard_node_args_default_flashblocks_mode_is_legacy() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from(["reth"]).args;
+
+        assert_eq!(args.rpc.flashblocks_mode, FlashblocksMode::Legacy);
+        assert!(args.rpc.flashblocks_url.is_none());
+    }
+
+    #[test]
+    fn standard_node_args_parses_explicit_hot_only_mode() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--flashblocks-url",
+            "ws://localhost:1234",
+            "--flashblocks.mode",
+            "hot-only",
+        ])
+        .args;
+
+        assert_eq!(args.rpc.flashblocks_mode, FlashblocksMode::HotOnly);
+        assert_eq!(args.rpc.flashblocks_url, Some(Url::parse("ws://localhost:1234").unwrap()));
+    }
+
+    #[test]
+    fn standard_node_args_require_flashblocks_url_for_mode_override() {
+        let result = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "reth",
+            "--flashblocks.mode",
+            "hot-only",
+        ]);
+
+        assert!(result.is_err());
     }
 }

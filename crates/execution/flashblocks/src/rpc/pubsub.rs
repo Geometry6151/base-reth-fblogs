@@ -16,6 +16,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     server::SubscriptionMessage,
 };
+use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use reth_rpc::eth::EthPubSub as RethEthPubSub;
 use reth_rpc_eth_api::{
     EthApiTypes, RpcBlock, RpcNodeCore, RpcTransaction,
@@ -23,13 +24,24 @@ use reth_rpc_eth_api::{
 };
 use reth_tasks::Runtime;
 use serde::Serialize;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::error;
 
 use crate::{
-    FlashblocksAPI, TransactionWithLogs,
-    rpc::types::{BaseSubscriptionKind, ExtendedSubscriptionKind},
+    FastFlashblockFeedEvent, FlashblocksAPI, TransactionWithLogs,
+    metrics::Metrics,
+    rpc::types::{
+        BaseSubscriptionKind, ExtendedSubscriptionKind, FlashblockLogsBatch,
+        unsupported_in_hot_only,
+    },
 };
+
+#[derive(Clone, Copy, Debug)]
+enum PubSubMetric {
+    FastLogs,
+    LogsBatch,
+}
 
 /// Eth pub-sub RPC extension for flashblocks and standard subscriptions.
 ///
@@ -92,7 +104,9 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
                     return None;
                 }
             };
-            Some(pending_blocks.get_latest_block(true))
+            Some(base_metrics::time!(Metrics::new_flashblocks_build_duration(), {
+                pending_blocks.get_latest_block(true)
+            }))
         })
     }
 
@@ -226,6 +240,23 @@ impl<Eth, FB> EthPubSub<Eth, FB> {
     }
 }
 
+fn flashblock_logs_filter_from_params(
+    params: Option<Params>,
+    subscription_name: &str,
+) -> Result<Option<Filter>, ErrorObjectOwned> {
+    match params {
+        None | Some(Params::None) => Ok(None),
+        Some(Params::Logs(filter)) => Ok(Some(*filter)),
+        Some(_) => Err(ErrorObjectOwned::owned(
+            INVALID_PARAMS_CODE,
+            format!(
+                "invalid params for {subscription_name}: expected omitted/null params or a logs filter object"
+            ),
+            None::<()>,
+        )),
+    }
+}
+
 #[async_trait]
 impl<Eth, FB> EthPubSubApiServer for EthPubSub<Eth, FB>
 where
@@ -254,17 +285,80 @@ where
             unreachable!("Standard subscription types should be delegated to inner");
         };
 
-        let sink = pending.accept().await?;
-
         match base_kind {
+            BaseSubscriptionKind::NewFastFlashblockLogs => {
+                let filter =
+                    match flashblock_logs_filter_from_params(params, "newFastFlashblockLogs") {
+                        Ok(filter) => filter,
+                        Err(err) => {
+                            pending.reject(err).await;
+                            return Ok(());
+                        }
+                    };
+                // Subscribe before spawning so fast update creation sees this subscriber
+                // immediately via `receiver_count()`.
+                let receiver = self.flashblocks_state.subscribe_to_fast_flashblock_logs();
+                let sink = pending.accept().await?;
+
+                tokio::spawn(async move {
+                    pipe_fast_flashblock_logs_subscription(sink, receiver, filter).await;
+                });
+            }
+            BaseSubscriptionKind::NewFlashblockLogsBatch => {
+                let filter =
+                    match flashblock_logs_filter_from_params(params, "newFlashblockLogsBatch") {
+                        Ok(filter) => filter,
+                        Err(err) => {
+                            pending.reject(err).await;
+                            return Ok(());
+                        }
+                    };
+                if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
+                    // Subscribe before spawning so fast update creation sees this subscriber
+                    // immediately via `receiver_count()`.
+                    let receiver = self.flashblocks_state.subscribe_to_fast_flashblock_logs();
+                    let sink = pending.accept().await?;
+
+                    tokio::spawn(async move {
+                        pipe_flashblock_logs_batch_from_fast_delta_subscription(
+                            sink, receiver, filter,
+                        )
+                        .await;
+                    });
+                } else {
+                    let sink = pending.accept().await?;
+                    let flashblocks_state = Arc::clone(&self.flashblocks_state);
+
+                    tokio::spawn(async move {
+                        pipe_flashblock_logs_batch_subscription(sink, flashblocks_state, filter)
+                            .await;
+                    });
+                }
+            }
             BaseSubscriptionKind::NewFlashblocks => {
+                if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
+                    pending
+                        .reject(unsupported_in_hot_only("eth_subscribe(\"newFlashblocks\")", None))
+                        .await;
+                    return Ok(());
+                }
+
+                let sink = pending.accept().await?;
                 let stream = Self::new_flashblocks_stream(Arc::clone(&self.flashblocks_state));
 
                 tokio::spawn(async move {
-                    pipe_from_stream(sink, stream).await;
+                    pipe_flashblocks_stream(sink, stream).await;
                 });
             }
             BaseSubscriptionKind::PendingLogs => {
+                if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) {
+                    pending
+                        .reject(unsupported_in_hot_only("eth_subscribe(\"pendingLogs\")", None))
+                        .await;
+                    return Ok(());
+                }
+
+                let sink = pending.accept().await?;
                 // Extract filter from params, default to empty filter (match all)
                 let filter = match params {
                     Some(Params::Logs(filter)) => *filter,
@@ -278,7 +372,17 @@ where
                 });
             }
             BaseSubscriptionKind::NewFlashblockTransactions => match params {
+                _ if matches!(self.flashblocks_state.mode(), crate::FlashblocksMode::HotOnly) => {
+                    pending
+                        .reject(unsupported_in_hot_only(
+                            "eth_subscribe(\"newFlashblockTransactions\")",
+                            None,
+                        ))
+                        .await;
+                    return Ok(());
+                }
                 Some(Params::Logs(filter)) => {
+                    let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_filtered_stream(
                         Arc::clone(&self.flashblocks_state),
                         *filter,
@@ -288,6 +392,7 @@ where
                     });
                 }
                 Some(Params::Bool(true)) => {
+                    let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_full_stream(Arc::clone(
                         &self.flashblocks_state,
                     ));
@@ -296,6 +401,7 @@ where
                     });
                 }
                 _ => {
+                    let sink = pending.accept().await?;
                     let stream = Self::new_flashblock_transactions_hash_stream(Arc::clone(
                         &self.flashblocks_state,
                     ));
@@ -308,6 +414,217 @@ where
 
         Ok(())
     }
+}
+
+async fn pipe_flashblock_logs_batch_from_fast_delta_subscription(
+    sink: SubscriptionSink,
+    mut receiver: broadcast::Receiver<FastFlashblockFeedEvent>,
+    filter: Option<Filter>,
+) {
+    loop {
+        tokio::select! {
+            _ = sink.closed() => return,
+            result = receiver.recv() => {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(skipped)) => {
+                        error!(
+                            target: "flashblocks_rpc::pubsub",
+                            skipped,
+                            "closing newFlashblockLogsBatch subscription after broadcast lag"
+                        );
+                        return;
+                    }
+                };
+                let delta = match event {
+                    FastFlashblockFeedEvent::Delta(delta) => delta,
+                    FastFlashblockFeedEvent::Resync => continue,
+                    FastFlashblockFeedEvent::InvalidateSession => return,
+                };
+
+                let batch = base_metrics::time!(Metrics::logs_batch_build_duration(), {
+                    filter.as_ref().map_or_else(
+                        || FlashblockLogsBatch::from_fast_delta(delta.as_ref()),
+                        |filter| FlashblockLogsBatch::from_fast_delta(&delta.filtered(filter)),
+                    )
+                });
+
+                if !send_subscription_item(&sink, &batch, Some(PubSubMetric::LogsBatch)).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn pipe_flashblock_logs_batch_subscription<FB>(
+    sink: SubscriptionSink,
+    flashblocks_state: Arc<FB>,
+    filter: Option<Filter>,
+) where
+    FB: FlashblocksAPI + Send + Sync + 'static,
+{
+    let mut receiver = flashblocks_state.subscribe_to_flashblocks();
+
+    loop {
+        tokio::select! {
+            _ = sink.closed() => return,
+            result = receiver.recv() => {
+                let pending_blocks = match result {
+                    Ok(pending_blocks) => pending_blocks,
+                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(skipped)) => {
+                        error!(
+                            target: "flashblocks_rpc::pubsub",
+                            skipped,
+                            "closing newFlashblockLogsBatch subscription after broadcast lag"
+                        );
+                        return;
+                    }
+                };
+
+                let batch = pending_blocks.get_latest_flashblock_logs_batch(filter.as_ref());
+                if !send_subscription_item(
+                    &sink,
+                    &batch,
+                    Some(PubSubMetric::LogsBatch),
+                )
+                .await
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn pipe_fast_flashblock_logs_subscription(
+    sink: SubscriptionSink,
+    mut receiver: broadcast::Receiver<FastFlashblockFeedEvent>,
+    filter: Option<Filter>,
+) {
+    loop {
+        tokio::select! {
+            _ = sink.closed() => return,
+            result = receiver.recv() => {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(skipped)) => {
+                        error!(
+                            target: "flashblocks_rpc::pubsub",
+                            skipped,
+                            "closing newFastFlashblockLogs subscription after broadcast lag"
+                        );
+                        return;
+                    }
+                };
+                let delta = match event {
+                    FastFlashblockFeedEvent::Delta(delta) => delta,
+                    FastFlashblockFeedEvent::Resync => continue,
+                    FastFlashblockFeedEvent::InvalidateSession => return,
+                };
+
+                if let Some(filter) = filter.as_ref() {
+                    let filtered_delta = delta.filtered(filter);
+                    if !send_subscription_item(&sink, &filtered_delta, Some(PubSubMetric::FastLogs)).await {
+                        return;
+                    }
+                } else if !send_subscription_item(&sink, delta.as_ref(), Some(PubSubMetric::FastLogs)).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn pipe_flashblocks_stream<St>(sink: SubscriptionSink, mut stream: St)
+where
+    St: Stream<Item = RpcBlock<Base>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            _ = sink.closed() => return,
+
+            maybe_item = stream.next() => {
+                let Some(item) = maybe_item else {
+                    return;
+                };
+
+                if !send_subscription_item(&sink, &item, None).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn send_subscription_item<T>(
+    sink: &SubscriptionSink,
+    item: &T,
+    metric: Option<PubSubMetric>,
+) -> bool
+where
+    T: Serialize,
+{
+    let msg = match metric {
+        Some(PubSubMetric::FastLogs) => {
+            match base_metrics::time!(Metrics::fast_pubsub_serialize_duration(), {
+                SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), item)
+            }) {
+                Ok(msg) => msg,
+                Err(err) => {
+                    error!(
+                        target: "flashblocks_rpc::pubsub",
+                        %err,
+                        "Failed to serialize subscription message"
+                    );
+                    return false;
+                }
+            }
+        }
+        Some(PubSubMetric::LogsBatch) => {
+            match base_metrics::time!(Metrics::logs_batch_pubsub_serialize_duration(), {
+                SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), item)
+            }) {
+                Ok(msg) => msg,
+                Err(err) => {
+                    error!(
+                        target: "flashblocks_rpc::pubsub",
+                        %err,
+                        "failed to serialize newFlashblockLogsBatch subscription message"
+                    );
+                    return false;
+                }
+            }
+        }
+        None => match SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), item) {
+            Ok(msg) => msg,
+            Err(err) => {
+                error!(
+                    target: "flashblocks_rpc::pubsub",
+                    %err,
+                    "Failed to serialize subscription message"
+                );
+                return false;
+            }
+        },
+    };
+
+    let send_result = match metric {
+        Some(PubSubMetric::FastLogs) => {
+            base_metrics::time!(Metrics::fast_pubsub_send_duration(), { sink.send(msg).await })
+        }
+        Some(PubSubMetric::LogsBatch) => {
+            base_metrics::time!(Metrics::logs_batch_pubsub_send_duration(), {
+                sink.send(msg).await
+            })
+        }
+        None => sink.send(msg).await,
+    };
+
+    send_result.is_ok()
 }
 
 /// Pipes all stream items to the subscription sink.
@@ -330,27 +647,236 @@ where
                     return;
                 };
 
-                let msg = match SubscriptionMessage::new(
-                    sink.method_name(),
-                    sink.subscription_id(),
-                    &item
-                ) {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        error!(
-                            target: "flashblocks_rpc::pubsub",
-                            %err,
-                            "Failed to serialize subscription message"
-                        );
-                        return;
-                    }
-                };
-
                 // if it fails, client disconnected
-                if sink.send(msg).await.is_err() {
+                if !send_subscription_item(&sink, &item, None).await {
                     return;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use alloy_primitives::{Address, B256};
+    use alloy_rpc_types_engine::PayloadId;
+    use jsonrpsee::{
+        RpcModule,
+        core::{EmptyServerParams, SubscriptionResult},
+    };
+    use serde_json::Value;
+    use tokio::{sync::broadcast, time::timeout};
+
+    use super::*;
+    use crate::{FastFlashblockLogsDelta, FlashblockSnapshotId};
+
+    #[tokio::test]
+    async fn fast_flashblock_update_resync_keeps_fast_subscription_open() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "fast_flashblock_update_resync",
+                "fast_flashblock_update_resync",
+                "fast_flashblock_update_resync_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_fast_flashblock_logs_subscription(sink, receiver, None).await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded("fast_flashblock_update_resync", EmptyServerParams::new())
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::Resync).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        let (value, _) = next.expect("subscription should stay open after resync").unwrap();
+        assert_eq!(value["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn fast_flashblock_update_invalidate_session_closes_fast_subscription() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "fast_flashblock_update_invalidate_session",
+                "fast_flashblock_update_invalidate_session",
+                "fast_flashblock_update_invalidate_session_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_fast_flashblock_logs_subscription(sink, receiver, None).await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded(
+                "fast_flashblock_update_invalidate_session",
+                EmptyServerParams::new(),
+            )
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::InvalidateSession).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        assert!(next.is_none(), "subscription should close after session invalidation");
+    }
+
+    #[tokio::test]
+    async fn fast_flashblock_update_resync_keeps_logs_batch_subscription_open() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "logs_batch_update_resync",
+                "logs_batch_update_resync",
+                "logs_batch_update_resync_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_flashblock_logs_batch_from_fast_delta_subscription(
+                                sink, receiver, None,
+                            )
+                            .await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded("logs_batch_update_resync", EmptyServerParams::new())
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::Resync).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        let (value, _) = next.expect("subscription should stay open after resync").unwrap();
+        assert_eq!(value["blockNumber"], "0x1");
+    }
+
+    #[tokio::test]
+    async fn invalidate_session_closes_logs_batch_subscription() {
+        let (sender, _) = broadcast::channel(4);
+        let mut module = RpcModule::new(());
+        module
+            .register_subscription::<SubscriptionResult, _, _>(
+                "logs_batch_update_invalidate_session",
+                "logs_batch_update_invalidate_session",
+                "logs_batch_update_invalidate_session_unsubscribe",
+                {
+                    let sender = sender.clone();
+                    move |_, pending, _, _| {
+                        let sender = sender.clone();
+                        async move {
+                            let receiver = sender.subscribe();
+                            let sink = pending.accept().await?;
+                            pipe_flashblock_logs_batch_from_fast_delta_subscription(
+                                sink, receiver, None,
+                            )
+                            .await;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        let mut subscription = module
+            .subscribe_unbounded("logs_batch_update_invalidate_session", EmptyServerParams::new())
+            .await
+            .unwrap();
+
+        sender.send(FastFlashblockFeedEvent::InvalidateSession).unwrap();
+        sender.send(FastFlashblockFeedEvent::Delta(Arc::new(test_fast_delta()))).unwrap();
+
+        let next = timeout(Duration::from_secs(1), subscription.next::<Value>()).await.unwrap();
+        assert!(next.is_none(), "subscription should close after session invalidation");
+    }
+
+    fn test_fast_delta() -> FastFlashblockLogsDelta {
+        FastFlashblockLogsDelta::new(
+            FlashblockSnapshotId::new(7, 1, 0, PayloadId::new([2; 8]), B256::with_last_byte(3)),
+            Some(4),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn logs_batch_filter_accepts_missing_params() {
+        assert!(
+            flashblock_logs_filter_from_params(None, "newFlashblockLogsBatch").unwrap().is_none()
+        );
+    }
+
+    #[test]
+    fn logs_batch_filter_accepts_null_params() {
+        assert!(
+            flashblock_logs_filter_from_params(Some(Params::None), "newFlashblockLogsBatch")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn logs_batch_filter_accepts_logs_filter() {
+        let filter = Filter::new().address(Address::with_last_byte(1));
+        let parsed = flashblock_logs_filter_from_params(
+            Some(Params::Logs(Box::new(filter.clone()))),
+            "newFlashblockLogsBatch",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed, filter);
+    }
+
+    #[test]
+    fn logs_batch_filter_rejects_bool_params() {
+        let err =
+            flashblock_logs_filter_from_params(Some(Params::Bool(true)), "newFlashblockLogsBatch")
+                .unwrap_err();
+        assert!(err.to_string().contains("newFlashblockLogsBatch"));
+    }
+
+    #[test]
+    fn fast_logs_filter_rejects_bool_params() {
+        let err =
+            flashblock_logs_filter_from_params(Some(Params::Bool(true)), "newFastFlashblockLogs")
+                .unwrap_err();
+        assert!(err.to_string().contains("newFastFlashblockLogs"));
     }
 }

@@ -25,7 +25,7 @@ use base_common_flashblocks::{
 use base_execution_chainspec::BaseChainSpec;
 use base_flashblocks::{
     EthApiExt, EthApiOverrideServer, EthPubSub, EthPubSubApiServer, FlashblocksAPI,
-    FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
+    FlashblocksMode, FlashblocksReceiver, FlashblocksState, PendingBlocksAPI,
 };
 use base_node_runner::{
     BaseNodeExtension, NodeHooks,
@@ -111,11 +111,16 @@ impl FlashblocksTestExtension {
     /// If `process_canonical` is true, canonical blocks are automatically processed.
     /// Set to false for tests that need manual control over canonical block timing.
     pub fn new(process_canonical: bool) -> Self {
+        Self::new_with_mode(process_canonical, FlashblocksMode::Legacy)
+    }
+
+    /// Create a new flashblocks test extension with an explicit runtime mode.
+    pub fn new_with_mode(process_canonical: bool, mode: FlashblocksMode) -> Self {
         let (sender, receiver) = mpsc::channel::<(Flashblock, oneshot::Sender<()>)>(100);
         let inner = FlashblocksTestExtensionInner {
             sender,
             receiver: Arc::new(Mutex::new(Some(receiver))),
-            state: Arc::new(FlashblocksState::new(5)),
+            state: Arc::new(FlashblocksState::new_with_mode(5, mode)),
             process_canonical,
         };
         Self { inner: Arc::new(inner) }
@@ -280,12 +285,22 @@ pub struct FlashblocksHarness {
 impl FlashblocksHarness {
     /// Launch a flashblocks-enabled harness with automatic canonical processing.
     pub async fn new() -> Result<Self> {
-        Self::with_options(true).await
+        Self::new_with_mode(FlashblocksMode::Legacy).await
+    }
+
+    /// Launch a flashblocks-enabled harness with an explicit runtime mode.
+    pub async fn new_with_mode(mode: FlashblocksMode) -> Result<Self> {
+        Self::with_options(true, mode).await
     }
 
     /// Launch the harness configured for manual canonical progression.
     pub async fn manual_canonical() -> Result<Self> {
-        Self::with_options(false).await
+        Self::manual_canonical_with_mode(FlashblocksMode::Legacy).await
+    }
+
+    /// Launch the harness configured for manual canonical progression in an explicit mode.
+    pub async fn manual_canonical_with_mode(mode: FlashblocksMode) -> Result<Self> {
+        Self::with_options(false, mode).await
     }
 
     /// Get a reference to the inner [`TestHarness`]
@@ -303,7 +318,7 @@ impl FlashblocksHarness {
         self.parts.send(flashblock).await
     }
 
-    async fn with_options(process_canonical: bool) -> Result<Self> {
+    async fn with_options(process_canonical: bool, mode: FlashblocksMode) -> Result<Self> {
         init_silenced_tracing();
 
         // Build default chain spec programmatically
@@ -311,7 +326,7 @@ impl FlashblocksHarness {
         let chain_spec = Arc::new(BaseChainSpec::from_genesis(genesis));
 
         // Create the extension and keep a reference to get parts after launch
-        let extension = FlashblocksTestExtension::new(process_canonical);
+        let extension = FlashblocksTestExtension::new_with_mode(process_canonical, mode);
         let parts_source = extension.clone();
 
         // Launch the node with the flashblocks extension
@@ -344,9 +359,14 @@ pub struct FlashblocksBuilderTestHarness {
 impl FlashblocksBuilderTestHarness {
     /// Launch a new flashblocks builder test harness.
     pub async fn new() -> Self {
+        Self::new_with_mode(FlashblocksMode::Legacy).await
+    }
+
+    /// Launch a new flashblocks builder test harness with an explicit runtime mode.
+    pub async fn new_with_mode(mode: FlashblocksMode) -> Self {
         // These tests simulate pathological timing (missing receipts, reorgs, etc.), so we disable
         // the automatic canonical listener and only apply blocks when the test explicitly requests it.
-        let node = FlashblocksHarness::manual_canonical()
+        let node = FlashblocksHarness::manual_canonical_with_mode(mode)
             .await
             .expect("able to launch flashblocks harness");
         let provider = node.blockchain_provider();

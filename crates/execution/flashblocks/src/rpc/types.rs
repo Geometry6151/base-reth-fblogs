@@ -1,11 +1,15 @@
 //! Subscription types for the `eth_` `PubSub` RPC extension
 
 use alloy_consensus::Eip658Value;
-use alloy_primitives::{Address, Bloom};
+use alloy_primitives::{Address, B256, Bloom, Bytes, keccak256};
+use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::{Log, pubsub::SubscriptionKind};
 use base_common_rpc_types::Transaction;
 use derive_more::From;
+use jsonrpsee_types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE};
 use serde::{Deserialize, Serialize};
+
+use crate::FastFlashblockLogsDelta;
 
 /// A full transaction object with its associated logs and receipt-equivalent fields.
 ///
@@ -33,6 +37,165 @@ pub struct TransactionWithLogs {
     pub contract_address: Option<Address>,
     /// Bloom filter for all logs emitted by this transaction.
     pub logs_bloom: Bloom,
+}
+
+/// Batch-oriented flashblock logs payload for `newFlashblockLogsBatch` notifications.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashblockLogsBatch {
+    /// Block number for the pending block being assembled.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_number: u64,
+    /// Index of this flashblock within the pending block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub flashblock_index: u64,
+    /// Engine payload identifier for the pending block.
+    pub payload_id: PayloadId,
+    /// Parent hash for the pending block.
+    pub parent_hash: B256,
+    /// Deterministic hash for this logs batch payload.
+    pub batch_hash: B256,
+    /// Optional timestamp for the pending block.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub block_timestamp: Option<u64>,
+    /// Logs emitted in this flashblock update.
+    pub logs: Vec<FlashblockLog>,
+    /// Transaction metadata referenced by the logs in this batch.
+    pub transactions: Vec<FlashblockTxMeta>,
+}
+
+/// Log entry included in a [`FlashblockLogsBatch`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashblockLog {
+    /// Hash of the transaction that emitted the log.
+    pub tx_hash: B256,
+    /// Transaction index within the pending block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub tx_index: u64,
+    /// Log index within the emitting transaction.
+    #[serde(with = "alloy_serde::quantity")]
+    pub log_index_in_tx: u64,
+    /// Log index within the pending block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub log_index_in_block: u64,
+    /// Contract address that emitted the log.
+    pub address: Address,
+    /// Indexed log topics.
+    pub topics: Vec<B256>,
+    /// ABI-encoded log data.
+    pub data: Bytes,
+    /// Whether the log was removed from pending state.
+    pub removed: bool,
+}
+
+/// Transaction metadata referenced by a [`FlashblockLogsBatch`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashblockTxMeta {
+    /// Transaction hash.
+    pub hash: B256,
+    /// Transaction index within the pending block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub index: u64,
+    /// Optional transaction status using receipt-style quantity encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "alloy_serde::quantity::opt")]
+    pub status: Option<u64>,
+}
+
+/// Returns an explicit compatibility error for pending-style RPC surfaces that are not available
+/// in flashblocks hot-only mode.
+pub(super) fn unsupported_in_hot_only(
+    method: &'static str,
+    replacement: Option<&'static str>,
+) -> ErrorObjectOwned {
+    let message = replacement.map_or_else(
+        || format!("{method} is unsupported in flashblocks hot-only mode"),
+        |replacement| {
+            format!("{method} is unsupported in flashblocks hot-only mode; use {replacement}")
+        },
+    );
+
+    ErrorObjectOwned::owned(INVALID_PARAMS_CODE, message, None::<()>)
+}
+
+impl FlashblockLogsBatch {
+    /// Returns the deterministic batch hash for this payload.
+    pub fn compute_batch_hash(&self) -> B256 {
+        let mut bytes = Vec::new();
+        push_u64(&mut bytes, self.block_number);
+        push_u64(&mut bytes, self.flashblock_index);
+        bytes.extend_from_slice(self.payload_id.to_string().as_bytes());
+        bytes.extend_from_slice(self.parent_hash.as_slice());
+
+        for tx in &self.transactions {
+            bytes.extend_from_slice(tx.hash.as_slice());
+            push_u64(&mut bytes, tx.index);
+            push_u64(&mut bytes, tx.status.unwrap_or(u64::MAX));
+        }
+
+        for log in &self.logs {
+            bytes.extend_from_slice(log.tx_hash.as_slice());
+            push_u64(&mut bytes, log.tx_index);
+            push_u64(&mut bytes, log.log_index_in_tx);
+            push_u64(&mut bytes, log.log_index_in_block);
+            bytes.extend_from_slice(log.address.as_slice());
+            push_u64(&mut bytes, log.topics.len() as u64);
+            for topic in &log.topics {
+                bytes.extend_from_slice(topic.as_slice());
+            }
+            push_u64(&mut bytes, log.data.len() as u64);
+            bytes.extend_from_slice(log.data.as_ref());
+            bytes.push(u8::from(log.removed));
+        }
+
+        keccak256(bytes)
+    }
+
+    /// Recomputes and stores the deterministic batch hash for this payload.
+    pub fn refresh_batch_hash(&mut self) {
+        self.batch_hash = self.compute_batch_hash();
+    }
+
+    /// Builds a batch notification payload from a fast delta without consulting pending state.
+    pub fn from_fast_delta(delta: &FastFlashblockLogsDelta) -> Self {
+        let logs = delta
+            .logs
+            .iter()
+            .map(|log| FlashblockLog {
+                tx_hash: log.tx_hash,
+                tx_index: log.tx_index,
+                log_index_in_tx: log.log_index_in_tx,
+                log_index_in_block: log.log_index_in_block,
+                address: log.address,
+                topics: log.topics.clone(),
+                data: log.data.clone(),
+                removed: false,
+            })
+            .collect();
+        let transactions = delta
+            .transactions
+            .iter()
+            .map(|tx| FlashblockTxMeta { hash: tx.hash, index: tx.index, status: tx.status })
+            .collect();
+
+        let mut batch = Self {
+            block_number: delta.block_number,
+            flashblock_index: delta.flashblock_index,
+            payload_id: delta.payload_id,
+            parent_hash: delta.parent_hash,
+            batch_hash: B256::ZERO,
+            block_timestamp: delta.block_timestamp,
+            logs,
+            transactions,
+        };
+        batch.refresh_batch_hash();
+        batch
+    }
+}
+
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
 }
 
 /// Extended subscription kind that includes both standard Ethereum subscription types
@@ -89,6 +252,17 @@ pub enum BaseSubscriptionKind {
     ///   where at least one log matches the filter. All logs are included in the response, not
     ///   just the matching ones.
     NewFlashblockTransactions,
+    /// New flashblock logs batch subscription.
+    ///
+    /// Returns batch-oriented log updates for each flashblock applied to the pending block,
+    /// including per-log indices and referenced transaction metadata.
+    NewFlashblockLogsBatch,
+    /// New fast flashblock logs subscription.
+    ///
+    /// Returns the local fast-path logs delta emitted by the in-process fast-update broadcaster.
+    /// This payload includes a `snapshotId` cursor but intentionally does not include a
+    /// `batchHash`.
+    NewFastFlashblockLogs,
 }
 
 impl ExtendedSubscriptionKind {
@@ -112,6 +286,7 @@ mod tests {
     use alloy_primitives::{
         Address, B256, Bytes, Log as PrimitiveLog, LogData, Signature, TxKind, U256,
     };
+    use alloy_rpc_types_engine::PayloadId;
     use alloy_rpc_types_eth::Log;
     use base_common_consensus::BaseTxEnvelope;
     use base_common_rpc_types::Transaction;
@@ -286,5 +461,101 @@ mod tests {
             format!("0x{}", "11".repeat(256)),
             "logsBloom should remain a required bloom field"
         );
+    }
+
+    #[test]
+    fn base_subscription_kind_decodes_new_flashblock_logs_batch() {
+        let kind: BaseSubscriptionKind =
+            serde_json::from_str(r#""newFlashblockLogsBatch""#).unwrap();
+        assert_eq!(kind, BaseSubscriptionKind::NewFlashblockLogsBatch);
+
+        let encoded = serde_json::to_string(&kind).unwrap();
+        assert_eq!(encoded, r#""newFlashblockLogsBatch""#);
+    }
+
+    #[test]
+    fn base_subscription_kind_decodes_new_fast_flashblock_logs() {
+        let kind: BaseSubscriptionKind =
+            serde_json::from_str(r#""newFastFlashblockLogs""#).unwrap();
+        assert_eq!(kind, BaseSubscriptionKind::NewFastFlashblockLogs);
+
+        let encoded = serde_json::to_string(&kind).unwrap();
+        assert_eq!(encoded, r#""newFastFlashblockLogs""#);
+    }
+
+    #[test]
+    fn flashblock_logs_batch_serializes_contract_shape() {
+        let batch = FlashblockLogsBatch {
+            block_number: 1,
+            flashblock_index: 2,
+            payload_id: PayloadId::new([3; 8]),
+            parent_hash: B256::with_last_byte(4),
+            batch_hash: B256::with_last_byte(5),
+            block_timestamp: Some(6),
+            logs: vec![FlashblockLog {
+                tx_hash: B256::with_last_byte(7),
+                tx_index: 8,
+                log_index_in_tx: 0,
+                log_index_in_block: 9,
+                address: Address::with_last_byte(10),
+                topics: vec![B256::with_last_byte(11)],
+                data: Bytes::from_static(&[12, 13]),
+                removed: false,
+            }],
+            transactions: vec![FlashblockTxMeta {
+                hash: B256::with_last_byte(14),
+                index: 8,
+                status: Some(1),
+            }],
+        };
+
+        let value = serde_json::to_value(&batch).unwrap();
+        assert_eq!(value["blockNumber"], "0x1");
+        assert_eq!(value["flashblockIndex"], "0x2");
+        assert_eq!(value["blockTimestamp"], "0x6");
+        assert_eq!(value["logs"][0]["txIndex"], "0x8");
+        assert_eq!(value["logs"][0]["logIndexInTx"], "0x0");
+        assert_eq!(value["logs"][0]["logIndexInBlock"], "0x9");
+        assert_eq!(value["transactions"][0]["status"], "0x1");
+    }
+
+    #[test]
+    fn flashblock_logs_batch_from_fast_delta_sets_removed_false_and_hash() {
+        let delta = crate::FastFlashblockLogsDelta::new(
+            crate::FlashblockSnapshotId::new(
+                1,
+                2,
+                3,
+                PayloadId::new([4; 8]),
+                B256::with_last_byte(5),
+            ),
+            Some(6),
+            vec![crate::FastFlashblockLog {
+                tx_hash: B256::with_last_byte(7),
+                tx_index: 8,
+                log_index_in_tx: 0,
+                log_index_in_block: 9,
+                address: Address::with_last_byte(10),
+                topics: vec![B256::with_last_byte(11)],
+                data: Bytes::from_static(&[12, 13]),
+            }],
+            vec![crate::FastFlashblockTxMeta {
+                hash: B256::with_last_byte(14),
+                index: 8,
+                status: Some(1),
+            }],
+        );
+
+        let batch = FlashblockLogsBatch::from_fast_delta(&delta);
+
+        assert_eq!(batch.block_number, delta.block_number);
+        assert_eq!(batch.flashblock_index, delta.flashblock_index);
+        assert_eq!(batch.payload_id, delta.payload_id);
+        assert_eq!(batch.parent_hash, delta.parent_hash);
+        assert_eq!(batch.block_timestamp, delta.block_timestamp);
+        assert_eq!(batch.logs.len(), 1);
+        assert!(!batch.logs[0].removed);
+        assert_eq!(batch.transactions.len(), 1);
+        assert_eq!(batch.batch_hash, batch.compute_batch_hash());
     }
 }

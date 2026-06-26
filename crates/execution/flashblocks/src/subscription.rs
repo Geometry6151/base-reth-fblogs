@@ -77,7 +77,9 @@ where
                                     match msg {
                                         Ok(msg @ (Message::Binary(_) | Message::Text(_))) => {
                                             let bytes = msg.into_data();
-                                            match Flashblock::try_decode_message(bytes) {
+                                            match base_metrics::time!(Metrics::upstream_decode_duration(), {
+                                                Flashblock::try_decode_message(bytes)
+                                            }) {
                                                 Ok(payload) => {
                                                     let _ = sender.send(ActorMessage::BestPayload { payload }).await.map_err(|e| {
                                                         error!(message = "Failed to publish message to channel", error = %e);

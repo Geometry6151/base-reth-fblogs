@@ -14,11 +14,44 @@ mod block_assembler;
 pub use block_assembler::{AssembledBlock, BlockAssembler};
 
 mod cache;
-pub use cache::FlashblockCache;
+pub use cache::{CachedFlashblock, FlashblockCache};
 
 mod error;
 pub use error::{
     BuildError, ExecutionError, ProtocolError, ProviderError, Result, StateProcessorError,
+};
+
+mod fast_logs;
+pub use fast_logs::{
+    FastFlashblockFeedEvent, FastFlashblockLog, FastFlashblockLogsDelta,
+    FastFlashblockLogsDeltaError, FastFlashblockTxMeta, FlashblockSnapshotId,
+};
+
+mod hot_engine;
+pub use hot_engine::{
+    HotApplyOutcome, HotEngine, HotExecutionDb, HotInvalidationReason, ShadowRebuildCompletion,
+};
+
+mod hot_overlay;
+pub use hot_overlay::{HotOverlay, HotOverlayDb, HotOverlayError, OverlayAccount};
+
+mod hot_mode;
+pub use hot_mode::FlashblocksMode;
+
+mod hot_snapshot;
+pub use hot_snapshot::{HotSnapshot, HotSnapshotRing};
+
+mod hot_dry_run_seed;
+pub use hot_dry_run_seed::{HotDryRunExecutionSeed, HotDryRunSeed, LatestHotDryRunSeedCache};
+
+mod hot_window;
+pub use hot_window::{
+    HotExecutedHeaderParts, HotExecutionState, HotPendingBlock, HotPendingWindow, HotWindowAnchor,
+};
+
+mod periodic_audit;
+pub use periodic_audit::{
+    AuditCursor, AuditWindowSnapshot, PeriodicAuditFailure, PeriodicAuditResult, RetainedFastOutput,
 };
 
 mod metrics;
@@ -27,8 +60,11 @@ pub use metrics::Metrics;
 mod pending_blocks;
 pub use pending_blocks::{PendingBlocks, PendingBlocksBuilder};
 
+mod snapshot_cache;
+pub use snapshot_cache::SnapshotCache;
+
 mod processor;
-pub use processor::{StateProcessor, StateUpdate};
+pub use processor::{StateProcessor, StateProcessorHandles, StateUpdate};
 
 mod state;
 pub use state::FlashblocksState;
@@ -40,7 +76,7 @@ mod traits;
 pub use traits::{FlashblocksAPI, FlashblocksReceiver, PendingBlocksAPI};
 
 mod state_builder;
-pub use state_builder::{ExecutedPendingTransaction, PendingStateBuilder};
+pub use state_builder::{ExecutedPendingTransaction, PendingHeaderBuilder, PendingStateBuilder};
 
 mod receipt_builder;
 pub use receipt_builder::{ReceiptBuildError, UnifiedReceiptBuilder};
@@ -55,7 +91,9 @@ mod config;
 pub use config::FlashblocksConfig;
 
 mod rpc;
+pub use rpc::FlashblockDryRunResult;
 pub use rpc::{
     BaseSubscriptionKind, BlockNumberOrTagExt, EthApiExt, EthApiOverrideServer, EthPubSub,
-    EthPubSubApiServer, ExtendedSubscriptionKind, TransactionWithLogs,
+    EthPubSubApiServer, ExtendedSubscriptionKind, FlashblockLog, FlashblockLogsBatch,
+    FlashblockTxMeta, TransactionWithLogs,
 };

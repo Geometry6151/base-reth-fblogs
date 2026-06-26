@@ -12,7 +12,10 @@ use reth_rpc_convert::RpcTransaction;
 use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
 use tokio::sync::broadcast;
 
-use crate::PendingBlocks;
+use crate::{
+    FastFlashblockFeedEvent, FlashblockSnapshotId, FlashblocksMode, HotDryRunSeed, HotSnapshot,
+    PendingBlocks,
+};
 
 /// Trait for receiving flashblock updates.
 pub trait FlashblocksReceiver {
@@ -24,6 +27,28 @@ pub trait FlashblocksReceiver {
 pub trait FlashblocksAPI {
     /// Retrieves the pending blocks.
     fn get_pending_blocks(&self) -> Guard<Option<Arc<PendingBlocks>>>;
+
+    /// Subscribes to fast flashblock log feed events.
+    fn subscribe_to_fast_flashblock_logs(&self) -> broadcast::Receiver<FastFlashblockFeedEvent>;
+
+    /// Returns a cached pending snapshot for a previously emitted fast delta.
+    ///
+    /// This lookup is best effort. After pending-state reset, cache clear, or cache eviction, a
+    /// previously buffered fast update may no longer resolve even if the update itself is still
+    /// readable from the broadcast channel. Callers must treat `None` as a resync signal.
+    fn get_snapshot(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<PendingBlocks>>;
+
+    /// Returns a cached hot snapshot for pinned flashblock RPC.
+    fn get_hot_snapshot(&self, snapshot_id: FlashblockSnapshotId) -> Option<Arc<HotSnapshot>>;
+
+    /// Returns the most recently cached hot snapshot for latest dry-run RPC.
+    fn get_latest_hot_snapshot(&self) -> Option<Arc<HotSnapshot>>;
+
+    /// Returns the most recently cached hot dry-run seed for latest dry-run RPC.
+    fn get_latest_hot_dry_run_seed(&self) -> Option<Arc<HotDryRunSeed>>;
+
+    /// Returns the configured flashblocks runtime mode.
+    fn mode(&self) -> FlashblocksMode;
 
     /// Subscribes to flashblock updates.
     fn subscribe_to_flashblocks(&self) -> broadcast::Receiver<Arc<PendingBlocks>>;
